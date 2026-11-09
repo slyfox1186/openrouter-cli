@@ -1,10 +1,19 @@
+// sigaction and the POSIX signal constants belong to the C API, beyond std::signal.
+extern "C" {
+#include <signal.h>
+}
+
 #include "http.hpp"
 
+#include "common.hpp"
+#include "config.hpp"
+#include "credentials.hpp"
 #include "secrets.hpp"
 #include "sse.hpp"
 
 #include <curl/curl.h>
-#include <signal.h>
+#include <curl/easy.h>
+#include <curl/system.h>
 
 #include <algorithm>
 #include <array>
@@ -14,12 +23,16 @@
 #include <csignal>
 #include <cstddef>
 #include <exception>
+#include <expected>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 namespace orcli {
@@ -51,12 +64,15 @@ constexpr int progress_abort = 1;
 constexpr int progress_continue = 0;
 constexpr const char* user_agent = "openrouter-cli/0.1.0";
 
-// The only mutable global: written from the signal handler, read by transfer callbacks.
-std::atomic<bool> interrupt_flag{false};
+// Constant initialization keeps the flag safe to access from the signal handler.
+std::atomic<bool>& interrupt_flag() noexcept {
+    static constinit std::atomic<bool> flag{false};
+    return flag;
+}
 static_assert(std::atomic<bool>::is_always_lock_free, "signal handlers need a lock-free flag");
 
 void on_terminate_signal(int /*signal*/) {
-    interrupt_flag.store(true);
+    interrupt_flag().store(true);
 }
 
 struct EasyDeleter {
@@ -81,15 +97,18 @@ Result<void> append_header(HeaderList& list, const std::string& header) {
     if (extended == nullptr) {
         return fail(Exit::api, "out of memory building request headers");
     }
-    static_cast<void>(list.release());
-    list.reset(extended);
+    // curl_slist_append keeps the existing head; only an empty list acquires a new owner.
+    if (list == nullptr) {
+        list.reset(extended);
+    }
     return {};
 }
 
 std::string lowercase(std::string_view text) {
     std::string out(text);
-    std::ranges::transform(out, out.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::ranges::transform(out, out.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
     return out;
 }
 
@@ -130,8 +149,10 @@ Result<HeaderList> base_headers(const Config& config, std::string_view key) {
             return std::unexpected(added.error());
         }
     }
-    for (const std::string& header : {"X-OpenRouter-Title: " + config.app_title,
-                                      "X-OpenRouter-Categories: " + config.app_categories}) {
+    for (const std::string& header : {
+             "X-OpenRouter-Title: " + config.app_title,
+             "X-OpenRouter-Categories: " + config.app_categories,
+         }) {
         if (auto added = append_header(list, header); !added) {
             return std::unexpected(added.error());
         }
@@ -167,14 +188,14 @@ Result<EasyHandle> new_handle(const std::string& url, long total_timeout_seconds
 bool interruptible_sleep(std::chrono::milliseconds duration) {
     const auto deadline = Clock::now() + duration;
     while (Clock::now() < deadline) {
-        if (interrupt_flag.load()) {
+        if (interrupt_flag().load()) {
             return false;
         }
         std::this_thread::sleep_for(std::min(
             sleep_slice,
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now())));
     }
-    return !interrupt_flag.load();
+    return !interrupt_flag().load();
 }
 
 bool retryable_transport_error(CURLcode code) {
@@ -213,25 +234,36 @@ struct GetBuffer {
     bool too_large = false;
 };
 
-std::size_t get_write(char* data, std::size_t size, std::size_t count, void* user) {
+// libcurl requires char* callbacks; processors receive a bounded read-only view.
+template <auto Process>
+std::size_t receive_bytes(char* data, std::size_t size, std::size_t count, void* user) {
+    if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size) {
+        return 0;
+    }
+    return Process(std::span(data, size * count), user);
+}
+
+std::size_t get_write(std::span<const char> data, void* user) {
     auto* buffer = static_cast<GetBuffer*>(user);
-    const std::size_t bytes = size * count;
-    if (buffer->body.size() + bytes > buffer->limit) {
+    const std::size_t bytes = data.size();
+    if (bytes > buffer->limit - buffer->body.size()) {
         buffer->too_large = true;
         return 0;
     }
     try {
-        buffer->body.append(std::string_view(data, bytes));
+        buffer->body.append(std::string_view(data.data(), bytes));
     } catch (const std::exception&) {
         return 0;
     }
     return bytes;
 }
 
+static_assert(std::is_same_v<decltype(&receive_bytes<get_write>), curl_write_callback>);
+
 // Lets Ctrl-C stop a GET or JSON POST at once instead of after its whole timeout.
 int abort_on_interrupt(void* /*user*/, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
                        curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
-    return interrupt_flag.load() ? progress_abort : progress_continue;
+    return interrupt_flag().load() ? progress_abort : progress_continue;
 }
 
 // One finished transfer: curl's result, the HTTP status, Retry-After and the body.
@@ -246,15 +278,15 @@ struct Attempt {
 struct Request {
     const Config* config = nullptr;
     std::string url;
-    std::string_view key;                      // empty: no Authorization header
-    std::optional<std::string_view> json_body; // set: POST with this body
+    std::string_view key;                   // empty: no Authorization header
+    const std::string* json_body = nullptr; // set: POST with this body
     std::size_t body_limit = max_get_body_bytes;
 };
 
 // Performs one transfer. When body_limit is small (the PKCE exchange) the buffer is reserved
 // up front, so a response holding a key is never spread over reallocated, uncleared memory.
 Result<Attempt> perform(const Request& request) {
-    if (interrupt_flag.load()) {
+    if (interrupt_flag().load()) {
         return fail(Exit::interrupted, "interrupted");
     }
     auto handle = new_handle(request.url, get_timeout_seconds);
@@ -265,7 +297,7 @@ Result<Attempt> perform(const Request& request) {
     if (!headers) {
         return std::unexpected(headers.error());
     }
-    if (request.json_body.has_value()) {
+    if (request.json_body != nullptr) {
         for (const char* header : {"Content-Type: application/json", "Accept: application/json"}) {
             if (auto added = append_header(*headers, std::string(header)); !added) {
                 return std::unexpected(added.error());
@@ -280,7 +312,7 @@ Result<Attempt> perform(const Request& request) {
     CURL* raw = handle->get();
     const std::array setup{
         set_option(raw, CURLOPT_HTTPHEADER, headers->get()),
-        set_option(raw, CURLOPT_WRITEFUNCTION, &get_write),
+        set_option(raw, CURLOPT_WRITEFUNCTION, &receive_bytes<get_write>),
         set_option(raw, CURLOPT_WRITEDATA, static_cast<void*>(&buffer)),
         set_option(raw, CURLOPT_XFERINFOFUNCTION, &abort_on_interrupt),
         set_option(raw, CURLOPT_NOPROGRESS, 0L),
@@ -290,11 +322,11 @@ Result<Attempt> perform(const Request& request) {
             return std::unexpected(result.error());
         }
     }
-    if (request.json_body.has_value()) {
-        const std::string_view body = *request.json_body;
+    if (request.json_body != nullptr) {
+        const std::string& body = *request.json_body;
         const std::array post_setup{
             set_option(raw, CURLOPT_POST, 1L),
-            set_option(raw, CURLOPT_POSTFIELDS, body.data()),
+            set_option(raw, CURLOPT_POSTFIELDS, body.c_str()),
             set_option(raw, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size())),
         };
         for (const auto& result : post_setup) {
@@ -309,7 +341,7 @@ Result<Attempt> perform(const Request& request) {
     curl_easy_getinfo(raw, CURLINFO_RETRY_AFTER, &attempt.retry_after);
     attempt.too_large = buffer.too_large;
     attempt.body = std::move(buffer.body);
-    if (interrupt_flag.load()) {
+    if (interrupt_flag().load()) {
         return fail(Exit::interrupted, "interrupted");
     }
     return attempt;
@@ -342,12 +374,12 @@ struct StreamState {
     std::string callback_error;
 };
 
-std::size_t stream_header(char* data, std::size_t size, std::size_t count, void* user) {
+std::size_t stream_header(std::span<const char> data, void* user) {
     auto* state = static_cast<StreamState*>(user);
-    const std::size_t bytes = size * count;
+    const std::size_t bytes = data.size();
     state->last_byte = Clock::now();
     try {
-        const std::string_view line(data, bytes);
+        const std::string_view line(data.data(), bytes);
         if (line.starts_with("HTTP/")) {
             state->result->event_stream = false;
             return bytes;
@@ -371,12 +403,12 @@ std::size_t stream_header(char* data, std::size_t size, std::size_t count, void*
     return bytes;
 }
 
-std::size_t stream_write(char* data, std::size_t size, std::size_t count, void* user) {
+std::size_t stream_write(std::span<const char> data, void* user) {
     auto* state = static_cast<StreamState*>(user);
-    const std::size_t bytes = size * count;
+    const std::size_t bytes = data.size();
     state->last_byte = Clock::now();
     try {
-        const std::string_view chunk(data, bytes);
+        const std::string_view chunk(data.data(), bytes);
         if (state->result->event_stream && state->handlers->on_body_bytes) {
             state->handlers->on_body_bytes(chunk);
         } else if (state->result->error_body.size() < max_error_body_bytes) {
@@ -390,10 +422,12 @@ std::size_t stream_write(char* data, std::size_t size, std::size_t count, void* 
     return bytes;
 }
 
-int stream_progress(void* user, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
-                    curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
-    auto* state = static_cast<StreamState*>(user);
-    if (interrupt_flag.load()) {
+// The declared callback type enforces libcurl's required non-const void* parameter.
+constexpr curl_xferinfo_callback stream_progress = [](void* user, curl_off_t /*dltotal*/,
+                                                      curl_off_t /*dlnow*/, curl_off_t /*ultotal*/,
+                                                      curl_off_t /*ulnow*/) {
+    const auto* state = static_cast<const StreamState*>(user);
+    if (interrupt_flag().load()) {
         state->result->interrupted = true;
         return progress_abort;
     }
@@ -402,7 +436,7 @@ int stream_progress(void* user, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
         return progress_abort;
     }
     return progress_continue;
-}
+};
 
 } // namespace
 
@@ -421,7 +455,7 @@ void install_signal_handlers() {
 }
 
 bool interrupt_requested() {
-    return interrupt_flag.load();
+    return interrupt_flag().load();
 }
 
 CurlGlobal::CurlGlobal() : ok_(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK) {}
@@ -472,11 +506,13 @@ Result<HttpResponse> Http::fetch(std::string_view path_and_query, const GetOptio
     if (!key) {
         return std::unexpected(key.error());
     }
-    const Request request{.config = &config_,
-                          .url = config_.base_url + std::string(path_and_query),
-                          .key = *key,
-                          .json_body = std::nullopt,
-                          .body_limit = max_get_body_bytes};
+    const Request request{
+        .config = &config_.get(),
+        .url = config_.get().base_url + std::string(path_and_query),
+        .key = *key,
+        .json_body = nullptr,
+        .body_limit = max_get_body_bytes,
+    };
     const auto started = Clock::now();
     int retries = 0;
     auto backoff = std::chrono::duration_cast<std::chrono::milliseconds>(first_backoff);
@@ -511,9 +547,9 @@ Result<HttpResponse> Http::fetch(std::string_view path_and_query, const GetOptio
 StreamResult Http::post_stream(std::string_view path, const std::string& body,
                                const StreamHandlers& handlers) const {
     StreamResult result;
-    const std::string url = config_.base_url + std::string(path);
+    const std::string url = config_.get().base_url + std::string(path);
 
-    auto handle = new_handle(url, config_.total_timeout_seconds);
+    auto handle = new_handle(url, config_.get().total_timeout_seconds);
     if (!handle) {
         result.transport_error = handle.error().message;
         return result;
@@ -523,13 +559,16 @@ StreamResult Http::post_stream(std::string_view path, const std::string& body,
         result.transport_error = key.error().message;
         return result;
     }
-    auto headers = base_headers(config_, *key);
+    auto headers = base_headers(config_.get(), *key);
     if (!headers) {
         result.transport_error = headers.error().message;
         return result;
     }
-    for (const char* header : {"Content-Type: application/json", "Accept: text/event-stream",
-                               "X-OpenRouter-Metadata: enabled"}) {
+    for (const char* header : {
+             "Content-Type: application/json",
+             "Accept: text/event-stream",
+             "X-OpenRouter-Metadata: enabled",
+         }) {
         if (auto added = append_header(*headers, std::string(header)); !added) {
             result.transport_error = added.error().message;
             return result;
@@ -540,7 +579,7 @@ StreamResult Http::post_stream(std::string_view path, const std::string& body,
     state.handlers = &handlers;
     state.result = &result;
     state.last_byte = Clock::now();
-    state.idle_limit = std::chrono::seconds{config_.idle_timeout_seconds};
+    state.idle_limit = std::chrono::seconds{config_.get().idle_timeout_seconds};
 
     CURL* raw = handle->get();
     const std::array setup{
@@ -548,11 +587,11 @@ StreamResult Http::post_stream(std::string_view path, const std::string& body,
         set_option(raw, CURLOPT_POST, 1L),
         set_option(raw, CURLOPT_POSTFIELDS, body.c_str()),
         set_option(raw, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size())),
-        set_option(raw, CURLOPT_HEADERFUNCTION, &stream_header),
+        set_option(raw, CURLOPT_HEADERFUNCTION, &receive_bytes<stream_header>),
         set_option(raw, CURLOPT_HEADERDATA, static_cast<void*>(&state)),
-        set_option(raw, CURLOPT_WRITEFUNCTION, &stream_write),
+        set_option(raw, CURLOPT_WRITEFUNCTION, &receive_bytes<stream_write>),
         set_option(raw, CURLOPT_WRITEDATA, static_cast<void*>(&state)),
-        set_option(raw, CURLOPT_XFERINFOFUNCTION, &stream_progress),
+        set_option(raw, CURLOPT_XFERINFOFUNCTION, stream_progress),
         set_option(raw, CURLOPT_XFERINFODATA, static_cast<void*>(&state)),
         set_option(raw, CURLOPT_NOPROGRESS, 0L),
     };
@@ -586,11 +625,13 @@ Result<std::string> Http::post_json(std::string_view path, const std::string& bo
     }
     // One attempt only: the PKCE exchange code is single-use, so a retry after an ambiguous
     // failure could never succeed and would hide the first error.
-    auto attempt = perform(Request{.config = &config_,
-                                   .url = config_.base_url + std::string(path),
-                                   .key = *key,
-                                   .json_body = body,
-                                   .body_limit = max_json_post_body_bytes});
+    auto attempt = perform(Request{
+        .config = &config_.get(),
+        .url = config_.get().base_url + std::string(path),
+        .key = *key,
+        .json_body = &body,
+        .body_limit = max_json_post_body_bytes,
+    });
     if (!attempt) {
         return std::unexpected(attempt.error());
     }

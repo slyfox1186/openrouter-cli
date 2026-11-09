@@ -1,4 +1,5 @@
-#pragma once
+#ifndef ORCLI_SSE_HPP
+#define ORCLI_SSE_HPP
 
 #include "common.hpp"
 
@@ -10,12 +11,14 @@
 
 namespace orcli {
 
+inline constexpr std::size_t default_max_event_bytes = std::size_t{16} << 20U;
+
 // Server-sent events decoder. Accepts bytes split anywhere (inside UTF-8 sequences, line
 // endings or field names), LF or CRLF line endings, multi-line `data` fields and `:` comment
 // lines. Returns the joined `data` payload of every event completed by this call.
 class SseParser {
 public:
-    explicit SseParser(std::size_t max_event_bytes = std::size_t{16} << 20U);
+    explicit SseParser(std::size_t max_event_bytes = default_max_event_bytes);
 
     // Exit::api when one event grows past max_event_bytes.
     Result<std::vector<std::string>> feed(std::string_view bytes);
@@ -40,10 +43,10 @@ struct StreamOutcome {
     std::optional<std::string> error_message; // raw provider text; callers sanitize before display
     Usage usage;
     bool done = false;
-
-    // Non-empty text, finish_reason "stop", [DONE] received and no error.
-    [[nodiscard]] bool complete() const;
 };
+
+// Non-empty text, finish_reason "stop", [DONE] received and no error.
+[[nodiscard]] bool stream_complete(const StreamOutcome& outcome);
 
 // Interprets OpenRouter Chat Completions stream payloads.
 class ChatStream {
@@ -64,3 +67,5 @@ private:
 bool parse_error_body(std::string_view body, StreamOutcome& outcome);
 
 } // namespace orcli
+
+#endif // ORCLI_SSE_HPP

@@ -8,11 +8,12 @@
 #   ~/.claude/skills/openrouter-cli    -> ../../.agents/skills/openrouter-cli (Claude Code)
 # Every step runs even if an earlier one fails, so one log shows everything; nothing is
 # installed unless every earlier step passed. Output is saved to build/logs/build-<UTC>.log
-# and build/logs/latest.log. Run scripts/build.sh --help for the options.
+# and build/logs/latest.log. --uninstall removes those three paths instead and builds nothing.
+# Run scripts/build.sh --help for the options.
 
+# Parse the complete run before executing it, so edits cannot change unread commands mid-build.
+{
 set -Euo pipefail
-
-clear
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
@@ -20,28 +21,76 @@ cd "$ROOT" || exit 1
 # = delete("reason") and the C++26 library features the code uses need at least Clang 19.
 MIN_CLANG_MAJOR=19
 
+# Descriptions in the help start this many columns after the two-space indent.
+HELP_COLUMN=22
+
+# Same rules as openrouter-cli --help: a non-empty NO_COLOR turns color off, CLICOLOR_FORCE
+# other than empty or 0 turns it on, otherwise color needs a terminal whose TERM is not dumb.
+help_color() {
+    if [[ -n "${NO_COLOR:-}" ]]; then
+        return 1
+    fi
+    if [[ -n "${CLICOLOR_FORCE:-}" && "$CLICOLOR_FORCE" != 0 ]]; then
+        return 0
+    fi
+    [[ -t 1 && -n "${TERM:-}" && "$TERM" != dumb ]]
+}
+
+# help_row SHORT LONG METAVAR DESCRIPTION [MORE_LINES...]
+# Pads on the plain text, then adds the color codes set by usage (bash's dynamic scope).
+help_row() {
+    local short="$1" long="$2" metavar="$3" plain styled line
+    shift 3
+    if [[ -n "$short" ]]; then
+        plain="$short, $long"
+        styled="$literal$short$reset, $literal$long$reset"
+    else
+        plain="    $long"
+        styled="    $literal$long$reset"
+    fi
+    if [[ -n "$metavar" ]]; then
+        plain+=" $metavar"
+        styled+=" $placeholder$metavar$reset"
+    fi
+    printf '  %s%*s%s\n' "$styled" "$((HELP_COLUMN - ${#plain}))" '' "$1"
+    shift
+    for line in "$@"; do
+        printf '  %*s%s\n' "$HELP_COLUMN" '' "$line"
+    done
+}
+
 usage() {
-    cat <<'EOF'
-Usage: scripts/build.sh [options]
-
-Checks, builds and installs openrouter-cli with the newest Clang on PATH. With no options:
-format check, debug build with ASan+UBSan and all tests, clang-tidy, cppcheck, release build,
-static-link check, then install the binary and the agent skill links.
-
-  --force           overwrite an existing, different openrouter-cli in the bin dir, and
-                    re-point skill links that point elsewhere
-  --bin-dir DIR     where the binary goes (default ~/.local/bin)
-  --no-skill        install only the binary
-  --no-install      run the checks and build, install nothing
-  --quick           skip the format check, debug build, tests, clang-tidy and cppcheck:
-                    release build, static-link check and install only
-  --fresh           reconfigure every build directory from scratch
-  --jobs N          parallel build jobs (default: number of CPUs)
-  --list-compilers  show every Clang found and the one used, then exit
-  -h, --help        show this help
-
-Logs: build/logs/build-<UTC time>.log, newest at build/logs/latest.log.
-EOF
+    local title="" header="" literal="" placeholder="" reset=""
+    if help_color; then
+        title=$'\e[1m'
+        header=$'\e[1;32m'
+        literal=$'\e[1;36m'
+        placeholder=$'\e[36m'
+        reset=$'\e[0m'
+    fi
+    printf '%s\n' "${title}scripts/build.sh${reset}"
+    printf '%s\n\n' "Checks, builds and installs openrouter-cli with the newest Clang on PATH."
+    printf '%s\n' "${header}USAGE${reset}"
+    printf '  %s %s\n\n' "${literal}scripts/build.sh${reset}" "${placeholder}[OPTIONS]${reset}"
+    printf '%s\n' "With no options it runs the format check, a debug build with ASan+UBSan and" \
+        "all tests, clang-tidy, cppcheck, the release build and the static-link check," \
+        "then installs the binary and the agent skill links."
+    printf '\n%s\n' "${header}OPTIONS${reset}"
+    help_row "" --force "" "Overwrite an existing, different openrouter-cli in the" \
+        "bin dir, and re-point skill links that point elsewhere"
+    help_row "" --bin-dir DIR "Where the binary goes (default ~/.local/bin)"
+    help_row "" --no-skill "" "Install or remove only the binary, not the skill links"
+    help_row "" --no-install "" "Run the checks and build; install nothing"
+    help_row "" --uninstall "" "Remove the installed binary and skill links, then exit;" \
+        "builds nothing. Combines only with --bin-dir and" "--no-skill"
+    help_row "" --quick "" "Skip the format check, debug build, tests, clang-tidy" \
+        "and cppcheck; run only the release build, the" "static-link check and the install"
+    help_row "" --fresh "" "Reconfigure every build directory from scratch"
+    help_row "" --jobs N "Parallel build jobs (default: number of CPUs)"
+    help_row "" --list-compilers "" "Show every Clang found and the one used, then exit"
+    help_row -h --help "" "Show this help and exit"
+    printf '\n%s\n' "${header}LOGS${reset}"
+    printf '  %s\n' "Each run: build/logs/build-<UTC time>.log" "Newest run: build/logs/latest.log"
 }
 
 usage_error() {
@@ -57,10 +106,16 @@ QUICK=0
 FRESH=0
 JOBS=""
 LIST_ONLY=0
+UNINSTALL=0
+# The last option given that only matters to a build or install, for rejecting it with --uninstall.
+BUILD_OPTION=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-    --force) FORCE=1 ;;
+    --force)
+        FORCE=1
+        BUILD_OPTION="$1"
+        ;;
     --bin-dir)
         if [[ $# -lt 2 || -z "$2" ]]; then
             usage_error "--bin-dir needs a directory"
@@ -75,18 +130,35 @@ while [[ $# -gt 0 ]]; do
         fi
         ;;
     --no-skill) INSTALL_SKILL=0 ;;
-    --no-install) INSTALL=0 ;;
-    --quick) QUICK=1 ;;
-    --fresh) FRESH=1 ;;
+    --no-install)
+        INSTALL=0
+        BUILD_OPTION="$1"
+        ;;
+    --uninstall) UNINSTALL=1 ;;
+    --quick)
+        QUICK=1
+        BUILD_OPTION="$1"
+        ;;
+    --fresh)
+        FRESH=1
+        BUILD_OPTION="$1"
+        ;;
     --jobs)
         if [[ $# -lt 2 ]]; then
             usage_error "--jobs needs a number"
         fi
         JOBS="$2"
+        BUILD_OPTION="$1"
         shift
         ;;
-    --jobs=*) JOBS="${1#--jobs=}" ;;
-    --list-compilers) LIST_ONLY=1 ;;
+    --jobs=*)
+        JOBS="${1#--jobs=}"
+        BUILD_OPTION="--jobs"
+        ;;
+    --list-compilers)
+        LIST_ONLY=1
+        BUILD_OPTION="$1"
+        ;;
     -h | --help)
         usage
         exit 0
@@ -96,11 +168,97 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+if [[ "$UNINSTALL" == 1 && -n "$BUILD_OPTION" ]]; then
+    usage_error "--uninstall cannot be combined with $BUILD_OPTION"
+fi
 if [[ -z "$JOBS" ]]; then
     JOBS="$(nproc)"
 fi
 if [[ ! "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
     usage_error "--jobs must be a positive whole number"
+fi
+
+# Cleared only once the options are valid, so --help and usage errors stay on screen.
+clear
+
+# ----- uninstall ---------------------------------------------------------------------------
+
+# visible DIR: true when the nearest existing directory at or above DIR can be searched, so a
+# failed existence test below it means the path is missing, not hidden by permissions.
+visible() {
+    local dir="$1"
+    local -A followed=()
+    while [[ ! -e "$dir" ]]; do
+        # A link here may point beneath an unsearchable directory, so the walk continues at
+        # its target. A loop of links counts as not visible; GNU readlink -m can return a
+        # path inside the loop instead of failing, hence the record of links followed.
+        if [[ -L "$dir" ]]; then
+            if [[ -n "${followed[$dir]:-}" ]]; then
+                return 1
+            fi
+            followed[$dir]=1
+            dir="$(readlink -m -- "$dir")" || return 1
+            continue
+        fi
+        case "$dir" in
+        */*) dir="${dir%/*}" ;;
+        *) dir=. ;;
+        esac
+        if [[ -z "$dir" ]]; then
+            dir=/
+        fi
+    done
+    [[ -d "$dir" && -x "$dir" ]]
+}
+
+# remove_installed PATH KIND: removes PATH when it is a symbolic link, or also a regular file
+# when KIND is binary. A real file or directory at a skill path, or a directory at the binary
+# path, was not made by this script and stays. Removing a link leaves what it points to.
+remove_installed() {
+    local path="$1" kind="$2" target
+    if [[ -L "$path" ]]; then
+        target="$(readlink "$path")"
+        rm -f -- "$path" || return 1
+        echo "removed  $path (link to $target)"
+        return 0
+    fi
+    if [[ ! -e "$path" ]]; then
+        if visible "${path%/*}"; then
+            echo "absent   $path"
+            return 0
+        fi
+        echo "cannot check $path: a directory above it cannot be searched"
+        return 1
+    fi
+    if [[ "$kind" == binary && -f "$path" ]]; then
+        rm -f -- "$path" || return 1
+        echo "removed  $path"
+        return 0
+    fi
+    if [[ "$kind" == binary ]]; then
+        echo "refusing to remove $path: it is not a regular file or link"
+    else
+        echo "refusing to remove $path: it is a real file or directory, not a link"
+    fi
+    return 1
+}
+
+uninstall() {
+    local status=0 other
+    remove_installed "$BIN_DIR/openrouter-cli" binary || status=1
+    if [[ "$INSTALL_SKILL" == 1 ]]; then
+        remove_installed "$HOME/.claude/skills/openrouter-cli" skill || status=1
+        remove_installed "$HOME/.agents/skills/openrouter-cli" skill || status=1
+    fi
+    while IFS= read -r other; do
+        echo "note: $other is still on PATH; it was not removed (see --bin-dir)"
+    done < <(type -aP openrouter-cli)
+    return "$status"
+}
+
+if [[ "$UNINSTALL" == 1 ]]; then
+    uninstall
+    exit
 fi
 
 # ----- compiler discovery ------------------------------------------------------------------
@@ -275,7 +433,19 @@ tidy_check() {
         return 1
     fi
     echo "using $CLANG_TIDY with $DEBUG_DIR/compile_commands.json"
-    "$CLANG_TIDY" -p "$DEBUG_DIR" --quiet "${SOURCES[@]}"
+    local source failed=0 checked=0 started
+    for source in "${SOURCES[@]}"; do
+        checked=$((checked + 1))
+        started=$SECONDS
+        printf '[%s/%s] clang-tidy: %s\n' "$checked" "${#SOURCES[@]}" "$source"
+        if "$CLANG_TIDY" -p "$DEBUG_DIR" --quiet "$source"; then
+            printf '%s: ok (%ss)\n' "$source" "$((SECONDS - started))"
+        else
+            printf '%s: FAILED (%ss)\n' "$source" "$((SECONDS - started))"
+            failed=1
+        fi
+    done
+    return "$failed"
 }
 
 cppcheck_check() {
@@ -303,7 +473,11 @@ if [[ "$QUICK" == 0 ]]; then
         fi
     fi
     if [[ "$DEBUG_BUILT" == 1 ]]; then
-        step "tests (debug, ASan+UBSan)" ctest --test-dir "$DEBUG_DIR" --output-on-failure
+        begin "tests (debug, ASan+UBSan)"
+        echo "Integration tests report each completed case and its duration."
+        echo "Some cases deliberately wait through timeouts and retries, including a 30-second lookup."
+        ctest --test-dir "$DEBUG_DIR" --verbose --no-tests=error
+        finish "tests (debug, ASan+UBSan)" "$?"
     else
         skipped "tests" "the debug build failed"
     fi
@@ -472,3 +646,4 @@ fi
 printf 'failed: %s\n' "${FAILED[@]}"
 echo "log: $LOG"
 exit 1
+}

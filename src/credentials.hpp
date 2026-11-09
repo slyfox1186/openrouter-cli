@@ -1,8 +1,10 @@
-#pragma once
+#ifndef ORCLI_CREDENTIALS_HPP
+#define ORCLI_CREDENTIALS_HPP
 
 #include "common.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -11,7 +13,7 @@
 
 namespace orcli {
 
-enum class KeyKind {
+enum class KeyKind : std::uint8_t {
     inference,  // a normal API key: chat completions, /key, /generation
     management, // a Management key: /keys, /credits, /activity; cannot call completions
 };
@@ -39,10 +41,12 @@ private:
 // Overwrites the bytes of a std::string that held key material, then empties it.
 void cleanse(std::string& text);
 
+inline constexpr std::chrono::seconds default_creds_timeout{30};
+
 // The program used for encryption: systemd-creds, or a fake in test builds.
 struct CredsTool {
     std::filesystem::path program;
-    std::chrono::seconds timeout{30};
+    std::chrono::seconds timeout{default_creds_timeout};
 };
 
 // Finds `systemd-creds` on PATH (absolute path). Builds compiled with ORCLI_TEST_HOOKS use
@@ -101,3 +105,5 @@ Result<std::vector<KeyKind>> remove_keys(const std::filesystem::path& state_dir,
                                          bool include_inference);
 
 } // namespace orcli
+
+#endif // ORCLI_CREDENTIALS_HPP

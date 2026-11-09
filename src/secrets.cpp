@@ -87,74 +87,107 @@ struct TokenRule {
 constexpr std::array kTokenRules{
     TokenRule{.name = "openrouter-key", .prefixes = {"sk-or-v1-"}, .body = kHex, .min_length = 64},
     TokenRule{
-        .name = "anthropic-key", .prefixes = {"sk-ant-"}, .body = kTokenChars, .min_length = 20},
-    TokenRule{.name = "openai-key",
-              .prefixes = {"sk-proj-", "sk-svcacct-"},
-              .body = kTokenChars,
-              .min_length = 20},
-    TokenRule{.name = "aws-access-key",
-              .prefixes = {"AKIA", "ASIA"},
-              .body = kUpperDigits,
-              .min_length = 16,
-              .exact = true,
-              .lead_boundary = true,
-              .trail_boundary = true},
-    TokenRule{.name = "github-token",
-              .prefixes = {"ghp_", "gho_", "ghu_", "ghs_", "ghr_"},
-              .body = kAlnum,
-              .min_length = 36,
-              .lead_boundary = true,
-              .trail_boundary = true},
-    TokenRule{.name = "github-token",
-              .prefixes = {"github_pat_"},
-              .body = kWordChars,
-              .min_length = 50,
-              .lead_boundary = true},
-    TokenRule{.name = "gitlab-token",
-              .prefixes = {"glpat-"},
-              .body = kTokenChars,
-              .min_length = 20,
-              .lead_boundary = true},
-    TokenRule{.name = "slack-token",
-              .prefixes = {"xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-"},
-              .body = kSlackChars,
-              .min_length = 10,
-              .lead_boundary = true},
-    TokenRule{.name = "google-api-key",
-              .prefixes = {"AIza"},
-              .body = kTokenChars,
-              .min_length = 35,
-              .exact = true,
-              .lead_boundary = true,
-              .trail_boundary = true},
-    TokenRule{.name = "stripe-key",
-              .prefixes = {"sk_live_", "rk_live_"},
-              .body = kAlnum,
-              .min_length = 20,
-              .lead_boundary = true},
-    TokenRule{.name = "huggingface-token",
-              .prefixes = {"hf_"},
-              .body = kAlpha,
-              .min_length = 30,
-              .lead_boundary = true,
-              .trail_boundary = true},
+        .name = "anthropic-key",
+        .prefixes = {"sk-ant-"},
+        .body = kTokenChars,
+        .min_length = 20,
+    },
+    TokenRule{
+        .name = "openai-key",
+        .prefixes = {"sk-proj-", "sk-svcacct-"},
+        .body = kTokenChars,
+        .min_length = 20,
+    },
+    TokenRule{
+        .name = "aws-access-key",
+        .prefixes = {"AKIA", "ASIA"},
+        .body = kUpperDigits,
+        .min_length = 16,
+        .exact = true,
+        .lead_boundary = true,
+        .trail_boundary = true,
+    },
+    TokenRule{
+        .name = "github-token",
+        .prefixes = {"ghp_", "gho_", "ghu_", "ghs_", "ghr_"},
+        .body = kAlnum,
+        .min_length = 36,
+        .lead_boundary = true,
+        .trail_boundary = true,
+    },
+    TokenRule{
+        .name = "github-token",
+        .prefixes = {"github_pat_"},
+        .body = kWordChars,
+        .min_length = 50,
+        .lead_boundary = true,
+    },
+    TokenRule{
+        .name = "gitlab-token",
+        .prefixes = {"glpat-"},
+        .body = kTokenChars,
+        .min_length = 20,
+        .lead_boundary = true,
+    },
+    TokenRule{
+        .name = "slack-token",
+        .prefixes = {"xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-"},
+        .body = kSlackChars,
+        .min_length = 10,
+        .lead_boundary = true,
+    },
+    TokenRule{
+        .name = "google-api-key",
+        .prefixes = {"AIza"},
+        .body = kTokenChars,
+        .min_length = 35,
+        .exact = true,
+        .lead_boundary = true,
+        .trail_boundary = true,
+    },
+    TokenRule{
+        .name = "stripe-key",
+        .prefixes = {"sk_live_", "rk_live_"},
+        .body = kAlnum,
+        .min_length = 20,
+        .lead_boundary = true,
+    },
+    TokenRule{
+        .name = "huggingface-token",
+        .prefixes = {"hf_"},
+        .body = kAlpha,
+        .min_length = 30,
+        .lead_boundary = true,
+        .trail_boundary = true,
+    },
 };
 
 constexpr std::array<std::string_view, 8> kCredentialKeywords{
     "password", "passwd",       "secret",     "api_key",
-    "apikey",   "access_token", "auth_token", "private_key"};
-constexpr std::array<std::string_view, 5> kPlaceholderMarkers{"example", "placeholder", "changeme",
-                                                              "xxxx", "your_"};
+    "apikey",   "access_token", "auth_token", "private_key",
+};
+constexpr std::array<std::string_view, 5> kPlaceholderMarkers{
+    "example", "placeholder", "changeme", "xxxx", "your_",
+};
 constexpr std::string_view kPlaceholderStarts = "$<{";
 
-constexpr std::array<std::string_view, 3> kEnvTemplates{".env.example", ".env.sample",
-                                                        ".env.template"};
+constexpr std::array<std::string_view, 3> kEnvTemplates{
+    ".env.example",
+    ".env.sample",
+    ".env.template",
+};
 constexpr std::array<std::string_view, 6> kCredentialNames{
-    ".netrc", ".npmrc", ".pypirc", ".git-credentials", "credentials", "credentials.json"};
-constexpr std::array<std::string_view, 4> kSshKeyPrefixes{"id_rsa", "id_dsa", "id_ecdsa",
-                                                          "id_ed25519"};
-constexpr std::array<std::string_view, 6> kKeyFileSuffixes{".pem", ".key", ".p12",
-                                                           ".pfx", ".jks", ".keystore"};
+    ".netrc", ".npmrc", ".pypirc", ".git-credentials", "credentials", "credentials.json",
+};
+constexpr std::array<std::string_view, 4> kSshKeyPrefixes{
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+};
+constexpr std::array<std::string_view, 6> kKeyFileSuffixes{
+    ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore",
+};
 constexpr std::array<std::string_view, 4> kCredentialDirs{".ssh", ".gnupg", ".aws", ".azure"};
 
 struct CredentialLocation {
@@ -165,14 +198,22 @@ struct CredentialLocation {
 // Matched as component sequences anywhere in the path rather than under $HOME, so other users'
 // homes and a $HOME that differs from the resolved path are covered too.
 constexpr std::array kCredentialLocations{
-    CredentialLocation{.components = {".config", "gcloud"},
-                       .description = "Google Cloud credential directory"},
-    CredentialLocation{.components = {".config", "openrouter"},
-                       .description = "OpenRouter credential directory"},
-    CredentialLocation{.components = {".docker", "config.json"},
-                       .description = "Docker credential file"},
-    CredentialLocation{.components = {".kube", "config"},
-                       .description = "Kubernetes credential file"},
+    CredentialLocation{
+        .components = {".config", "gcloud"},
+        .description = "Google Cloud credential directory",
+    },
+    CredentialLocation{
+        .components = {".config", "openrouter"},
+        .description = "OpenRouter credential directory",
+    },
+    CredentialLocation{
+        .components = {".docker", "config.json"},
+        .description = "Docker credential file",
+    },
+    CredentialLocation{
+        .components = {".kube", "config"},
+        .description = "Kubernetes credential file",
+    },
 };
 
 bool is_in(std::string_view set, char symbol) {
@@ -586,10 +627,10 @@ std::optional<std::string> credential_location_reason(const std::filesystem::pat
 
 } // namespace
 
-std::vector<SecretFinding> scan_text(std::string_view text, std::string_view source) {
+std::vector<SecretFinding> scan_text(const SecretScan& input) {
     std::vector<SecretFinding> findings;
     std::size_t line_number = 0;
-    for (const auto part : std::views::split(text, '\n')) {
+    for (const auto part : std::views::split(input.text, '\n')) {
         ++line_number;
         std::vector<std::string_view> reported;
         for (const Match& match : find_all(std::string_view(part.begin(), part.end()))) {
@@ -597,9 +638,11 @@ std::vector<SecretFinding> scan_text(std::string_view text, std::string_view sou
                 continue;
             }
             reported.push_back(match.pattern);
-            findings.push_back(SecretFinding{.source = std::string(source),
-                                             .line = line_number,
-                                             .pattern = std::string(match.pattern)});
+            findings.push_back(SecretFinding{
+                .source = std::string(input.source),
+                .line = line_number,
+                .pattern = std::string(match.pattern),
+            });
         }
     }
     return findings;

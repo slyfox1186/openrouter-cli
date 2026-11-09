@@ -4,6 +4,7 @@
 #include "credentials.hpp"
 
 #include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -23,7 +24,7 @@ namespace orcli {
 
 namespace {
 
-using json = nlohmann::json;
+using nlohmann::json;
 
 constexpr std::string_view base64url_alphabet =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -53,7 +54,7 @@ bool is_unreserved(char character) {
 
 std::string base64url(std::span<const std::uint8_t> bytes) {
     std::string encoded;
-    encoded.reserve((bytes.size() * 4 + 2) / 3);
+    encoded.reserve(((bytes.size() * 4) + 2) / 3);
     // Only the low `pending` bits of `buffer` are unencoded; higher bits are masked off.
     std::uint32_t buffer = 0;
     unsigned int pending = 0;
@@ -123,9 +124,11 @@ std::string authorization_url(std::string_view challenge, std::string_view key_l
 }
 
 std::string exchange_body(std::string_view code, std::string_view verifier) {
-    const json body = json::object({{"code", std::string{code}},
-                                    {"code_verifier", std::string{verifier}},
-                                    {"code_challenge_method", "S256"}});
+    const json body = json::object({
+        {"code", std::string{code}},
+        {"code_verifier", std::string{verifier}},
+        {"code_challenge_method", "S256"},
+    });
     // Replacement keeps dump() from throwing on a pasted code that is not valid UTF-8.
     return body.dump(compact_dump, ' ', false, json::error_handler_t::replace);
 }

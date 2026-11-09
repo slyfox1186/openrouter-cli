@@ -45,8 +45,8 @@ std::string cycle(std::string_view alphabet, std::size_t length) {
 }
 
 Patterns patterns_in(std::string_view text) {
-    return orcli::scan_text(text, "test") | std::views::transform(&SecretFinding::pattern) |
-           std::ranges::to<Patterns>();
+    return orcli::scan_text({.text = text, .source = "test"}) |
+           std::views::transform(&SecretFinding::pattern) | std::ranges::to<Patterns>();
 }
 
 std::string private_key_header() {
@@ -153,7 +153,7 @@ TEST_CASE("findings carry the source and 1-based line, once per line and pattern
     const std::string aws = "AKIA" + cycle(kUpperChars, kAwsBody);
     const std::string text = "first line\n" + key + " and " + key + "\n" + aws + "\r\n" + aws +
                              " " + key + "\nlast line";
-    const std::vector<SecretFinding> findings = orcli::scan_text(text, "query");
+    const std::vector<SecretFinding> findings = orcli::scan_text({.text = text, .source = "query"});
     REQUIRE(findings.size() == 4);
     CHECK(findings.at(0).source == "query");
     CHECK(findings.at(0).line == 2);
@@ -162,7 +162,7 @@ TEST_CASE("findings carry the source and 1-based line, once per line and pattern
     CHECK(findings.at(1).pattern == "aws-access-key");
     CHECK(findings.at(2).line == 4);
     CHECK(findings.at(3).line == 4);
-    CHECK(orcli::scan_text("no secrets here\n", "system").empty());
+    CHECK(orcli::scan_text({.text = "no secrets here\n", .source = "system"}).empty());
 }
 
 TEST_CASE("credential paths are refused by name and location") {

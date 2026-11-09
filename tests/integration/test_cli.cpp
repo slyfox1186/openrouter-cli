@@ -272,10 +272,12 @@ struct RunResult {
 struct Launch {
     std::vector<std::string> args{};
     std::optional<std::string> stdin_text{};
+    std::optional<fs::path> stdin_path{};
     bool closed_stdout = false; // stdout is a pipe whose read end is already closed
     bool creds_tool = true;     // false: no test credential tool and nothing on PATH
     std::optional<fs::path> home{};
     std::optional<rlim_t> file_size_limit{}; // RLIMIT_FSIZE, with SIGXFSZ ignored
+    std::vector<std::string> extra_env{};    // NAME=value entries added to the environment
 };
 
 std::vector<char*> pointers_to(std::vector<std::string>& strings) {
@@ -384,8 +386,9 @@ public:
         if (launch.stdin_text.has_value()) {
             write_text(in_path, *launch.stdin_text);
         }
-        const UniqueFd in =
-            open_fd(launch.stdin_text.has_value() ? in_path : fs::path("/dev/null"), O_RDONLY);
+        const UniqueFd in = open_fd(
+            launch.stdin_text.has_value() ? in_path : launch.stdin_path.value_or("/dev/null"),
+            O_RDONLY);
         UniqueFd out;
         if (launch.closed_stdout) {
             std::array<int, 2> ends{-1, -1};
@@ -409,6 +412,7 @@ public:
         } else {
             env_strings.push_back("PATH=" + empty_bin().string());
         }
+        std::ranges::copy(launch.extra_env, std::back_inserter(env_strings));
         const std::vector<char*> argv = pointers_to(arg_strings);
         const std::vector<char*> envp = pointers_to(env_strings);
         const std::string workdir = work().string();
@@ -546,8 +550,28 @@ void log_unpriced_call(const Sandbox& sandbox, const std::string& call_id,
     result.call_id = call_id;
     result.outcome = "complete";
     REQUIRE(ledger.append(orcli::pending_record(pending)).has_value());
-    REQUIRE(ledger.append(orcli::generation_record(call_id, generation)).has_value());
+    REQUIRE(
+        ledger.append(orcli::generation_record({.call_id = call_id, .generation_id = generation}))
+            .has_value());
     REQUIRE(ledger.append(orcli::result_record(result)).has_value());
+}
+
+// Removes the SGR color sequences the help pages use.
+std::string strip_escapes(std::string_view text) {
+    std::string plain;
+    bool in_escape = false;
+    for (const char character : text) {
+        if (in_escape) {
+            in_escape = character != 'm';
+            continue;
+        }
+        if (character == '\x1b') {
+            in_escape = true;
+            continue;
+        }
+        plain += character;
+    }
+    return plain;
 }
 
 } // namespace
@@ -1008,6 +1032,93 @@ TEST_CASE("command line grammar") {
     CHECK(server.post_count() == 1);
 }
 
+TEST_CASE("help is shown for -h and --help on every command") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+
+    struct Page {
+        std::vector<std::string> path;
+        std::string usage;
+    };
+    const std::vector<Page> pages{
+        {.path = {}, .usage = "  openrouter-cli [OPTIONS] QUERY\n  openrouter-cli COMMAND\n"},
+        {.path = {"models"}, .usage = "  openrouter-cli models COMMAND\n"},
+        {.path = {"models", "find"}, .usage = "  openrouter-cli models find [OPTIONS] NAME\n"},
+        {.path = {"models", "show"}, .usage = "  openrouter-cli models show MODEL\n"},
+        {.path = {"models", "save"}, .usage = "  openrouter-cli models save ALIAS MODEL_ID\n"},
+        {.path = {"models", "list"}, .usage = "  openrouter-cli models list\n"},
+        {.path = {"spend"}, .usage = "  openrouter-cli spend [OPTIONS]\n"},
+        {.path = {"auth"}, .usage = "  openrouter-cli auth COMMAND\n"},
+        {.path = {"auth", "login"}, .usage = "  openrouter-cli auth login [OPTIONS]\n"},
+        {.path = {"auth", "set"}, .usage = "  openrouter-cli auth set [OPTIONS]\n"},
+        {.path = {"auth", "logout"}, .usage = "  openrouter-cli auth logout [OPTIONS]\n"},
+        {.path = {"status"}, .usage = "  openrouter-cli status\n"},
+        {.path = {"account"}, .usage = "  openrouter-cli account COMMAND\n"},
+        {.path = {"account", "balance"}, .usage = "  openrouter-cli account balance\n"},
+        {.path = {"account", "keys"}, .usage = "  openrouter-cli account keys\n"},
+        {.path = {"account", "credits"}, .usage = "  openrouter-cli account credits\n"},
+        {.path = {"account", "activity"}, .usage = "  openrouter-cli account activity [OPTIONS]\n"},
+    };
+    for (const Page& page : pages) {
+        INFO(page.usage);
+        std::vector<std::string> long_form = page.path;
+        long_form.emplace_back("--help");
+        std::vector<std::string> short_form = page.path;
+        short_form.emplace_back("-h");
+        const RunResult by_long = sandbox.run(long_form);
+        const RunResult by_short = sandbox.run(short_form);
+        CHECK(by_long.code == exit_ok);
+        CHECK(by_short.code == exit_ok);
+        CHECK(by_long.err.empty());
+        CHECK(by_short.out == by_long.out);
+        CHECK(by_long.out.find("\nUSAGE\n" + page.usage) != std::string::npos);
+        CHECK(by_long.out.find('\x1b') == std::string::npos);
+    }
+
+    const std::string root = sandbox.run({"--help"}).out;
+    CHECK(root.starts_with("openrouter-cli "));
+    CHECK(line_starting(root, "  -h, --help ").ends_with("Show this help and exit"));
+    CHECK(line_starting(root, "      --version ").ends_with("Show the version and exit"));
+    CHECK(line_starting(root, "  -m, --model MODEL ").ends_with("~author/family-latest, or name"));
+    CHECK(root.find("HELP") == std::string::npos);
+    CHECK(root.find("VERSION") == std::string::npos);
+    CHECK(root.find("\nEXAMPLES\n") != std::string::npos);
+    const std::string find_page = sandbox.run({"models", "find", "--help"}).out;
+    CHECK(line_starting(find_page, "      --refresh ").ends_with("Refetch the catalog first"));
+    CHECK(find_page.find("REFRESH") == std::string::npos);
+
+    for (const std::size_t width : {std::size_t{60}, std::size_t{80}, std::size_t{100}}) {
+        INFO(width);
+        const RunResult sized = sandbox.run_with(
+            Launch{.args = {"--help"}, .extra_env = {std::format("COLUMNS={}", width)}});
+        CHECK(sized.code == exit_ok);
+        for (const std::string& line : lines_of(sized.out)) {
+            CHECK(line.size() <= width);
+        }
+    }
+    // Example commands are never broken, so only they may run past a 40-column page.
+    constexpr std::size_t narrow = 40;
+    const RunResult narrow_page =
+        sandbox.run_with(Launch{.args = {"--help"}, .extra_env = {"COLUMNS=40"}});
+    for (const std::string& line : lines_of(narrow_page.out)) {
+        if (!line.starts_with("    openrouter-cli ") && !line.starts_with("    git diff ")) {
+            CHECK(line.size() <= narrow);
+        }
+    }
+
+    const RunResult forced =
+        sandbox.run_with(Launch{.args = {"--help"}, .extra_env = {"CLICOLOR_FORCE=1"}});
+    CHECK(forced.code == exit_ok);
+    CHECK(forced.out.find("\x1b[") != std::string::npos);
+    CHECK(strip_escapes(forced.out) == root);
+    const RunResult refused = sandbox.run_with(
+        Launch{.args = {"--help"}, .extra_env = {"NO_COLOR=1", "CLICOLOR_FORCE=1"}});
+    CHECK(refused.out.find('\x1b') == std::string::npos);
+    CHECK(refused.out == root);
+
+    CHECK(server.requests().empty());
+}
+
 TEST_CASE("a closed stdout still leaves a complete answer file") {
     MockServer server;
     Sandbox sandbox(server.port());
@@ -1085,6 +1196,36 @@ TEST_CASE("a session that cannot be saved after a completed call exits 9") {
 }
 
 // ----- spend --resolve -------------------------------------------------------------------------
+
+TEST_CASE("spend reads empty logs and records across read-buffer boundaries") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    const std::string call_id(32, 'c');
+    log_unpriced_call(sandbox, call_id, "gen-unpriced");
+    const std::string records = read_text(sandbox.cost_log());
+    const RunResult baseline = sandbox.run({"spend"});
+    REQUIRE(baseline.code == exit_ok);
+    REQUIRE(baseline.out.contains(call_id));
+
+    constexpr std::size_t chunk_bytes = 65536;
+    for (const std::size_t bytes :
+         {chunk_bytes - 1, chunk_bytes, chunk_bytes + 1, chunk_bytes * 2}) {
+        INFO(bytes);
+        REQUIRE(records.size() < bytes);
+        std::string contents(bytes - records.size(), '\n');
+        contents += records;
+        write_text(sandbox.cost_log(), contents);
+        const RunResult result = sandbox.run({"spend"});
+        CHECK(result.code == exit_ok);
+        CHECK(result.out == baseline.out);
+    }
+
+    write_text(sandbox.cost_log(), "");
+    const RunResult empty = sandbox.run({"spend"});
+    CHECK(empty.code == exit_ok);
+    CHECK(empty.out.contains("no calls logged yet"));
+    CHECK(server.requests().empty());
+}
 
 TEST_CASE("spend --resolve prices calls whose charge has appeared and keeps the rest") {
     MockServer server;
@@ -1265,6 +1406,19 @@ TEST_CASE("auth login exchanges the pasted code without an Authorization header"
     CHECK(login.out.contains("key_label="));
     CHECK_FALSE(login.out.contains("callback_url"));
     CHECK_FALSE(login.all().contains(mock::login_key()));
+    CHECK_FALSE(login.all().contains("mock-code"));
+    CHECK_FALSE(login.out.contains("Paste the code here"));
+    const auto instructions = login.err.find("3. Copy the code");
+    const auto prompt = login.err.find("Paste the code here, then press Enter: ");
+    const auto progress = login.err.find("Completing sign-in with OpenRouter...");
+    const auto success = login.err.find("logged in;");
+    REQUIRE(instructions != std::string::npos);
+    REQUIRE(prompt != std::string::npos);
+    REQUIRE(progress != std::string::npos);
+    REQUIRE(success != std::string::npos);
+    CHECK(instructions < prompt);
+    CHECK(prompt < progress);
+    CHECK(progress < success);
 
     const std::vector<RecordedRequest> checks = server.requests_to("/key");
     REQUIRE(checks.size() == 1U);
@@ -1272,6 +1426,43 @@ TEST_CASE("auth login exchanges the pasted code without an Authorization header"
     REQUIRE(file_exists(sandbox.api_credential()));
     REQUIRE(sandbox.run(ask("question")).code == exit_ok);
     CHECK(server.last_authorization() == bearer(mock::login_key()));
+}
+
+TEST_CASE("auth login shows its prompt before the user supplies a code") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    const fs::path input_path = sandbox.root() / "login-input";
+    REQUIRE(::mkfifo(input_path.c_str(), private_file_mode) == 0);
+    // Keep a writer open so login waits for input instead of seeing EOF.
+    const UniqueFd input = open_fd(input_path, O_RDWR | O_NONBLOCK);
+    Child child = sandbox.spawn(Launch{.args = {"auth", "login"}, .stdin_path = input_path});
+    constexpr std::string_view prompt = "Paste the code here, then press Enter: ";
+    const auto deadline = Clock::now() + output_wait;
+    while (!child.err().contains(prompt) && Clock::now() < deadline) {
+        std::this_thread::sleep_for(poll_interval);
+    }
+    REQUIRE(child.err().ends_with(prompt));
+    CHECK(child.out().contains("https://openrouter.ai/auth?"));
+    CHECK(server.requests().empty());
+    constexpr std::string_view code = "mock-code\n";
+    REQUIRE(::write(input.get(), code.data(), code.size()) == static_cast<ssize_t>(code.size()));
+    CHECK(child.wait() == exit_ok);
+    CHECK(child.err().contains("logged in;"));
+}
+
+TEST_CASE("auth login reports blank input and EOF beneath the prompt without sending") {
+    for (const std::string& input : {std::string(), std::string("\n"), std::string(" \t\r\n")}) {
+        MockServer server;
+        Sandbox sandbox(server.port());
+        const RunResult login =
+            sandbox.run_with(Launch{.args = {"auth", "login"}, .stdin_text = input});
+        CHECK(login.code == exit_usage);
+        CHECK(login.err.contains("Paste the code here, then press Enter: \nopenrouter-cli:"));
+        CHECK(login.err.contains("no code was pasted"));
+        CHECK_FALSE(login.err.contains("Completing sign-in"));
+        CHECK(server.requests().empty());
+        CHECK_FALSE(file_exists(sandbox.api_credential()));
+    }
 }
 
 TEST_CASE("a plaintext key in .env stops every command except auth set, login and logout") {

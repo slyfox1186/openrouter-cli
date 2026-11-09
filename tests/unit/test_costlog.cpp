@@ -103,7 +103,8 @@ std::string result_line(const std::string& call_id, std::optional<double> cost) 
 }
 
 std::string generation_line(const std::string& call_id, const std::string& generation_id) {
-    return record_line(orcli::generation_record(call_id, generation_id));
+    return record_line(
+        orcli::generation_record({.call_id = call_id, .generation_id = generation_id}));
 }
 
 std::string resolved_line(const std::string& call_id, std::optional<double> cost) {
@@ -165,9 +166,10 @@ TEST_CASE("record builders write unknown values as null and zero as zero") {
     const json zero = orcli::result_record(result);
     CHECK(zero.at("cost").is_number());
     CHECK(zero.at("cost") == 0.0);
+    CHECK(zero.at("prompt_tokens").is_number_integer());
     CHECK(zero.at("prompt_tokens") == 0);
 
-    const json generation = orcli::generation_record("abc", "gen-1");
+    const json generation = orcli::generation_record({.call_id = "abc", .generation_id = "gen-1"});
     CHECK(generation.at("type") == "generation");
     CHECK(generation.at("generation_id") == "gen-1");
 
@@ -211,8 +213,8 @@ TEST_CASE("parse_generation keeps a null cost unknown and rejects bodies without
 }
 
 TEST_CASE("fold_log leaves a call with only a pending record unresolved") {
-    const auto report =
-        orcli::fold_log(pending_line("c1", "2026-11-09T10:00:00Z", "vendor/model"), "");
+    const auto report = orcli::fold_log(
+        {.contents = pending_line("c1", "2026-11-09T10:00:00Z", "vendor/model"), .since_iso = ""});
     REQUIRE(report.calls.size() == 1);
     CHECK(report.calls.at(0).state == "pending");
     CHECK_FALSE(report.calls.at(0).cost.has_value());
@@ -224,7 +226,7 @@ TEST_CASE("fold_log leaves a call with only a pending record unresolved") {
 TEST_CASE("fold_log uses the stream cost when the result has one") {
     const std::string log =
         pending_line("c1", "2026-11-09T10:00:00Z", "vendor/model") + result_line("c1", quarter);
-    const auto report = orcli::fold_log(log, "");
+    const auto report = orcli::fold_log({.contents = log, .since_iso = ""});
     REQUIRE(report.calls.size() == 1);
     CHECK(report.calls.at(0).state == "complete");
     CHECK(report.calls.at(0).cost == quarter);
@@ -238,7 +240,7 @@ TEST_CASE("fold_log counts a resolved charge once and never adds it to a stream 
     const std::string resolved_twice = pending_line("c1", "2026-11-09T10:00:00Z", "vendor/model") +
                                        result_line("c1", std::nullopt) + resolved_line("c1", half) +
                                        resolved_line("c1", half);
-    const auto resolved = orcli::fold_log(resolved_twice, "");
+    const auto resolved = orcli::fold_log({.contents = resolved_twice, .since_iso = ""});
     REQUIRE(resolved.calls.size() == 1);
     CHECK(resolved.calls.at(0).cost == half);
     CHECK(resolved.calls.at(0).provider == "Provider A");
@@ -247,12 +249,12 @@ TEST_CASE("fold_log counts a resolved charge once and never adds it to a stream 
 
     const std::string both = pending_line("c2", "2026-11-09T10:00:00Z", "vendor/model") +
                              result_line("c2", quarter) + resolved_line("c2", half);
-    const auto stream_wins = orcli::fold_log(both, "");
+    const auto stream_wins = orcli::fold_log({.contents = both, .since_iso = ""});
     CHECK(stream_wins.known_total == quarter);
 
     const std::string still_unknown = pending_line("c3", "2026-11-09T10:00:00Z", "vendor/model") +
                                       result_line("c3", std::nullopt);
-    const auto unknown = orcli::fold_log(still_unknown, "");
+    const auto unknown = orcli::fold_log({.contents = still_unknown, .since_iso = ""});
     REQUIRE(unknown.unresolved.size() == 1);
     CHECK(unknown.unresolved.at(0).state == "complete");
 }
@@ -262,7 +264,7 @@ TEST_CASE("fold_log reports corrupt lines by number and keeps the valid records"
                             "not json\n" + "\n" + R"({"v":1,"type":"result"})" + "\n" +
                             result_line("c1", quarter) + R"({"v":1,"type":"pend)";
     const std::vector<std::size_t> expected_corrupt{2, 4, 6};
-    const auto report = orcli::fold_log(log, "");
+    const auto report = orcli::fold_log({.contents = log, .since_iso = ""});
     CHECK(report.corrupt_lines == expected_corrupt);
     REQUIRE(report.calls.size() == 1);
     CHECK(report.known_total == quarter);
@@ -276,7 +278,7 @@ TEST_CASE("fold_log uses the earliest record time when the pending record is mis
         R"({"v":1,"type":"generation","call_id":"c9","time":"2026-11-08T08:00:00Z",)"
         R"("generation_id":"g"})"
         "\n";
-    const auto report = orcli::fold_log(log, "");
+    const auto report = orcli::fold_log({.contents = log, .since_iso = ""});
     REQUIRE(report.calls.size() == 1);
     CHECK(report.calls.at(0).time == "2026-11-08T08:00:00Z");
     CHECK(report.calls.at(0).state == "error");
@@ -288,7 +290,7 @@ TEST_CASE("fold_log filters by since and totals by day and by model") {
         pending_line("day1", "2026-11-08T10:00:00Z", "vendor/a") + result_line("day1", quarter) +
         pending_line("day2a", "2026-11-09T10:00:00Z", "vendor/a") + result_line("day2a", eighth) +
         pending_line("day2b", "2026-11-09T11:00:00Z", "vendor/b") + result_line("day2b", quarter);
-    const auto report = orcli::fold_log(log, "2026-11-08T10:00:00Z");
+    const auto report = orcli::fold_log({.contents = log, .since_iso = "2026-11-08T10:00:00Z"});
     REQUIRE(report.calls.size() == 3);
     CHECK(report.calls.at(0).call_id == "day1");
     CHECK(report.calls.at(1).call_id == "day2a");
@@ -301,14 +303,15 @@ TEST_CASE("fold_log filters by since and totals by day and by model") {
     CHECK(report.cost_by_model.at("vendor/a") == quarter + eighth);
     CHECK(report.cost_by_model.at("vendor/b") == quarter);
 
-    CHECK(orcli::fold_log(log, "").calls.size() == 4);
+    CHECK(orcli::fold_log({.contents = log, .since_iso = ""}).calls.size() == 4);
 }
 
 TEST_CASE("format_spend lists totals, unresolved calls and corrupt lines") {
     const std::string log = pending_line("c1", "2026-11-09T10:00:00Z", "vendor/a") +
                             result_line("c1", quarter) +
                             pending_line("c2", "2026-11-09T11:00:00Z", "vendor/b") + "junk\n";
-    const std::string text = orcli::format_spend(orcli::fold_log(log, ""));
+    const std::string text =
+        orcli::format_spend(orcli::fold_log({.contents = log, .since_iso = ""}));
     CHECK(text.find("$0.2500") != std::string::npos);
     CHECK(text.find("2026-11-09") != std::string::npos);
     CHECK(text.find("vendor/a") != std::string::npos);
@@ -348,12 +351,14 @@ TEST_CASE("CostLog::append writes one private JSON line per record") {
     const TempDir temp;
     const fs::path dir = temp.path() / "log";
     const orcli::CostLog log(dir / "costs.jsonl", dir / "costs.lock");
-    REQUIRE(log.append(orcli::generation_record("c1", "g1")).has_value());
-    REQUIRE(log.append(orcli::generation_record("c1", "g2")).has_value());
+    REQUIRE(
+        log.append(orcli::generation_record({.call_id = "c1", .generation_id = "g1"})).has_value());
+    REQUIRE(
+        log.append(orcli::generation_record({.call_id = "c1", .generation_id = "g2"})).has_value());
     CHECK(fs::symlink_status(dir).permissions() == fs::perms::owner_all);
     CHECK(fs::symlink_status(log.file()).permissions() ==
           (fs::perms::owner_read | fs::perms::owner_write));
-    const auto report = orcli::fold_log(read_file(log.file()), "");
+    const auto report = orcli::fold_log({.contents = read_file(log.file()), .since_iso = ""});
     CHECK(report.corrupt_lines.empty());
     REQUIRE(report.calls.size() == 1);
     CHECK(report.calls.at(0).call_id == "c1");
@@ -369,7 +374,7 @@ TEST_CASE("CostLog::append serializes a record holding invalid UTF-8 without thr
     const json record = orcli::pending_record(info);
     CHECK_NOTHROW(record_line(record));
     REQUIRE(log.append(record).has_value());
-    const auto report = orcli::fold_log(read_file(log.file()), "");
+    const auto report = orcli::fold_log({.contents = read_file(log.file()), .since_iso = ""});
     CHECK(report.corrupt_lines.empty());
     REQUIRE(report.calls.size() == 1);
     CHECK(report.calls.at(0).call_id == "c1");
@@ -378,7 +383,7 @@ TEST_CASE("CostLog::append serializes a record holding invalid UTF-8 without thr
 TEST_CASE("fold_log carries the generation id onto the call") {
     const std::string log = pending_line("c1", "2026-11-09T10:00:00Z", "vendor/model") +
                             generation_line("c1", "gen-1") + result_line("c1", quarter);
-    const auto report = orcli::fold_log(log, "");
+    const auto report = orcli::fold_log({.contents = log, .since_iso = ""});
     REQUIRE(report.calls.size() == 1);
     CHECK(report.calls.at(0).generation_id == "gen-1");
     CHECK(report.unresolved.empty());
@@ -387,7 +392,7 @@ TEST_CASE("fold_log carries the generation id onto the call") {
 TEST_CASE("a call killed before its result is unresolved with its generation id") {
     const std::string log =
         pending_line("c1", "2026-11-09T10:00:00Z", "vendor/model") + generation_line("c1", "gen-1");
-    const auto report = orcli::fold_log(log, "");
+    const auto report = orcli::fold_log({.contents = log, .since_iso = ""});
     REQUIRE(report.unresolved.size() == 1);
     CHECK(report.unresolved.at(0).call_id == "c1");
     CHECK(report.unresolved.at(0).state == "pending");
@@ -399,11 +404,12 @@ TEST_CASE("fold_log keeps the first non-empty generation id") {
     const std::string log = pending_line("c1", "2026-11-09T10:00:00Z", "vendor/model") +
                             generation_line("c1", "") + generation_line("c1", "gen-first") +
                             generation_line("c1", "gen-second");
-    const auto report = orcli::fold_log(log, "");
+    const auto report = orcli::fold_log({.contents = log, .since_iso = ""});
     REQUIRE(report.calls.size() == 1);
     CHECK(report.calls.at(0).generation_id == "gen-first");
 
-    const auto without = orcli::fold_log(pending_line("c2", "2026-11-09T10:00:00Z", "m"), "");
+    const auto without = orcli::fold_log(
+        {.contents = pending_line("c2", "2026-11-09T10:00:00Z", "m"), .since_iso = ""});
     REQUIRE(without.calls.size() == 1);
     CHECK_FALSE(without.calls.at(0).generation_id.has_value());
 }
@@ -412,7 +418,7 @@ TEST_CASE("a generation id does not change how a resolved charge is counted") {
     const std::string log = pending_line("c1", "2026-11-09T10:00:00Z", "vendor/model") +
                             generation_line("c1", "gen-1") + result_line("c1", std::nullopt) +
                             resolved_line("c1", half) + resolved_line("c1", half);
-    const auto report = orcli::fold_log(log, "");
+    const auto report = orcli::fold_log({.contents = log, .since_iso = ""});
     REQUIRE(report.calls.size() == 1);
     CHECK(report.calls.at(0).generation_id == "gen-1");
     CHECK(report.calls.at(0).cost == half);

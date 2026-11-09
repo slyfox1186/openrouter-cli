@@ -47,17 +47,24 @@ Later steps still run after a failure, so one log shows everything. The log is s
 `build/logs/build-<UTC time>.log`, with `build/logs/latest.log` pointing to the newest one, and
 ends with a summary of failed steps. The script exits 0 only if every step it ran passed.
 
+Each integration case's result is shown as it finishes, including its name and elapsed time.
+The suite deliberately exercises timeouts and retries, including a 30-second wait for a missing
+generation record, so pauses between completed cases are expected. A recorded local integration
+run took about 80 seconds. Let the suite finish to see its result; failures still block installation.
+Clang-tidy also prints each source file's result and elapsed time before moving to the next file.
+
 | Option | Effect |
 | --- | --- |
 | `--force` | Overwrite an existing, different `openrouter-cli` in the bin directory, and re-point skill links that point elsewhere. |
 | `--bin-dir DIR` | Install the binary to `DIR` (default `~/.local/bin`). |
-| `--no-skill` | Install only the binary. |
+| `--no-skill` | Install, or with `--uninstall` remove, only the binary and not the skill links. |
 | `--no-install` | Run the checks and build; install nothing. |
+| `--uninstall` | Remove the installed binary and skill links, then exit without building (see [What gets installed](#what-gets-installed)). Combines only with `--bin-dir` and `--no-skill`. |
 | `--quick` | Skip the format check, debug build, tests, clang-tidy and cppcheck: release build, static-link check and install only. |
 | `--fresh` | Reconfigure every build directory from scratch. |
 | `--jobs N` | Parallel build jobs (default: `nproc`). |
 | `--list-compilers` | Show every Clang found and mark the one that would be used, then exit. |
-| `-h`, `--help` | Show the options. |
+| `-h`, `--help` | Show the options, in color on a terminal (see [Usage](#usage) for the rules). |
 
 Each Clang version gets its own build directories, `build/debug-clang-<version>` and
 `build/release-clang-<version>`; clang-tidy and cppcheck read the debug tree's compile database.
@@ -80,11 +87,18 @@ The installed binary is a standalone copy, so you can move it. It keeps the proj
 compiled in and reads `.env` and `state/` from there; set `OPENROUTER_CLI_HOME` to use another
 project directory.
 
-To remove the install (the skill paths are links, so this leaves `skill/` untouched):
+To remove the install:
 
 ```bash
-rm ~/.local/bin/openrouter-cli ~/.agents/skills/openrouter-cli ~/.claude/skills/openrouter-cli
+scripts/build.sh --uninstall
 ```
+
+It deletes the binary (a file or link) in the bin directory and both skill links, wherever they
+point; removing a link leaves its target, so `skill/` is untouched. It refuses to delete a
+directory at the binary path or a real file or directory at a skill path, and exits 1 if
+anything was refused or a path could not be checked. Pass the same `--bin-dir` you
+installed with. Any other `openrouter-cli` still on `PATH` is listed but not removed. Nothing is
+built, and the run is not logged.
 
 Stored keys stay in `state/credentials/`; run `openrouter-cli auth logout` first to delete them.
 
@@ -99,8 +113,11 @@ openrouter-cli auth login
 ```
 
 `auth login` uses OpenRouter's OAuth sign-in. It prints a URL; open it in any browser, sign in
-with your OpenRouter email and password on openrouter.ai, approve, and paste the code the page
-shows back into the terminal. The code is valid for 10 minutes and works once. OpenRouter then creates an
+with your OpenRouter email and password on openrouter.ai, and approve access. Copy the code shown
+on the page, return to the terminal, and paste it at `Paste the code here, then press Enter:`
+below the URL. Press Enter to submit it. The terminal shows `Completing sign-in with OpenRouter...`
+while the CLI exchanges the code and stores your key. The code is valid for 10 minutes and works once.
+OpenRouter then creates an
 API key labelled `openrouter-cli on HOST` in your account, which the CLI checks and stores
 encrypted. The CLI never asks for or sees your password. Because only a URL and a code change
 hands, this works over SSH: open the URL on any computer.
@@ -264,6 +281,13 @@ openrouter-cli spend [--since today|7d|30d|all] [--resolve]
 
 Options come first and the query comes last. Put `--` before a query that starts with `-` or is a
 subcommand name. Question options cannot be combined with a subcommand.
+
+Every command and subcommand takes `-h` or `--help`, for example `openrouter-cli --help` or
+`openrouter-cli models find -h`. The top-level page lists every command with its arguments and
+ends with examples. Help is in color when stdout is a terminal whose `TERM` is set and is not
+`dumb`. A non-empty `NO_COLOR` turns color off, and `CLICOLOR_FORCE=1` turns it on for a pager
+such as `less -R`. Text wraps to the terminal width, held between 40 and 100 columns; piped help
+uses `COLUMNS` when it is set, otherwise 80. `scripts/build.sh --help` follows the same color rules.
 
 | Option | Meaning |
 | --- | --- |

@@ -1,5 +1,9 @@
 #include "commands.hpp"
 
+#include "common.hpp"
+#include "config.hpp"
+#include "credentials.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdio>
@@ -32,7 +36,7 @@ std::string host_name() {
     if (::gethostname(buffer.data(), buffer.size() - 1) != 0) {
         return "this PC";
     }
-    std::string name(buffer.data());
+    const std::string name(buffer.data());
     return name.empty() ? std::string("this PC") : name;
 }
 

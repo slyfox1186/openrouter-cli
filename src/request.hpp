@@ -1,9 +1,12 @@
-#pragma once
+#ifndef ORCLI_REQUEST_HPP
+#define ORCLI_REQUEST_HPP
 
 #include "common.hpp"
 #include "models.hpp"
 
+#include <cstdint>
 #include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 
 #include <optional>
 #include <string>
@@ -12,7 +15,7 @@
 
 namespace orcli {
 
-enum class Role {
+enum class Role : std::uint8_t {
     review,
     plain,
 };
@@ -44,3 +47,5 @@ struct BuiltRequest {
 Result<BuiltRequest> build_request(const RequestInput& input);
 
 } // namespace orcli
+
+#endif // ORCLI_REQUEST_HPP

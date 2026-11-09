@@ -54,7 +54,15 @@ set(_orcli_build_testing ${BUILD_TESTING})
 set(BUILD_TESTING OFF)
 set(BUILD_SHARED_LIBS OFF)
 
-FetchContent_MakeAvailable(nlohmann_json cli11 jitterentropy)
+FetchContent_MakeAvailable(nlohmann_json cli11)
+# jitterentropy 3.6.3 requests CMake 2.8.12 policies, which CMake 4 rejects. A 3.10 floor
+# also avoids the deprecation warning. Keep higher caller floors and restore the prior value.
+block(SCOPE_FOR VARIABLES)
+    if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM OR CMAKE_POLICY_VERSION_MINIMUM VERSION_LESS 3.10)
+        set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
+    endif()
+    FetchContent_MakeAvailable(jitterentropy)
+endblock()
 
 set(OPENSSL_USE_STATIC_LIBS TRUE)
 find_package(OpenSSL 3 REQUIRED)
@@ -65,7 +73,8 @@ find_package(Threads REQUIRED)
 set_property(TARGET OpenSSL::Crypto APPEND PROPERTY INTERFACE_LINK_LIBRARIES
     jitterentropy ${ORCLI_ZLIB_STATIC} ${ORCLI_ZSTD_STATIC} ${CMAKE_DL_LIBS} Threads::Threads)
 
-# HTTPS client only: every other protocol and optional library is off.
+# HTTP is needed by the offline mock server; HTTPS serves the API.
+# Disable other protocols and unused optional libraries.
 set(BUILD_STATIC_LIBS ON)
 set(BUILD_CURL_EXE OFF)
 set(BUILD_EXAMPLES OFF)
@@ -83,15 +92,18 @@ set(CURL_USE_GSSAPI OFF)
 set(USE_LIBIDN2 OFF)
 set(USE_NGHTTP2 OFF)
 set(USE_NGTCP2 OFF)
-set(CURL_ZLIB OFF)
-set(CURL_BROTLI OFF)
-set(CURL_ZSTD OFF)
+# curl's tri-state cache defaults can replace normal variables on a fresh configure.
+set(CURL_ZLIB OFF CACHE STRING "Build curl without zlib compression" FORCE)
+set(CURL_BROTLI OFF CACHE STRING "Build curl without Brotli compression" FORCE)
+set(CURL_ZSTD OFF CACHE STRING "Build curl without zstd compression" FORCE)
 set(CURL_DISABLE_LDAP ON)
 set(CURL_DISABLE_DICT ON)
 set(CURL_DISABLE_FILE ON)
 set(CURL_DISABLE_FTP ON)
 set(CURL_DISABLE_GOPHER ON)
 set(CURL_DISABLE_IMAP ON)
+# IPFS/IPNS are curl-tool features; disable them so the summary matches our libcurl build.
+set(CURL_DISABLE_IPFS ON)
 set(CURL_DISABLE_MQTT ON)
 set(CURL_DISABLE_POP3 ON)
 set(CURL_DISABLE_RTSP ON)
@@ -159,12 +171,18 @@ if(BUILD_TESTING)
     target_compile_definitions(orcli_core PRIVATE ORCLI_TEST_HOOKS)
 endif()
 
+# The help formatter is its own library so the unit tests can render pages without main.cpp.
+add_library(orcli_help STATIC src/help.cpp)
+target_include_directories(orcli_help PUBLIC src)
+target_link_libraries(orcli_help PUBLIC CLI11::CLI11 orcli_flags)
+
 add_executable(openrouter-cli src/main.cpp)
-target_link_libraries(openrouter-cli PRIVATE orcli_core CLI11::CLI11 orcli_flags)
+target_link_libraries(openrouter-cli PRIVATE orcli_core orcli_help CLI11::CLI11 orcli_flags)
 target_link_options(openrouter-cli PRIVATE -static-libstdc++ -static-libgcc)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    set_property(TARGET orcli_core openrouter-cli PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+    set_property(TARGET orcli_core orcli_help openrouter-cli
+        PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
 endif()
 
 if(BUILD_TESTING)

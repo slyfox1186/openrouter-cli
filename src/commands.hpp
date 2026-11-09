@@ -1,4 +1,5 @@
-#pragma once
+#ifndef ORCLI_COMMANDS_HPP
+#define ORCLI_COMMANDS_HPP
 
 #include "common.hpp"
 #include "config.hpp"
@@ -58,3 +59,5 @@ int cmd_account_credits(const Config& config);            // GET /credits, manag
 int cmd_account_activity(const Config& config, int days); // GET /activity, management key
 
 } // namespace orcli
+
+#endif // ORCLI_COMMANDS_HPP

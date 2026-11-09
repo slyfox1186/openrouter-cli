@@ -1,8 +1,10 @@
-#pragma once
+#ifndef ORCLI_MODELS_HPP
+#define ORCLI_MODELS_HPP
 
 #include "common.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -13,7 +15,7 @@
 
 namespace orcli {
 
-enum class EffortSupport {
+enum class EffortSupport : std::uint8_t {
     none,   // no reasoning.supported_efforts field: effort cannot be selected
     any,    // supported_efforts is null: every effort is accepted
     listed, // supported_efforts is a list
@@ -53,7 +55,7 @@ struct AliasEntry {
 };
 
 struct Resolution {
-    enum class Kind { found, ambiguous, none };
+    enum class Kind : std::uint8_t { found, ambiguous, none };
     Kind kind = Kind::none;
     std::optional<ModelInfo> model;       // concrete model (a "~...-latest" alias is followed)
     std::vector<ModelInfo> candidates;    // for ambiguous
@@ -98,3 +100,5 @@ Result<void> save_alias(const std::filesystem::path& state_dir, const std::strin
                         const std::string& model_id);
 
 } // namespace orcli
+
+#endif // ORCLI_MODELS_HPP

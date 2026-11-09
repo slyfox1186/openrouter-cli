@@ -1,4 +1,5 @@
-#pragma once
+#ifndef ORCLI_FSUTIL_HPP
+#define ORCLI_FSUTIL_HPP
 
 #include "common.hpp"
 
@@ -29,7 +30,7 @@ public:
     ~FileLock();
 
 private:
-    explicit FileLock(int fd) : fd_(fd) {}
+    explicit FileLock(int descriptor) : fd_(descriptor) {}
     int fd_ = -1;
 };
 
@@ -54,10 +55,16 @@ Result<void> atomic_write(const std::filesystem::path& target, std::string_view 
 // Creates a new file with O_CREAT|O_EXCL|O_NOFOLLOW and mode 0600; returns the descriptor.
 Result<int> create_exclusive(const std::filesystem::path& file);
 
+struct AppendPaths {
+    std::filesystem::path file;
+    std::filesystem::path lock_file;
+};
+
 // Appends data (which must end in '\n') under lock_file. If the file does not end with a
 // newline, one is written first so a crashed partial line cannot swallow this record. Checks
 // every write and fsyncs before releasing the lock. Creates the file 0600 when missing.
-Result<void> append_record(const std::filesystem::path& file, const std::filesystem::path& lock_file,
-                           std::string_view data);
+Result<void> append_record(const AppendPaths& paths, std::string_view data);
 
 } // namespace orcli
+
+#endif // ORCLI_FSUTIL_HPP

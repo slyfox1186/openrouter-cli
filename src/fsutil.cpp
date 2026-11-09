@@ -4,6 +4,7 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdio>
 #include <expected>
 #include <filesystem>
 #include <format>
@@ -261,7 +262,7 @@ Result<Replaced> atomic_replace(const fs::path& target, std::string_view data) {
     if (!written) {
         return std::unexpected(written.error());
     }
-    if (::rename(temp.c_str(), target.c_str()) != 0) {
+    if (std::rename(temp.c_str(), target.c_str()) != 0) {
         return sys_fail("rename into place", target);
     }
     guard.dismiss();
@@ -321,26 +322,26 @@ Result<void> repair_trailing_newline(int descriptor, const fs::path& file) {
 
 } // namespace
 
-Result<void> append_record(const fs::path& file, const fs::path& lock_file, std::string_view data) {
+Result<void> append_record(const AppendPaths& paths, std::string_view data) {
     if (data.empty() || !data.ends_with('\n')) {
         return fail(Exit::usage, "internal error: an appended record must end with a newline");
     }
-    const auto lock = FileLock::acquire(lock_file, true);
+    const auto lock = FileLock::acquire(paths.lock_file, true);
     if (!lock) {
         return std::unexpected(lock.error());
     }
-    const auto checked = check_private_file(file);
+    const auto checked = check_private_file(paths.file);
     if (!checked) {
         return std::unexpected(checked.error());
     }
-    auto handle = open_file(file, O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
+    auto handle = open_file(paths.file, O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
     if (!handle) {
         return std::unexpected(handle.error());
     }
-    return repair_trailing_newline(handle->get(), file)
-        .and_then([&] { return write_all(handle->get(), data, file); })
-        .and_then([&] { return sync_descriptor(handle->get(), file); })
-        .and_then([&] { return handle->close(file); });
+    return repair_trailing_newline(handle->get(), paths.file)
+        .and_then([&] { return write_all(handle->get(), data, paths.file); })
+        .and_then([&] { return sync_descriptor(handle->get(), paths.file); })
+        .and_then([&] { return handle->close(paths.file); });
 }
 
 } // namespace orcli

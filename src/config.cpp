@@ -55,29 +55,49 @@ template <class T> struct NumberSetting {
     T fallback;
 };
 
-constexpr TextSetting base_url_setting{.key = "OPENROUTER_CLI_BASE_URL",
-                                       .fallback = "https://openrouter.ai/api/v1"};
+constexpr TextSetting base_url_setting{
+    .key = "OPENROUTER_CLI_BASE_URL",
+    .fallback = "https://openrouter.ai/api/v1",
+};
 constexpr TextSetting app_referer_setting{.key = "OPENROUTER_CLI_APP_REFERER", .fallback = ""};
-constexpr TextSetting app_title_setting{.key = "OPENROUTER_CLI_APP_TITLE",
-                                        .fallback = "openrouter-cli"};
-constexpr TextSetting app_categories_setting{.key = "OPENROUTER_CLI_APP_CATEGORIES",
-                                             .fallback = "cli-agent"};
-constexpr TextSetting default_effort_setting{.key = "OPENROUTER_CLI_DEFAULT_EFFORT",
-                                             .fallback = "high"};
+constexpr TextSetting app_title_setting{
+    .key = "OPENROUTER_CLI_APP_TITLE",
+    .fallback = "openrouter-cli",
+};
+constexpr TextSetting app_categories_setting{
+    .key = "OPENROUTER_CLI_APP_CATEGORIES",
+    .fallback = "cli-agent",
+};
+constexpr TextSetting default_effort_setting{
+    .key = "OPENROUTER_CLI_DEFAULT_EFFORT",
+    .fallback = "high",
+};
 constexpr TextSetting privacy_setting{.key = "OPENROUTER_CLI_PRIVACY", .fallback = "zdr"};
 
 constexpr NumberSetting<long long> max_output_tokens_setting{
-    .key = "OPENROUTER_CLI_MAX_OUTPUT_TOKENS", .fallback = 64000};
-constexpr NumberSetting<int> catalog_ttl_setting{.key = "OPENROUTER_CLI_CATALOG_TTL_HOURS",
-                                                 .fallback = 24};
-constexpr NumberSetting<int> idle_timeout_setting{.key = "OPENROUTER_CLI_IDLE_TIMEOUT_SECONDS",
-                                                  .fallback = 300};
-constexpr NumberSetting<int> total_timeout_setting{.key = "OPENROUTER_CLI_TOTAL_TIMEOUT_SECONDS",
-                                                   .fallback = 3600};
-constexpr NumberSetting<std::size_t> max_file_bytes_setting{.key = "OPENROUTER_CLI_MAX_FILE_BYTES",
-                                                            .fallback = 1048576};
+    .key = "OPENROUTER_CLI_MAX_OUTPUT_TOKENS",
+    .fallback = 64000,
+};
+constexpr NumberSetting<int> catalog_ttl_setting{
+    .key = "OPENROUTER_CLI_CATALOG_TTL_HOURS",
+    .fallback = 24,
+};
+constexpr NumberSetting<int> idle_timeout_setting{
+    .key = "OPENROUTER_CLI_IDLE_TIMEOUT_SECONDS",
+    .fallback = 300,
+};
+constexpr NumberSetting<int> total_timeout_setting{
+    .key = "OPENROUTER_CLI_TOTAL_TIMEOUT_SECONDS",
+    .fallback = 3600,
+};
+constexpr NumberSetting<std::size_t> max_file_bytes_setting{
+    .key = "OPENROUTER_CLI_MAX_FILE_BYTES",
+    .fallback = 1048576,
+};
 constexpr NumberSetting<std::size_t> max_input_bytes_setting{
-    .key = "OPENROUTER_CLI_MAX_INPUT_BYTES", .fallback = 4194304};
+    .key = "OPENROUTER_CLI_MAX_INPUT_BYTES",
+    .fallback = 4194304,
+};
 
 std::string_view trim(std::string_view text) {
     const std::size_t first = text.find_first_not_of(blank_chars);
@@ -130,9 +150,11 @@ EnvLine classify_line(std::string_view raw) {
     if (!is_valid_key(key)) {
         return non_assignment(EnvLine::Kind::bad_key);
     }
-    return EnvLine{.kind = EnvLine::Kind::assignment,
-                   .key = key,
-                   .value = unquote(trim(line.substr(equals + 1)))};
+    return EnvLine{
+        .kind = EnvLine::Kind::assignment,
+        .key = key,
+        .value = unquote(trim(line.substr(equals + 1))),
+    };
 }
 
 // Empty for a missing key, so callers treat missing and empty alike: a copied .env.example with a
@@ -211,7 +233,7 @@ Result<Privacy> parse_privacy(std::string_view value) {
         return Privacy::no_training;
     }
     return fail(Exit::config,
-                std::format("{} must be \"zdr\" or \"no-training\"", privacy_setting.key));
+                std::format(R"({} must be "zdr" or "no-training")", privacy_setting.key));
 }
 
 Result<Config> config_from_env(const EnvMap& env) {
@@ -317,8 +339,10 @@ std::vector<PlaintextKey> find_plaintext_keys(std::string_view env_text) {
         const EnvLine line = classify_line(std::string_view{piece.begin(), piece.end()});
         if (line.kind == EnvLine::Kind::assignment && !line.value.empty() &&
             std::ranges::contains(plaintext_key_names, line.key)) {
-            keys.push_back(PlaintextKey{.name = std::string{line.key},
-                                        .line = static_cast<std::size_t>(index) + 1});
+            keys.push_back(PlaintextKey{
+                .name = std::string{line.key},
+                .line = static_cast<std::size_t>(index) + 1,
+            });
         }
     }
     return keys;
@@ -342,8 +366,10 @@ Result<Config> load_config(const std::filesystem::path& home,
     }
     Result<Config> config =
         parse_env(*text).and_then(config_from_env).transform_error([&env_path](const Error& error) {
-            return Error{.code = error.code,
-                         .message = std::format("{}: {}", env_path.string(), error.message)};
+            return Error{
+                .code = error.code,
+                .message = std::format("{}: {}", env_path.string(), error.message),
+            };
         });
     if (!config.has_value()) {
         return config;

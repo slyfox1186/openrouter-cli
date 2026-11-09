@@ -1,3 +1,9 @@
+// POSIX APIs use C linkage. Including wait first gives its macros their public-header origin.
+extern "C" {
+#include <signal.h>
+#include <sys/wait.h>
+}
+
 #include "credentials.hpp"
 
 #include "common.hpp"
@@ -8,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -28,11 +35,8 @@
 #include <vector>
 
 #include <fcntl.h>
-#include <poll.h>
-#include <signal.h>
 #include <spawn.h>
-#include <sys/types.h>
-#include <sys/wait.h>
+#include <sys/poll.h>
 #include <unistd.h>
 
 namespace orcli {
@@ -58,6 +62,8 @@ constexpr std::chrono::milliseconds poll_slice{100};
 constexpr std::chrono::milliseconds reap_slice{10};
 constexpr std::size_t output_slot = 0;
 constexpr std::size_t input_slot = 1;
+constexpr unsigned int poll_closed_bits = POLLERR | POLLHUP;
+constexpr unsigned int poll_readable_bits = POLLIN | POLLHUP | POLLERR;
 
 std::unexpected<Error> sys_fail_code(std::string_view action, int error_number) {
     return fail(Exit::config,
@@ -274,7 +280,8 @@ Result<void> feed(Descriptor& to_child, short revents, std::string_view& pending
     if (!to_child.valid() || revents == 0) {
         return {};
     }
-    if ((revents & (POLLERR | POLLHUP)) != 0) {
+    const auto events = static_cast<unsigned int>(std::bit_cast<unsigned short>(revents));
+    if ((events & poll_closed_bits) != 0) {
         to_child.reset();
         return {};
     }
@@ -326,7 +333,9 @@ Result<void> communicate(const Run& run, Descriptor& to_child, const Descriptor&
         if (!fed) {
             return fed;
         }
-        if ((slots.at(output_slot).revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+        const auto output_events =
+            static_cast<unsigned int>(std::bit_cast<unsigned short>(slots.at(output_slot).revents));
+        if ((output_events & poll_readable_bits) != 0) {
             const auto more = output.read_from(from_child.get(), run.action);
             if (!more) {
                 return std::unexpected(more.error());
@@ -383,7 +392,10 @@ Result<SecretString> run_tool(const CredsTool& tool, std::string_view action,
     from_child->write_end.reset();
 
     const Run run{
-        .action = action, .timeout = tool.timeout, .deadline = Clock::now() + tool.timeout};
+        .action = action,
+        .timeout = tool.timeout,
+        .deadline = Clock::now() + tool.timeout,
+    };
     OutputBuffer output;
     const auto communicated =
         communicate(run, to_child->write_end, from_child->read_end, input, output);

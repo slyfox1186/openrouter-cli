@@ -4,6 +4,7 @@
 #include "fsutil.hpp"
 
 #include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 
 #include <algorithm>
 #include <array>
@@ -29,7 +30,7 @@
 namespace orcli {
 namespace {
 
-using json = nlohmann::json;
+using nlohmann::json;
 
 constexpr std::string_view catalog_file_name = "catalog.json";
 constexpr std::string_view aliases_file_name = "models.json";
@@ -408,7 +409,11 @@ std::string render_row(const std::array<std::string, Columns>& row,
                        const std::array<std::size_t, Columns>& widths) {
     std::string line;
     for (const auto& [cell, width] : std::views::zip(row, widths)) {
-        line += std::format("{:<{}}", cell, width + column_gap);
+        // Padding by hand: a nested width ("{:<{}}") is rejected by Clang with libstdc++ 15
+        // (llvm/llvm-project#151371).
+        const std::size_t start = line.size();
+        line += cell;
+        line.resize(start + std::max(cell.size(), width + column_gap), ' ');
     }
     while (line.ends_with(' ')) {
         line.pop_back();
@@ -437,12 +442,14 @@ constexpr std::size_t candidate_columns = 6;
 using CandidateRow = std::array<std::string, candidate_columns>;
 
 CandidateRow candidate_row(const ModelInfo& model) {
-    return CandidateRow{model.id,
-                        model.name,
-                        with_commas(model.context_length),
-                        optional_count(model.max_completion_tokens),
-                        per_million(model.pricing.prompt),
-                        per_million(model.pricing.completion)};
+    return CandidateRow{
+        model.id,
+        model.name,
+        with_commas(model.context_length),
+        optional_count(model.max_completion_tokens),
+        per_million(model.pricing.prompt),
+        per_million(model.pricing.completion),
+    };
 }
 
 constexpr std::size_t endpoint_columns = 7;
@@ -457,13 +464,15 @@ std::string endpoint_notes(const Endpoint& endpoint) {
 }
 
 EndpointRow endpoint_row(const Endpoint& endpoint) {
-    return EndpointRow{endpoint.tag,
-                       endpoint.provider_name,
-                       per_million(endpoint.prompt_price),
-                       per_million(endpoint.completion_price),
-                       with_commas(endpoint.context_length),
-                       optional_count(endpoint.max_completion_tokens),
-                       endpoint_notes(endpoint)};
+    return EndpointRow{
+        endpoint.tag,
+        endpoint.provider_name,
+        per_million(endpoint.prompt_price),
+        per_million(endpoint.completion_price),
+        with_commas(endpoint.context_length),
+        optional_count(endpoint.max_completion_tokens),
+        endpoint_notes(endpoint),
+    };
 }
 
 std::string join(const std::vector<std::string>& items, std::string_view separator) {
@@ -507,8 +516,11 @@ struct Field {
 std::string render_fields(const std::vector<Field>& fields) {
     std::string text;
     for (const Field& field : fields) {
-        text +=
-            std::format("{:<{}}{}\n", std::format("{}:", field.label), label_width, field.value);
+        std::string label = std::format("{}:", field.label);
+        label.resize(std::max(label.size(), label_width), ' ');
+        text += label;
+        text += field.value;
+        text += '\n';
     }
     return text;
 }
@@ -549,7 +561,7 @@ Result<std::string> read_private_file(const std::filesystem::path& file) {
     if (const auto checked = check_private_file(file); !checked) {
         return std::unexpected(checked.error());
     }
-    std::ifstream input(file, std::ios::binary);
+    const std::ifstream input(file, std::ios::binary);
     if (!input) {
         return fail(Exit::config, std::format("cannot open {}", file.string()));
     }
@@ -581,9 +593,10 @@ std::optional<CachedCatalog> decode_catalog_cache(std::string_view text) {
     if (!models) {
         return std::nullopt;
     }
-    return CachedCatalog{.catalog =
-                             Catalog{.models = std::move(*models), .fetched_at = *fetched_at},
-                         .fetched = *fetched};
+    return CachedCatalog{
+        .catalog = Catalog{.models = std::move(*models), .fetched_at = *fetched_at},
+        .fetched = *fetched,
+    };
 }
 
 // An unreadable or corrupt cache is not an error: the catalog is fetched again.
@@ -643,9 +656,10 @@ std::optional<std::map<std::string, AliasEntry>> decode_aliases(std::string_view
             return std::nullopt;
         }
         aliases.insert_or_assign(
-            item.key(),
-            AliasEntry{.model_id = std::move(*model_id),
-                       .saved = string_member(item.value(), "saved").value_or(std::string{})});
+            item.key(), AliasEntry{
+                            .model_id = std::move(*model_id),
+                            .saved = string_member(item.value(), "saved").value_or(std::string{}),
+                        });
     }
     return aliases;
 }
@@ -753,14 +767,16 @@ Resolution resolve(std::string_view name, const std::vector<ModelInfo>& catalog,
 
 std::string format_candidates(const std::vector<ModelInfo>& models) {
     std::vector<CandidateRow> rows{
-        CandidateRow{"ID", "NAME", "CONTEXT", "MAX OUTPUT", "INPUT", "OUTPUT"}};
+        CandidateRow{"ID", "NAME", "CONTEXT", "MAX OUTPUT", "INPUT", "OUTPUT"},
+    };
     rows.append_range(models | std::views::transform(candidate_row));
     return render_table(rows);
 }
 
 std::string format_endpoints(const std::vector<Endpoint>& endpoints) {
     std::vector<EndpointRow> rows{
-        EndpointRow{"TAG", "PROVIDER", "INPUT", "OUTPUT", "CONTEXT", "MAX OUTPUT", "NOTES"}};
+        EndpointRow{"TAG", "PROVIDER", "INPUT", "OUTPUT", "CONTEXT", "MAX OUTPUT", "NOTES"},
+    };
     rows.append_range(endpoints | std::views::transform(endpoint_row));
     return render_table(rows) + "Pass a tag (or its provider prefix, e.g. google-vertex) to "
                                 "--provider to use only those endpoints.\n";
@@ -770,9 +786,10 @@ std::string format_model(const ModelInfo& model, std::string_view catalog_fetche
     std::vector<Field> fields;
     fields.push_back({.label = "ID", .value = model.id});
     fields.push_back({.label = "Name", .value = model.name});
-    fields.push_back({.label = "Canonical slug",
-                      .value = model.canonical_slug.empty() ? std::string(not_available)
-                                                            : model.canonical_slug});
+    fields.push_back({
+        .label = "Canonical slug",
+        .value = model.canonical_slug.empty() ? std::string(not_available) : model.canonical_slug,
+    });
     if (model.alias_target.has_value()) {
         fields.push_back({.label = "Alias for", .value = *model.alias_target});
     }

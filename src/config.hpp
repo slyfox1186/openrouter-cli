@@ -1,4 +1,5 @@
-#pragma once
+#ifndef ORCLI_CONFIG_HPP
+#define ORCLI_CONFIG_HPP
 
 #include "common.hpp"
 
@@ -22,7 +23,8 @@ struct PlaintextKey {
 struct Config {
     std::filesystem::path home;      // project directory holding .env and state/
     std::filesystem::path state_dir; // home / "state"
-    std::filesystem::path cost_log;  // $XDG_STATE_HOME or ~/.local/state, then openrouter-cli/costs.jsonl
+    std::filesystem::path
+        cost_log; // $XDG_STATE_HOME or ~/.local/state, then openrouter-cli/costs.jsonl
     std::string base_url;
     std::string app_referer;
     std::string app_title;
@@ -62,3 +64,5 @@ Result<Config> load_config(const std::filesystem::path& home,
                            const std::filesystem::path& xdg_state_home);
 
 } // namespace orcli
+
+#endif // ORCLI_CONFIG_HPP

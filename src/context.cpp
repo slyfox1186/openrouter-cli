@@ -1,5 +1,6 @@
 #include "context.hpp"
 
+#include "common.hpp"
 #include "secrets.hpp"
 
 #include <algorithm>
@@ -59,7 +60,14 @@ void append_numbered_lines(std::string& out, std::string_view content) {
         const std::size_t newline = content.find('\n', start);
         const std::size_t stop = newline == std::string_view::npos ? content.size() : newline;
         ++number;
-        out += std::format("{:>{}} | {}\n", number, width, content.substr(start, stop - start));
+        // Right-aligned by hand: a nested width ("{:>{}}") is rejected by Clang with
+        // libstdc++ 15 (llvm/llvm-project#151371).
+        const std::string digits = std::to_string(number);
+        out.append(width > digits.size() ? width - digits.size() : 0, ' ');
+        out += digits;
+        out += " | ";
+        out += content.substr(start, stop - start);
+        out += '\n';
         start = stop + 1;
     }
 }
@@ -97,7 +105,10 @@ Result<FileSnapshot> read_snapshot(const std::filesystem::path& path, std::size_
                                                shown, kBinaryProbeBytes));
     }
     return FileSnapshot{
-        .display_path = shown, .resolved = resolved, .content = std::move(*content)};
+        .display_path = shown,
+        .resolved = resolved,
+        .content = std::move(*content),
+    };
 }
 
 std::string fence_for(std::string_view content) {
@@ -107,7 +118,9 @@ std::string fence_for(std::string_view content) {
         run = symbol == '`' ? run + 1 : 0;
         longest = std::max(longest, run);
     }
-    return std::string(std::max(kMinFenceLength, longest + 1), '`');
+    std::string fence;
+    fence.assign(std::max(kMinFenceLength, longest + 1), '`');
+    return fence;
 }
 
 std::string pack_files(const std::vector<FileSnapshot>& files) {

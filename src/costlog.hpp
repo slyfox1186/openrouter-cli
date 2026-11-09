@@ -1,8 +1,10 @@
-#pragma once
+#ifndef ORCLI_COSTLOG_HPP
+#define ORCLI_COSTLOG_HPP
 
 #include "common.hpp"
 
 #include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 
 #include <filesystem>
 #include <map>
@@ -51,10 +53,15 @@ struct GenerationStats {
     Usage usage; // native_tokens_* mapped onto Usage; cost left empty
 };
 
+struct GenerationInfo {
+    std::string_view call_id;
+    std::string_view generation_id;
+};
+
 // Record builders. Every record carries "v": 1, "type" and "call_id"; absent values are JSON
 // null so unknown is never confused with zero.
 nlohmann::json pending_record(const PendingInfo& info);
-nlohmann::json generation_record(const std::string& call_id, const std::string& generation_id);
+nlohmann::json generation_record(const GenerationInfo& info);
 nlohmann::json result_record(const ResultInfo& info);
 nlohmann::json resolved_record(const std::string& call_id, const GenerationStats& stats);
 
@@ -66,7 +73,7 @@ Result<GenerationStats> parse_generation(std::string_view json_text);
 class CostLog {
 public:
     CostLog(std::filesystem::path file, std::filesystem::path lock_file);
-    Result<void> append(const nlohmann::json& record) const;
+    [[nodiscard]] Result<void> append(const nlohmann::json& record) const;
     [[nodiscard]] const std::filesystem::path& file() const { return file_; }
 
 private:
@@ -94,9 +101,14 @@ struct SpendReport {
     std::vector<std::size_t> corrupt_lines; // 1-based line numbers that are not valid records
 };
 
+struct SpendQuery {
+    std::string_view contents;
+    std::string_view since_iso;
+};
+
 // Folds records by call_id into one call and one cost. since_iso (inclusive, compared on the
 // pending record's time) may be empty for all records.
-SpendReport fold_log(std::string_view contents, std::string_view since_iso);
+SpendReport fold_log(const SpendQuery& query);
 std::string format_spend(const SpendReport& report);
 
 // The final stderr line, e.g.
@@ -107,3 +119,5 @@ std::string format_cost_line(const ResultInfo& result, std::string_view model_id
                              std::string_view answer_path);
 
 } // namespace orcli
+
+#endif // ORCLI_COSTLOG_HPP

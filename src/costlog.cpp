@@ -1,9 +1,11 @@
 #include "costlog.hpp"
 
+#include "account.hpp"
 #include "common.hpp"
 #include "fsutil.hpp"
 
 #include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -30,9 +32,6 @@ constexpr std::size_t call_id_bytes = 16;
 constexpr int compact_dump = -1;
 constexpr std::size_t iso_date_length = 10;
 constexpr std::size_t thousands_group = 3;
-constexpr int money_decimals = 4;
-constexpr int max_money_decimals = 8;
-constexpr double smallest_four_decimal_amount = 0.0001;
 
 std::optional<std::string> string_at(const json& object, std::string_view key) {
     const auto found = object.find(key);
@@ -60,26 +59,32 @@ std::optional<long long> integer_at(const json& object, std::string_view key) {
 
 template <class T> json nullable(const std::optional<T>& value) {
     if (value.has_value()) {
-        return json(*value);
+        return *value;
     }
-    return json(nullptr);
+    return nullptr;
 }
 
-json record_header(std::string_view type, const std::string& call_id, const std::string& time) {
+struct RecordMetadata {
+    std::string_view type;
+    std::string_view call_id;
+    std::string_view time;
+};
+
+json record_header(const RecordMetadata& metadata) {
     json record = json::object();
-    record["v"] = record_version;
-    record["type"] = type;
-    record["call_id"] = call_id;
-    record["time"] = time;
+    record.emplace("v", record_version);
+    record.emplace("type", metadata.type);
+    record.emplace("call_id", metadata.call_id);
+    record.emplace("time", metadata.time);
     return record;
 }
 
 void put_tokens(json& record, const Usage& usage) {
-    record["prompt_tokens"] = nullable(usage.prompt_tokens);
-    record["cached_tokens"] = nullable(usage.cached_tokens);
-    record["cache_write_tokens"] = nullable(usage.cache_write_tokens);
-    record["completion_tokens"] = nullable(usage.completion_tokens);
-    record["reasoning_tokens"] = nullable(usage.reasoning_tokens);
+    record.emplace("prompt_tokens", nullable(usage.prompt_tokens));
+    record.emplace("cached_tokens", nullable(usage.cached_tokens));
+    record.emplace("cache_write_tokens", nullable(usage.cache_write_tokens));
+    record.emplace("completion_tokens", nullable(usage.completion_tokens));
+    record.emplace("reasoning_tokens", nullable(usage.reasoning_tokens));
 }
 
 std::string with_thousands(long long value) {
@@ -96,23 +101,8 @@ std::string count_text(const std::optional<long long>& count) {
     return count.has_value() ? with_thousands(*count) : std::string("unknown");
 }
 
-// Sub-cent calls are common with cheap models, so a tiny charge must not print as $0.0000.
-std::string money(double amount) {
-    if (amount <= 0.0 || amount >= smallest_four_decimal_amount) {
-        return std::format("${:.{}f}", amount, money_decimals);
-    }
-    std::string text;
-    for (int decimals = money_decimals + 1; decimals <= max_money_decimals; ++decimals) {
-        text = std::format("${:.{}f}", amount, decimals);
-        if (text.find_first_of("123456789") != std::string::npos) {
-            break;
-        }
-    }
-    return text;
-}
-
 std::string money_text(const std::optional<double>& amount) {
-    return amount.has_value() ? money(*amount) : std::string("unknown");
+    return amount.has_value() ? format_usd(*amount) : std::string("unknown");
 }
 
 // Everything known about one call_id, gathered from its records in log order.
@@ -244,42 +234,43 @@ std::string utc_now_iso() {
 }
 
 json pending_record(const PendingInfo& info) {
-    json record = record_header("pending", info.call_id, info.time);
-    record["cwd"] = info.cwd;
-    record["requested_model"] = info.requested_model;
-    record["model_id"] = info.model_id;
-    record["privacy"] = info.privacy;
-    record["effort"] = nullable(info.effort);
-    record["session"] = nullable(info.session);
-    record["answer_path"] = info.answer_path;
+    json record = record_header({.type = "pending", .call_id = info.call_id, .time = info.time});
+    record.emplace("cwd", info.cwd);
+    record.emplace("requested_model", info.requested_model);
+    record.emplace("model_id", info.model_id);
+    record.emplace("privacy", info.privacy);
+    record.emplace("effort", nullable(info.effort));
+    record.emplace("session", nullable(info.session));
+    record.emplace("answer_path", info.answer_path);
     return record;
 }
 
-json generation_record(const std::string& call_id, const std::string& generation_id) {
-    json record = record_header("generation", call_id, utc_now_iso());
-    record["generation_id"] = generation_id;
+json generation_record(const GenerationInfo& info) {
+    json record =
+        record_header({.type = "generation", .call_id = info.call_id, .time = utc_now_iso()});
+    record.emplace("generation_id", info.generation_id);
     return record;
 }
 
 json result_record(const ResultInfo& info) {
-    json record = record_header("result", info.call_id, utc_now_iso());
-    record["outcome"] = info.outcome;
-    record["served_model"] = nullable(info.served_model);
-    record["provider"] = nullable(info.provider);
+    json record = record_header({.type = "result", .call_id = info.call_id, .time = utc_now_iso()});
+    record.emplace("outcome", info.outcome);
+    record.emplace("served_model", nullable(info.served_model));
+    record.emplace("provider", nullable(info.provider));
     put_tokens(record, info.usage);
-    record["cost"] = nullable(info.usage.cost);
-    record["finish_reason"] = nullable(info.finish_reason);
-    record["error_type"] = nullable(info.error_type);
-    record["latency_ms"] = info.latency_ms;
+    record.emplace("cost", nullable(info.usage.cost));
+    record.emplace("finish_reason", nullable(info.finish_reason));
+    record.emplace("error_type", nullable(info.error_type));
+    record.emplace("latency_ms", info.latency_ms);
     return record;
 }
 
 json resolved_record(const std::string& call_id, const GenerationStats& stats) {
-    json record = record_header("resolved", call_id, utc_now_iso());
-    record["total_cost"] = nullable(stats.total_cost);
-    record["provider"] = nullable(stats.provider);
-    record["model"] = nullable(stats.model);
-    record["finish_reason"] = nullable(stats.finish_reason);
+    json record = record_header({.type = "resolved", .call_id = call_id, .time = utc_now_iso()});
+    record.emplace("total_cost", nullable(stats.total_cost));
+    record.emplace("provider", nullable(stats.provider));
+    record.emplace("model", nullable(stats.model));
+    record.emplace("finish_reason", nullable(stats.finish_reason));
     put_tokens(record, stats.usage);
     return record;
 }
@@ -314,16 +305,17 @@ Result<void> CostLog::append(const json& record) const {
         return std::unexpected(made.error());
     }
     // Paths and model names may hold invalid UTF-8; replacing bad bytes keeps dump from throwing.
-    return append_record(file_, lock_file_,
+    return append_record({.file = file_, .lock_file = lock_file_},
                          record.dump(compact_dump, ' ', false, json::error_handler_t::replace) +
                              "\n");
 }
 
-SpendReport fold_log(std::string_view contents, std::string_view since_iso) {
+SpendReport fold_log(const SpendQuery& query) {
     SpendReport report;
     std::vector<CallRecords> calls;
     std::map<std::string, std::size_t> index_by_id;
-    for (const auto [index, piece] : std::views::enumerate(std::views::split(contents, '\n'))) {
+    for (const auto [index, piece] :
+         std::views::enumerate(std::views::split(query.contents, '\n'))) {
         const std::string_view line(piece.begin(), piece.end());
         if (line.empty()) {
             continue;
@@ -344,7 +336,7 @@ SpendReport fold_log(std::string_view contents, std::string_view since_iso) {
     }
     for (const CallRecords& call : calls) {
         CallSummary summary = summarize(call);
-        if (!since_iso.empty() && std::string_view(summary.time) < since_iso) {
+        if (!query.since_iso.empty() && std::string_view(summary.time) < query.since_iso) {
             continue;
         }
         add_call(report, std::move(summary));
@@ -354,18 +346,18 @@ SpendReport fold_log(std::string_view contents, std::string_view since_iso) {
 
 std::string format_spend(const SpendReport& report) {
     std::string text =
-        std::format("Known spend: {} across {} calls ({} unresolved)\n", money(report.known_total),
-                    report.calls.size(), report.unresolved.size());
+        std::format("Known spend: {} across {} calls ({} unresolved)\n",
+                    format_usd(report.known_total), report.calls.size(), report.unresolved.size());
     if (!report.cost_by_day.empty()) {
         text += "\nBy day:\n";
         for (const auto& [day, cost] : report.cost_by_day) {
-            text += std::format("  {}  {}\n", day, money(cost));
+            text += std::format("  {}  {}\n", day, format_usd(cost));
         }
     }
     if (!report.cost_by_model.empty()) {
         text += "\nBy model:\n";
         for (const auto& [model, cost] : report.cost_by_model) {
-            text += std::format("  {}  {}\n", model, money(cost));
+            text += std::format("  {}  {}\n", model, format_usd(cost));
         }
     }
     if (!report.unresolved.empty()) {

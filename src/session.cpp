@@ -4,6 +4,7 @@
 #include "fsutil.hpp"
 
 #include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 
 #include <algorithm>
 #include <array>
@@ -87,26 +88,28 @@ Result<SessionData> parse_session(std::string_view text, const fs::path& file) {
     if (!model_id || !system_prompt || !session_uuid || !history) {
         return corrupt(file);
     }
-    return SessionData{.model_id = std::move(*model_id),
-                       .system_prompt = std::move(*system_prompt),
-                       .session_uuid = std::move(*session_uuid),
-                       .history = std::move(*history)};
+    return SessionData{
+        .model_id = std::move(*model_id),
+        .system_prompt = std::move(*system_prompt),
+        .session_uuid = std::move(*session_uuid),
+        .history = std::move(*history),
+    };
 }
 
 std::string serialize(const SessionData& data) {
     nlohmann::json history = nlohmann::json::array();
     for (const Message& message : data.history) {
         nlohmann::json entry = nlohmann::json::object();
-        entry["role"] = message.role;
-        entry["content"] = message.content;
+        entry.emplace("role", message.role);
+        entry.emplace("content", message.content);
         history.push_back(std::move(entry));
     }
     nlohmann::json root = nlohmann::json::object();
-    root["v"] = session_format_version;
-    root["model_id"] = data.model_id;
-    root["system_prompt"] = data.system_prompt;
-    root["session_uuid"] = data.session_uuid;
-    root["history"] = std::move(history);
+    root.emplace("v", session_format_version);
+    root.emplace("model_id", data.model_id);
+    root.emplace("system_prompt", data.system_prompt);
+    root.emplace("session_uuid", data.session_uuid);
+    root.emplace("history", std::move(history));
     // Model output is not guaranteed to be valid UTF-8; replacing bad bytes keeps dump from
     // throwing and the file parseable.
     return root.dump(json_indent, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
@@ -187,10 +190,12 @@ Result<void> Session::create(const std::string& model_id, const std::string& sys
         return fail(Exit::usage, "the session already exists; its model and system prompt are "
                                  "fixed at creation");
     }
-    data_ = SessionData{.model_id = model_id,
-                        .system_prompt = system_prompt,
-                        .session_uuid = random_hex(uuid_bytes),
-                        .history = {}};
+    data_ = SessionData{
+        .model_id = model_id,
+        .system_prompt = system_prompt,
+        .session_uuid = random_hex(uuid_bytes),
+        .history = {},
+    };
     return {};
 }
 

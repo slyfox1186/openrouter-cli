@@ -289,18 +289,18 @@ TEST_CASE("append_record creates the file and repairs a partial last line") {
     const fs::path file = temp.path() / "costs.jsonl";
     const fs::path lock_file = temp.path() / "costs.lock";
 
-    REQUIRE(orcli::append_record(file, lock_file, "first\n").has_value());
+    REQUIRE(orcli::append_record({.file = file, .lock_file = lock_file}, "first\n").has_value());
     CHECK(read_file(file) == "first\n");
     CHECK(perms_of(file) == private_file_perms);
 
     REQUIRE(orcli::atomic_write(file, "first\n{\"partial").has_value());
-    REQUIRE(orcli::append_record(file, lock_file, "second\n").has_value());
+    REQUIRE(orcli::append_record({.file = file, .lock_file = lock_file}, "second\n").has_value());
     CHECK(read_file(file) == "first\n{\"partial\nsecond\n");
 
-    const auto unterminated = orcli::append_record(file, lock_file, "third");
+    const auto unterminated = orcli::append_record({.file = file, .lock_file = lock_file}, "third");
     REQUIRE_FALSE(unterminated.has_value());
     CHECK(unterminated.error().code == Exit::usage);
-    CHECK_FALSE(orcli::append_record(file, lock_file, "").has_value());
+    CHECK_FALSE(orcli::append_record({.file = file, .lock_file = lock_file}, "").has_value());
 }
 
 TEST_CASE("append_record rejects a log file readable by others") {
@@ -308,7 +308,8 @@ TEST_CASE("append_record rejects a log file readable by others") {
     const fs::path file = temp.path() / "costs.jsonl";
     REQUIRE(orcli::atomic_write(file, "first\n").has_value());
     fs::permissions(file, shared_file_perms);
-    const auto result = orcli::append_record(file, temp.path() / "costs.lock", "second\n");
+    const auto result =
+        orcli::append_record({.file = file, .lock_file = temp.path() / "costs.lock"}, "second\n");
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().code == Exit::config);
     CHECK(read_file(file) == "first\n");
@@ -333,7 +334,8 @@ TEST_CASE("concurrent append_record calls keep every line intact") {
                 for (int record = 0; record < records_per_thread; ++record) {
                     const std::string line =
                         std::format("writer {} record {} {}\n", writer, record, padding);
-                    if (!orcli::append_record(file, lock_file, line).has_value()) {
+                    if (!orcli::append_record({.file = file, .lock_file = lock_file}, line)
+                             .has_value()) {
                         ++failures;
                     }
                 }

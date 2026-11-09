@@ -1,4 +1,5 @@
-#pragma once
+#ifndef ORCLI_CONTEXT_HPP
+#define ORCLI_CONTEXT_HPP
 
 #include "common.hpp"
 
@@ -28,3 +29,5 @@ std::string fence_for(std::string_view content);
 std::string pack_files(const std::vector<FileSnapshot>& files);
 
 } // namespace orcli
+
+#endif // ORCLI_CONTEXT_HPP

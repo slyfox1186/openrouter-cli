@@ -7,6 +7,7 @@
 #include "http.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <expected>
 #include <format>
@@ -159,7 +160,7 @@ Result<void> stdin_status() {
     return {};
 }
 
-enum class ReadUntil {
+enum class ReadUntil : std::uint8_t {
     newline,
     end_of_input,
 };
@@ -255,26 +256,35 @@ int cmd_auth_login(const Config& config, bool replace) {
         return report(already.error());
     }
     if (*already && !replace) {
-        return report(Error{.code = Exit::refused,
-                            .message = "an API key is already stored; pass --replace"});
+        return report(Error{
+            .code = Exit::refused,
+            .message = "an API key is already stored; pass --replace",
+        });
     }
     const auto pkce = new_pkce();
     if (!pkce) {
         return report(pkce.error());
     }
     const std::string label = std::format("openrouter-cli on {}", host_name());
-    std::println(stderr, "Open this URL in any browser (this works over SSH: open it on another "
-                         "PC), sign in with your OpenRouter account and approve; then paste the "
-                         "code shown on the page here:");
+    std::println(stderr, "Sign in to OpenRouter\n\n"
+                         "1. Open this link in your browser. Over SSH, use any computer:\n");
     std::println("{}", authorization_url(pkce->challenge, label));
     if (std::fflush(stdout) != 0) {
         return report(Error{.code = Exit::config, .message = "cannot write to standard output"});
     }
+    std::println(stderr, "\n2. Sign in to your OpenRouter account and approve access.\n"
+                         "3. Copy the code shown in your browser and return to this terminal.\n");
+    std::print(stderr, "Paste the code here, then press Enter: ");
+    if (std::fflush(stderr) != 0) {
+        return report(Error{.code = Exit::config, .message = "cannot write the login prompt"});
+    }
 
     auto code = read_code();
+    std::println(stderr, "");
     if (!code) {
         return report(code.error());
     }
+    std::println(stderr, "Completing sign-in with OpenRouter...");
     // OpenRouter's OAuth guide sends the exchange without an Authorization header, while the
     // generated API reference lists bearer security for it; this follows the guide.
     const Http http(config, HttpKeys{});

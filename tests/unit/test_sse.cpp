@@ -109,7 +109,7 @@ void check_realistic(const StreamOutcome& outcome) {
     CHECK(outcome.usage.cost == reported_cost);
     CHECK(outcome.done);
     CHECK_FALSE(outcome.error_code.has_value());
-    CHECK(outcome.complete());
+    CHECK(orcli::stream_complete(outcome));
 }
 
 // Takes the error type already escaped for a JSON string literal.
@@ -221,7 +221,7 @@ TEST_CASE("duplicate finish chunks and later null finish reasons keep the last v
     });
     CHECK(outcome.finish_reason == "stop");
     CHECK(outcome.native_finish_reason == "end_turn");
-    CHECK(outcome.complete());
+    CHECK(orcli::stream_complete(outcome));
 }
 
 TEST_CASE("usage chunk is parsed and cost null stays unknown") {
@@ -287,7 +287,7 @@ TEST_CASE("error chunk then usage chunk then EOF records both and is not complet
     CHECK(outcome.usage.completion_tokens == completion_tokens);
     CHECK(outcome.usage.cost == reported_cost);
     CHECK_FALSE(outcome.done);
-    CHECK_FALSE(outcome.complete());
+    CHECK_FALSE(orcli::stream_complete(outcome));
 }
 
 TEST_CASE("an error object blocks completion even with a string code and no message") {
@@ -299,14 +299,14 @@ TEST_CASE("an error object blocks completion even with a string code and no mess
     CHECK(outcome.error_code == "server_error");
     CHECK(outcome.error_message == "");
     CHECK_FALSE(outcome.error_type.has_value());
-    CHECK_FALSE(outcome.complete());
+    CHECK_FALSE(orcli::stream_complete(outcome));
 }
 
 TEST_CASE("stop without [DONE] is not complete") {
     const StreamOutcome outcome =
         apply_all({R"({"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]})"});
     CHECK(outcome.finish_reason == "stop");
-    CHECK_FALSE(outcome.complete());
+    CHECK_FALSE(orcli::stream_complete(outcome));
 }
 
 TEST_CASE("empty text with stop and [DONE] is not complete") {
@@ -315,7 +315,7 @@ TEST_CASE("empty text with stop and [DONE] is not complete") {
         "[DONE]",
     });
     CHECK(outcome.done);
-    CHECK_FALSE(outcome.complete());
+    CHECK_FALSE(orcli::stream_complete(outcome));
 }
 
 TEST_CASE("length finish with [DONE] is not complete") {
@@ -323,7 +323,7 @@ TEST_CASE("length finish with [DONE] is not complete") {
         R"({"choices":[{"delta":{"content":"a"},"finish_reason":"length"}]})",
         "[DONE]",
     });
-    CHECK_FALSE(outcome.complete());
+    CHECK_FALSE(orcli::stream_complete(outcome));
 }
 
 TEST_CASE("provider comes from the selected openrouter_metadata endpoint") {
@@ -337,7 +337,7 @@ TEST_CASE("provider comes from the selected openrouter_metadata endpoint") {
 TEST_CASE("invalid JSON payload fails without echoing it") {
     ChatStream chat;
     for (const std::string_view payload :
-         {std::string_view{R"({"secret-text)"}, std::string_view{""}}) {
+         {std::string_view{R"({"secret-text)"}, std::string_view{R"(secret-text})"}}) {
         const auto result = chat.on_data(payload);
         REQUIRE_FALSE(result.has_value());
         CHECK(result.error().code == Exit::api);
@@ -354,7 +354,7 @@ TEST_CASE("parse_error_body reads an error body") {
     CHECK(outcome.error_message == "Slow down");
     CHECK(outcome.error_type == "rate_limit_exceeded");
     CHECK(outcome.provider == "Example");
-    CHECK_FALSE(outcome.complete());
+    CHECK_FALSE(orcli::stream_complete(outcome));
 }
 
 TEST_CASE("provider error types are kept only as short plain tokens") {

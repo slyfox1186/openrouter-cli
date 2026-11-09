@@ -1,10 +1,12 @@
-#pragma once
+#ifndef ORCLI_HTTP_HPP
+#define ORCLI_HTTP_HPP
 
 #include "common.hpp"
 #include "config.hpp"
 #include "credentials.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -34,7 +36,7 @@ private:
 // none for public metadata and the PKCE exchange, inference for completions, /generation and
 // /key, management for /keys, /credits and /activity. A management key is never sent to an
 // inference endpoint because each request names its kind and Http holds both separately.
-enum class Auth {
+enum class Auth : std::uint8_t {
     none,
     inference,
     management,
@@ -84,27 +86,32 @@ public:
     // 5xx, honouring Retry-After. Returns the last response whatever its status; errors are
     // only transport failures, interruption (Exit::interrupted), an oversize body, or a missing
     // key for options.auth (Exit::config).
-    Result<HttpResponse> fetch(std::string_view path_and_query, const GetOptions& options) const;
+    [[nodiscard]] Result<HttpResponse> fetch(std::string_view path_and_query,
+                                             const GetOptions& options) const;
 
     // fetch, with any non-2xx status turned into Exit::api (sanitized message only).
-    Result<std::string> get(std::string_view path_and_query, const GetOptions& options) const;
+    [[nodiscard]] Result<std::string> get(std::string_view path_and_query,
+                                          const GetOptions& options) const;
 
     // POST base_url + path with a JSON body and the inference key, streaming the response.
     // Never retried. Applies the idle timeout (time since the last received byte) and the total
     // timeout.
-    StreamResult post_stream(std::string_view path, const std::string& body,
-                             const StreamHandlers& handlers) const;
+    [[nodiscard]] StreamResult post_stream(std::string_view path, const std::string& body,
+                                           const StreamHandlers& handlers) const;
 
     // POST base_url + path with a JSON body, reading a bounded JSON response. Never retried:
     // the PKCE exchange code is single-use. Returns the body for 2xx; Exit::api otherwise, with
     // only a sanitized, length-bounded error message.
-    Result<std::string> post_json(std::string_view path, const std::string& body, Auth auth) const;
+    [[nodiscard]] Result<std::string> post_json(std::string_view path, const std::string& body,
+                                                Auth auth) const;
 
 private:
-    Result<std::string_view> key_for(Auth auth) const;
+    [[nodiscard]] Result<std::string_view> key_for(Auth auth) const;
 
-    const Config& config_;
+    std::reference_wrapper<const Config> config_;
     HttpKeys keys_;
 };
 
 } // namespace orcli
+
+#endif // ORCLI_HTTP_HPP

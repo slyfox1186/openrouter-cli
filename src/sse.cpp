@@ -121,7 +121,7 @@ void record_provider(const json& body, StreamOutcome& outcome) {
 std::string classify_error_type(std::string_view value) {
     if (value.empty() || value.size() > max_error_type_length ||
         value.find_first_not_of(error_type_characters) != std::string_view::npos ||
-        !scan_text(value, "error type").empty()) {
+        !scan_text({.text = value, .source = "error type"}).empty()) {
         return std::string{unrecognized_error_type};
     }
     return std::string{value};
@@ -215,9 +215,10 @@ Result<std::vector<std::string>> SseParser::feed(std::string_view bytes) {
     return events;
 }
 
-bool StreamOutcome::complete() const {
-    return !text.empty() && finish_reason == "stop" && done && !error_code.has_value() &&
-           !error_type.has_value() && !error_message.has_value();
+bool stream_complete(const StreamOutcome& outcome) {
+    return !outcome.text.empty() && outcome.finish_reason == "stop" && outcome.done &&
+           !outcome.error_code.has_value() && !outcome.error_type.has_value() &&
+           !outcome.error_message.has_value();
 }
 
 Result<std::string> ChatStream::on_data(std::string_view payload) {

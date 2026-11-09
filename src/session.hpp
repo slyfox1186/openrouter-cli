@@ -1,4 +1,5 @@
-#pragma once
+#ifndef ORCLI_SESSION_HPP
+#define ORCLI_SESSION_HPP
 
 #include "common.hpp"
 #include "fsutil.hpp"
@@ -38,7 +39,8 @@ public:
     Result<void> commit(const Message& user, const Message& assistant);
 
 private:
-    Session(FileLock lock, std::filesystem::path file) : lock_(std::move(lock)), file_(std::move(file)) {}
+    Session(FileLock lock, std::filesystem::path file)
+        : lock_(std::move(lock)), file_(std::move(file)) {}
     FileLock lock_;
     std::filesystem::path file_;
     bool exists_ = false;
@@ -46,3 +48,5 @@ private:
 };
 
 } // namespace orcli
+
+#endif // ORCLI_SESSION_HPP

@@ -1,4 +1,5 @@
-#pragma once
+#ifndef ORCLI_ACCOUNT_HPP
+#define ORCLI_ACCOUNT_HPP
 
 #include "common.hpp"
 
@@ -104,3 +105,5 @@ std::string format_activity(const std::vector<ActivityRow>& rows, int days,
                             std::string_view today_utc);
 
 } // namespace orcli
+
+#endif // ORCLI_ACCOUNT_HPP

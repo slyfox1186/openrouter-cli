@@ -1,4 +1,5 @@
-#pragma once
+#ifndef ORCLI_AUTH_HPP
+#define ORCLI_AUTH_HPP
 
 #include "common.hpp"
 #include "credentials.hpp"
@@ -44,3 +45,5 @@ std::string exchange_body(std::string_view code, std::string_view verifier);
 Result<SecretString> parse_exchange(std::string_view json_text);
 
 } // namespace orcli
+
+#endif // ORCLI_AUTH_HPP

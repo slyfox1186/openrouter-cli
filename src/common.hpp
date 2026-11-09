@@ -1,5 +1,7 @@
-#pragma once
+#ifndef ORCLI_COMMON_HPP
+#define ORCLI_COMMON_HPP
 
+#include <cstdint>
 #include <expected>
 #include <optional>
 #include <string>
@@ -8,7 +10,7 @@
 namespace orcli {
 
 // Process exit codes; documented in README.md and the skill, so values are a public contract.
-enum class Exit : int {
+enum class Exit : std::uint8_t {
     ok = 0,
     usage = 2,
     refused = 3,
@@ -33,7 +35,7 @@ inline std::unexpected<Error> fail(Exit code, std::string message) {
     return std::unexpected<Error>(Error{.code = code, .message = std::move(message)});
 }
 
-enum class Privacy {
+enum class Privacy : std::uint8_t {
     zdr,
     no_training,
 };
@@ -55,3 +57,5 @@ struct Usage {
 };
 
 } // namespace orcli
+
+#endif // ORCLI_COMMON_HPP

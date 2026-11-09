@@ -3,7 +3,7 @@
 #include "common.hpp"
 #include "models.hpp"
 
-#include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 
 #include <algorithm>
 #include <array>
@@ -136,7 +136,7 @@ nlohmann::json provider_json(const RequestInput& input) {
     nlohmann::json provider =
         nlohmann::json::object({{"data_collection", "deny"}, {"require_parameters", true}});
     if (input.privacy == Privacy::zdr) {
-        provider["zdr"] = true;
+        provider.emplace("zdr", true);
     }
     if (!input.providers.empty()) {
         std::vector<std::string> only;
@@ -145,16 +145,17 @@ nlohmann::json provider_json(const RequestInput& input) {
                 only.push_back(slug);
             }
         }
-        provider["only"] = only;
+        provider.emplace("only", only);
     }
     return provider;
 }
 
 // Account-level plugin defaults could otherwise add billed web searches or rewrite the context.
 nlohmann::json plugins_json() {
-    return nlohmann::json::array(
-        {nlohmann::json::object({{"id", "web"}, {"enabled", false}}),
-         nlohmann::json::object({{"id", "context-compression"}, {"enabled", false}})});
+    return nlohmann::json::array({
+        nlohmann::json::object({{"id", "web"}, {"enabled", false}}),
+        nlohmann::json::object({{"id", "context-compression"}, {"enabled", false}}),
+    });
 }
 
 } // namespace
@@ -190,22 +191,22 @@ Result<BuiltRequest> build_request(const RequestInput& input) {
     built.max_tokens = *max_tokens;
 
     nlohmann::json& body = built.body;
-    body["model"] = model.id;
-    body["messages"] = messages_json(input);
-    body["stream"] = true;
-    body["max_tokens"] = built.max_tokens;
+    body.emplace("model", model.id);
+    body.emplace("messages", messages_json(input));
+    body.emplace("stream", true);
+    body.emplace("max_tokens", built.max_tokens);
     // Reasoning text is never shown, so excluding it keeps the stream to the answer alone.
     if (model.has_reasoning) {
         nlohmann::json reasoning = nlohmann::json::object({{"exclude", true}});
         if (built.effort_sent.has_value()) {
-            reasoning["effort"] = *built.effort_sent;
+            reasoning.emplace("effort", *built.effort_sent);
         }
-        body["reasoning"] = std::move(reasoning);
+        body.emplace("reasoning", std::move(reasoning));
     }
-    body["provider"] = provider_json(input);
-    body["plugins"] = plugins_json();
+    body.emplace("provider", provider_json(input));
+    body.emplace("plugins", plugins_json());
     if (input.session_id.has_value()) {
-        body["session_id"] = *input.session_id;
+        body.emplace("session_id", *input.session_id);
     }
     return built;
 }

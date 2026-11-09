@@ -3,20 +3,25 @@
 #include "common.hpp"
 
 #include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <format>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <ranges>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -24,7 +29,7 @@
 namespace orcli {
 namespace {
 
-using json = nlohmann::json;
+using nlohmann::json;
 
 constexpr std::string_view key_path = "/key";
 constexpr std::string_view keys_path = "/keys";
@@ -38,6 +43,9 @@ constexpr int max_activity_days = 30;
 constexpr int money_decimals = 4;
 constexpr int max_money_decimals = 8;
 constexpr double smallest_four_decimal_amount = 0.0001;
+// Holds any finite double in fixed notation (at most 309 integer digits) with sign, point and
+// max_money_decimals decimals.
+constexpr std::size_t money_buffer_bytes = 384;
 constexpr std::size_t digits_per_group = 3;
 constexpr std::size_t date_length = 10; // YYYY-MM-DD
 constexpr std::size_t column_gap = 2;
@@ -164,14 +172,27 @@ std::string with_commas(long long value) {
     return grouped;
 }
 
+// std::format with a nested precision ("{:.{}f}") is rejected by Clang with libstdc++ 15
+// (llvm/llvm-project#151371, a Clang bug), so the digits come from std::to_chars, which
+// formats like printf's %.*f in the "C" locale.
+std::string dollars(double amount, int decimals) {
+    std::array<char, money_buffer_bytes> digits{};
+    const auto [end, error] = std::to_chars(digits.data(), std::to_address(digits.end()), amount,
+                                            std::chars_format::fixed, decimals);
+    if (error != std::errc{}) {
+        return std::format("${}", amount);
+    }
+    return "$" + std::string(digits.data(), end);
+}
+
 // Sub-cent amounts are common with cheap models, so a tiny charge must not print as $0.0000.
 std::string unsigned_money(double amount) {
     if (amount <= 0.0 || amount >= smallest_four_decimal_amount) {
-        return std::format("${:.{}f}", amount, money_decimals);
+        return dollars(amount, money_decimals);
     }
     std::string text;
     for (int decimals = money_decimals + 1; decimals <= max_money_decimals; ++decimals) {
-        text = std::format("${:.{}f}", amount, decimals);
+        text = dollars(amount, decimals);
         if (text.find_first_of("123456789") != std::string::npos) {
             break;
         }
@@ -209,7 +230,10 @@ std::string render_table(const Table& rows) {
     for (const auto& row : rows) {
         std::string line;
         for (const auto& [cell, width] : std::views::zip(row, widths)) {
-            line += std::format("{:<{}}", cell, width + column_gap);
+            // Padding by hand: a nested width ("{:<{}}") hits the same Clang bug as dollars().
+            const std::size_t start = line.size();
+            line += cell;
+            line.resize(start + std::max(cell.size(), width + column_gap), ' ');
         }
         while (line.ends_with(' ')) {
             line.pop_back();
@@ -228,8 +252,11 @@ struct Field {
 std::string render_fields(const std::vector<Field>& fields) {
     std::string text;
     for (const Field& field : fields) {
-        text +=
-            std::format("{:<{}}{}\n", std::format("{}:", field.label), label_width, field.value);
+        std::string label = std::format("{}:", field.label);
+        label.resize(std::max(label.size(), label_width), ' ');
+        text += label;
+        text += field.value;
+        text += '\n';
     }
     return text;
 }
@@ -269,11 +296,13 @@ std::optional<MemberEntry> parse_member(const json& item) {
         return std::nullopt;
     }
     FieldReader fields(item);
-    MemberEntry member{.id = fields.text("id"),
-                       .email = fields.text("email"),
-                       .first_name = fields.optional_text("first_name"),
-                       .last_name = fields.optional_text("last_name"),
-                       .role = fields.text("role")};
+    MemberEntry member{
+        .id = fields.text("id"),
+        .email = fields.text("email"),
+        .first_name = fields.optional_text("first_name"),
+        .last_name = fields.optional_text("last_name"),
+        .role = fields.text("role"),
+    };
     if (!fields.valid()) {
         return std::nullopt;
     }
@@ -285,14 +314,16 @@ std::optional<ActivityRow> parse_activity_row(const json& item) {
         return std::nullopt;
     }
     FieldReader fields(item);
-    ActivityRow row{.date = fields.text("date"),
-                    .model = fields.text("model"),
-                    .provider = fields.text("provider_name"),
-                    .requests = fields.count("requests"),
-                    .prompt_tokens = fields.count("prompt_tokens"),
-                    .completion_tokens = fields.count("completion_tokens"),
-                    .reasoning_tokens = fields.count("reasoning_tokens"),
-                    .usage = fields.number("usage")};
+    ActivityRow row{
+        .date = fields.text("date"),
+        .model = fields.text("model"),
+        .provider = fields.text("provider_name"),
+        .requests = fields.count("requests"),
+        .prompt_tokens = fields.count("prompt_tokens"),
+        .completion_tokens = fields.count("completion_tokens"),
+        .reasoning_tokens = fields.count("reasoning_tokens"),
+        .usage = fields.number("usage"),
+    };
     if (!fields.valid()) {
         return std::nullopt;
     }
@@ -339,14 +370,16 @@ bool newest_then_costliest(const ActivityRow& left, const ActivityRow& right) {
 }
 
 std::vector<std::string> activity_cells(const ActivityRow& row) {
-    return {row.date,
-            row.model,
-            row.provider,
-            with_commas(row.requests),
-            with_commas(row.prompt_tokens),
-            with_commas(row.completion_tokens),
-            with_commas(row.reasoning_tokens),
-            format_usd(row.usage)};
+    return {
+        row.date,
+        row.model,
+        row.provider,
+        with_commas(row.requests),
+        with_commas(row.prompt_tokens),
+        with_commas(row.completion_tokens),
+        with_commas(row.reasoning_tokens),
+        format_usd(row.usage),
+    };
 }
 
 std::string activity_range(int days, std::string_view today_utc) {
@@ -430,19 +463,41 @@ Result<std::vector<KeyEntry>> parse_keys_page(std::string_view json_text) {
 }
 
 std::string format_keys(const std::vector<KeyEntry>& keys) {
-    std::string text = "API keys in this management key's workspace (an organization-scoped key "
-                       "lists its default workspace), disabled and expired included:\n";
+    const std::string text =
+        "API keys in this management key's workspace (an organization-scoped key "
+        "lists its default workspace), disabled and expired included:\n";
     if (keys.empty()) {
         return text + "No API keys.\n";
     }
-    Table rows{{"NAME", "LABEL", "STATUS", "CREATED", "EXPIRES", "TODAY", "WEEK", "MONTH", "TOTAL",
-                "LIMIT", "REMAINING"}};
+    Table rows{
+        {
+            "NAME",
+            "LABEL",
+            "STATUS",
+            "CREATED",
+            "EXPIRES",
+            "TODAY",
+            "WEEK",
+            "MONTH",
+            "TOTAL",
+            "LIMIT",
+            "REMAINING",
+        },
+    };
     for (const KeyEntry& key : keys) {
-        rows.push_back({key.name, key.label, key.disabled ? "disabled" : "enabled",
-                        date_part(key.created_at), date_part(key.expires_at),
-                        money_text(key.usage_daily), money_text(key.usage_weekly),
-                        money_text(key.usage_monthly), money_text(key.usage), money_text(key.limit),
-                        money_text(key.limit_remaining)});
+        rows.push_back({
+            key.name,
+            key.label,
+            key.disabled ? "disabled" : "enabled",
+            date_part(key.created_at),
+            date_part(key.expires_at),
+            money_text(key.usage_daily),
+            money_text(key.usage_weekly),
+            money_text(key.usage_monthly),
+            money_text(key.usage),
+            money_text(key.limit),
+            money_text(key.limit_remaining),
+        });
     }
     return text + render_table(rows);
 }
@@ -470,8 +525,10 @@ Result<Credits> parse_credits(std::string_view json_text) {
         return malformed(credits_path);
     }
     FieldReader fields(*data);
-    const Credits credits{.total_credits = fields.number("total_credits"),
-                          .total_usage = fields.number("total_usage")};
+    const Credits credits{
+        .total_credits = fields.number("total_credits"),
+        .total_usage = fields.number("total_usage"),
+    };
     if (!fields.valid()) {
         return malformed(credits_path);
     }
@@ -539,7 +596,8 @@ std::string format_activity(const std::vector<ActivityRow>& rows, int days,
         text += "No activity in this range.\n";
     } else {
         Table table{
-            {"DATE", "MODEL", "PROVIDER", "REQUESTS", "PROMPT", "COMPLETION", "REASONING", "COST"}};
+            {"DATE", "MODEL", "PROVIDER", "REQUESTS", "PROMPT", "COMPLETION", "REASONING", "COST"},
+        };
         for (const ActivityRow& row : summary) {
             table.push_back(activity_cells(row));
             add_into(total, row);
