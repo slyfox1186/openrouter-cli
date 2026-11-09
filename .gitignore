@@ -1,0 +1,68 @@
+# Secrets: the real .env holds the API key. Only the documented template is tracked.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime state written by the CLI: call ledger, sessions, saved answers, model
+# catalog cache and the alias registry. Holds private prompt history.
+/state/
+
+# Out-of-tree build directories (CMake presets, IDEs).
+/build/
+/out/
+/cmake-build-*/
+CMakeUserPresets.json
+
+# In-tree CMake leftovers if someone configures in the source dir by mistake.
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+/Testing/
+/_deps/
+/compile_commands.json
+
+# Compiled objects and binaries.
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.d
+*.gch
+*.pch
+
+# Coverage and profiling output.
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+/coverage/
+
+# Core dumps. Anchored so it can never match source files such as core.cpp.
+/core
+vgcore.*
+
+# Tool caches and logs.
+/.cache/
+*.log
+
+# Editors and OS files.
+/.vscode/
+/.idea/
+*.swp
+*~
+.DS_Store
+
+# Machine-local agent notes and settings, kept out of the public repo.
+/.claude/
+/.codex/
+/CLAUDE.md
+/AGENTS.md
+/JEFF_START_HERE.md
