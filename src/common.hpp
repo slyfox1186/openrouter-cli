@@ -17,6 +17,9 @@ enum class Exit : int {
     incomplete = 6,
     config = 7,
     interrupted = 8,
+    // The request completed and may have been billed, but the answer, cost record or session
+    // could not be saved; callers must not retry automatically.
+    persist = 9,
 };
 
 struct Error {

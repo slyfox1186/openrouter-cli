@@ -4,7 +4,6 @@
 
 #include <cerrno>
 #include <cstddef>
-#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <format>
@@ -29,7 +28,9 @@ namespace {
 constexpr mode_t private_dir_mode = S_IRWXU;
 constexpr mode_t private_file_mode = S_IRUSR | S_IWUSR;
 constexpr mode_t group_other_bits = S_IRWXG | S_IRWXO;
-constexpr std::size_t temp_suffix_chunks = 2;
+constexpr std::size_t temp_suffix_bytes = 8;
+// uniform_int_distribution is undefined for char types, so bytes are drawn as unsigned int.
+constexpr unsigned int byte_max = 0xFF;
 
 // Reads errno first, before any other call can overwrite it.
 std::unexpected<Error> sys_fail(std::string_view action, const fs::path& path) {
@@ -114,16 +115,6 @@ Result<void> sync_directory(const fs::path& dir) {
         return std::unexpected(handle.error());
     }
     return sync_descriptor(handle->get(), dir).and_then([&] { return handle->close(dir); });
-}
-
-std::string random_hex(std::size_t chunks) {
-    std::random_device device;
-    std::uniform_int_distribution<std::uint32_t> distribution;
-    std::string hex;
-    for (std::size_t index = 0; index < chunks; ++index) {
-        hex += std::format("{:08x}", distribution(device));
-    }
-    return hex;
 }
 
 // Removes the temporary file unless the rename that publishes it succeeded.
@@ -245,9 +236,20 @@ FileLock::~FileLock() {
     close_descriptor(fd_);
 }
 
-Result<void> atomic_write(const fs::path& target, std::string_view data) {
+std::string random_hex(std::size_t bytes) {
+    std::random_device device;
+    std::uniform_int_distribution<unsigned int> distribution(0, byte_max);
+    std::string hex;
+    hex.reserve(bytes * 2);
+    for (std::size_t index = 0; index < bytes; ++index) {
+        hex += std::format("{:02x}", distribution(device));
+    }
+    return hex;
+}
+
+Result<Replaced> atomic_replace(const fs::path& target, std::string_view data) {
     fs::path temp = target;
-    temp += std::format(".tmp.{}.{}", ::getpid(), random_hex(temp_suffix_chunks));
+    temp += std::format(".tmp.{}.{}", ::getpid(), random_hex(temp_suffix_bytes));
     auto handle = open_file(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW);
     if (!handle) {
         return std::unexpected(handle.error());
@@ -263,8 +265,24 @@ Result<void> atomic_write(const fs::path& target, std::string_view data) {
         return sys_fail("rename into place", target);
     }
     guard.dismiss();
+    // Past the rename the new content is visible, so reporting an error would make callers
+    // believe the old content survived.
     const fs::path parent = target.parent_path();
-    return sync_directory(parent.empty() ? fs::path(".") : parent);
+    return Replaced{.durable = sync_directory(parent.empty() ? fs::path(".") : parent).has_value()};
+}
+
+Result<void> atomic_write(const fs::path& target, std::string_view data) {
+    const auto replaced = atomic_replace(target, data);
+    if (!replaced) {
+        return std::unexpected(replaced.error());
+    }
+    if (!replaced->durable) {
+        return fail(Exit::config,
+                    std::format("replaced {} but could not sync its directory, so the change may "
+                                "not survive a power loss",
+                                target.string()));
+    }
+    return {};
 }
 
 Result<int> create_exclusive(const fs::path& file) {

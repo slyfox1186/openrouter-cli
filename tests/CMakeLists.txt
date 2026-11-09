@@ -3,9 +3,12 @@ target_include_directories(orcli_doctest SYSTEM INTERFACE ${doctest_SOURCE_DIR})
 
 add_executable(unit_tests
     unit/main.cpp
+    unit/test_account.cpp
+    unit/test_auth.cpp
     unit/test_config.cpp
     unit/test_context.cpp
     unit/test_costlog.cpp
+    unit/test_credentials.cpp
     unit/test_fsutil.cpp
     unit/test_models.cpp
     unit/test_request.cpp
@@ -13,6 +16,9 @@ add_executable(unit_tests
     unit/test_session.cpp
     unit/test_sse.cpp)
 target_link_libraries(unit_tests PRIVATE orcli_core orcli_doctest orcli_flags)
+# Stand-in for systemd-creds: exercises spawning, pipes, exit codes and timeouts, not encryption.
+set(ORCLI_FAKE_CREDS_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/fake_systemd_creds.sh")
+target_compile_definitions(unit_tests PRIVATE ORCLI_FAKE_CREDS_TOOL="${ORCLI_FAKE_CREDS_TOOL}")
 add_test(NAME unit COMMAND unit_tests)
 
 add_library(orcli_httplib INTERFACE)
@@ -26,6 +32,7 @@ add_executable(integration_tests
 target_include_directories(integration_tests PRIVATE mock)
 target_link_libraries(integration_tests PRIVATE orcli_core orcli_doctest orcli_httplib orcli_flags)
 target_compile_definitions(integration_tests PRIVATE
-    ORCLI_BINARY="$<TARGET_FILE:openrouter-cli>")
+    ORCLI_BINARY="$<TARGET_FILE:openrouter-cli>"
+    ORCLI_FAKE_CREDS_TOOL="${ORCLI_FAKE_CREDS_TOOL}")
 add_dependencies(integration_tests openrouter-cli)
 add_test(NAME integration COMMAND integration_tests)

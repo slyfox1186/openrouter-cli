@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
-#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <format>
@@ -16,7 +15,6 @@
 #include <ios>
 #include <iterator>
 #include <optional>
-#include <random>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -30,23 +28,13 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr std::size_t max_session_name_length = 64;
-constexpr std::size_t uuid_chunks = 4;
+constexpr std::size_t uuid_bytes = 16;
 constexpr long long session_format_version = 1;
 constexpr int json_indent = 2;
 
 bool session_name_char(char letter) {
     return (letter >= 'a' && letter <= 'z') || (letter >= 'A' && letter <= 'Z') ||
            (letter >= '0' && letter <= '9') || letter == '.' || letter == '_' || letter == '-';
-}
-
-std::string random_uuid() {
-    std::random_device device;
-    std::uniform_int_distribution<std::uint32_t> distribution;
-    std::string hex;
-    for (std::size_t index = 0; index < uuid_chunks; ++index) {
-        hex += std::format("{:08x}", distribution(device));
-    }
-    return hex;
 }
 
 std::optional<std::string> string_at(const nlohmann::json& object, std::string_view key) {
@@ -201,7 +189,7 @@ Result<void> Session::create(const std::string& model_id, const std::string& sys
     }
     data_ = SessionData{.model_id = model_id,
                         .system_prompt = system_prompt,
-                        .session_uuid = random_uuid(),
+                        .session_uuid = random_hex(uuid_bytes),
                         .history = {}};
     return {};
 }

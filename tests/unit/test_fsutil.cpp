@@ -36,6 +36,8 @@ constexpr fs::perms shared_dir_perms = fs::perms::owner_all | fs::perms::group_r
                                        fs::perms::others_exec;
 constexpr fs::perms shared_file_perms =
     private_file_perms | fs::perms::group_read | fs::perms::others_read;
+constexpr fs::perms read_only_dir_perms = fs::perms::owner_read | fs::perms::owner_exec;
+constexpr std::size_t sample_hex_bytes = 16;
 constexpr int writer_threads = 8;
 constexpr int records_per_thread = 50;
 constexpr std::size_t record_padding = 300;
@@ -63,6 +65,32 @@ public:
 private:
     fs::path path_;
 };
+
+// Restores a directory's mode so TempDir can remove it even when a check fails first.
+class RestorePerms {
+public:
+    RestorePerms(fs::path dir, fs::perms perms) : dir_(std::move(dir)), perms_(perms) {}
+    RestorePerms(RestorePerms&&) = delete;
+    RestorePerms& operator=(RestorePerms&&) = delete;
+    RestorePerms(const RestorePerms&) = delete;
+    RestorePerms& operator=(const RestorePerms&) = delete;
+    ~RestorePerms() {
+        std::error_code ignored;
+        fs::permissions(dir_, perms_, ignored);
+    }
+
+private:
+    fs::path dir_;
+    fs::perms perms_;
+};
+
+std::set<std::string> entry_names(const fs::path& dir) {
+    std::set<std::string> names;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        names.insert(entry.path().filename().string());
+    }
+    return names;
+}
 
 std::string read_file(const fs::path& file) {
     std::ifstream input(file, std::ios::binary);
@@ -199,6 +227,48 @@ TEST_CASE("atomic_write replaces content and leaves no temporary files") {
         ++entries;
     }
     CHECK(entries == 1);
+}
+
+TEST_CASE("random_hex returns two lowercase hex characters per byte") {
+    const std::string first = orcli::random_hex(sample_hex_bytes);
+    CHECK(first.size() == sample_hex_bytes * 2);
+    CHECK(first.find_first_not_of("0123456789abcdef") == std::string::npos);
+    CHECK(first != orcli::random_hex(sample_hex_bytes));
+    CHECK(orcli::random_hex(0).empty());
+}
+
+TEST_CASE("atomic_replace reports a durable replacement") {
+    const TempDir temp;
+    const fs::path target = temp.path() / "catalog.json";
+    const auto created = orcli::atomic_replace(target, "first");
+    REQUIRE(created.has_value());
+    CHECK(created->durable);
+    const auto replaced = orcli::atomic_replace(target, "second");
+    REQUIRE(replaced.has_value());
+    CHECK(replaced->durable);
+    CHECK(read_file(target) == "second");
+    CHECK(perms_of(target) == private_file_perms);
+    CHECK(entry_names(temp.path()) == std::set<std::string>{"catalog.json"});
+}
+
+TEST_CASE("atomic_replace that fails before the rename leaves the target untouched") {
+    const TempDir temp;
+    const fs::path dir = temp.path() / "locked";
+    REQUIRE(orcli::ensure_private_dir(dir).has_value());
+    const fs::path target = dir / "registry.json";
+    REQUIRE(orcli::atomic_write(target, "old").has_value());
+    const RestorePerms restore(dir, private_dir_perms);
+    fs::permissions(dir, read_only_dir_perms);
+
+    const auto replaced = orcli::atomic_replace(target, "new");
+    REQUIRE_FALSE(replaced.has_value());
+    CHECK(replaced.error().code == Exit::config);
+    CHECK(read_file(target) == "old");
+    CHECK(entry_names(dir) == std::set<std::string>{"registry.json"});
+
+    const auto written = orcli::atomic_write(target, "new");
+    REQUIRE_FALSE(written.has_value());
+    CHECK(read_file(target) == "old");
 }
 
 TEST_CASE("create_exclusive creates a private file and refuses an existing one") {

@@ -2,7 +2,9 @@
 
 #include "common.hpp"
 
+#include <cstddef>
 #include <filesystem>
+#include <string>
 #include <string_view>
 
 namespace orcli {
@@ -31,8 +33,22 @@ private:
     int fd_ = -1;
 };
 
+// Lowercase hex of `bytes` random bytes from std::random_device (getrandom(2) on Linux); the
+// one helper for temp-file suffixes, session ids and call ids.
+std::string random_hex(std::size_t bytes);
+
+struct Replaced {
+    // False when the rename succeeded but the directory fsync failed: the new content is in
+    // place, but its survival across a power loss is unconfirmed.
+    bool durable = true;
+};
+
 // Writes a uniquely named O_EXCL temp file (0600) beside target, fsyncs it, renames it over
-// target and fsyncs the directory.
+// target and fsyncs the directory. The rename is the commit point: an error means target was
+// not replaced (the temp file is removed); a value means it was.
+Result<Replaced> atomic_replace(const std::filesystem::path& target, std::string_view data);
+
+// atomic_replace for callers that need durability: durable == false becomes an error.
 Result<void> atomic_write(const std::filesystem::path& target, std::string_view data);
 
 // Creates a new file with O_CREAT|O_EXCL|O_NOFOLLOW and mode 0600; returns the descriptor.

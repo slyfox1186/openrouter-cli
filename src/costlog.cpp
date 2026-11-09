@@ -7,13 +7,11 @@
 
 #include <chrono>
 #include <cstddef>
-#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <map>
 #include <optional>
-#include <random>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -28,7 +26,7 @@ using nlohmann::json;
 namespace {
 
 constexpr int record_version = 1;
-constexpr std::size_t call_id_chunks = 4;
+constexpr std::size_t call_id_bytes = 16;
 constexpr int compact_dump = -1;
 constexpr std::size_t iso_date_length = 10;
 constexpr std::size_t thousands_group = 3;
@@ -123,6 +121,7 @@ struct CallRecords {
     std::string earliest_time;
     std::optional<std::string> pending_time;
     std::optional<std::string> model_id;
+    std::optional<std::string> generation_id;
     bool has_result = false;
     std::optional<std::string> outcome;
     std::optional<std::string> served_model;
@@ -157,6 +156,16 @@ void absorb_pending(CallRecords& call, const json& record) {
     call.model_id = string_at(record, "model_id");
 }
 
+void absorb_generation(CallRecords& call, const json& record) {
+    if (call.generation_id.has_value()) {
+        return;
+    }
+    if (auto generation_id = string_at(record, "generation_id");
+        generation_id.has_value() && !generation_id->empty()) {
+        call.generation_id = std::move(generation_id);
+    }
+}
+
 void absorb_result(CallRecords& call, const json& record) {
     if (call.has_result) {
         return;
@@ -187,6 +196,8 @@ void absorb(CallRecords& call, const json& record) {
     const auto type = string_at(record, "type").value_or("");
     if (type == "pending") {
         absorb_pending(call, record);
+    } else if (type == "generation") {
+        absorb_generation(call, record);
     } else if (type == "result") {
         absorb_result(call, record);
     } else if (type == "resolved") {
@@ -201,6 +212,7 @@ CallSummary summarize(const CallRecords& call) {
         .model = call.model_id.value_or(call.served_model.value_or("unknown")),
         .provider =
             call.result_provider.has_value() ? call.result_provider : call.resolved_provider,
+        .generation_id = call.generation_id,
         // The stream's cost and the looked-up charge describe the same call; never add both.
         .cost = call.result_cost.has_value() ? call.result_cost : call.resolved_cost,
         .state = call.has_result ? call.outcome.value_or("unknown") : std::string("pending"),
@@ -223,13 +235,7 @@ void add_call(SpendReport& report, CallSummary call) {
 } // namespace
 
 std::string new_call_id() {
-    std::random_device device;
-    std::uniform_int_distribution<std::uint32_t> distribution;
-    std::string hex;
-    for (std::size_t index = 0; index < call_id_chunks; ++index) {
-        hex += std::format("{:08x}", distribution(device));
-    }
-    return hex;
+    return random_hex(call_id_bytes);
 }
 
 std::string utc_now_iso() {

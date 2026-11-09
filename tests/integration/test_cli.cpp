@@ -1,3 +1,5 @@
+#include "auth.hpp"
+#include "costlog.hpp"
 #include "mock_server.hpp"
 
 #include <doctest/doctest.h>
@@ -7,6 +9,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -15,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -36,10 +40,13 @@ namespace {
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 using mock::MockServer;
+using mock::RecordedRequest;
+using mock::Reply;
 using mock::Scenario;
 using nlohmann::json;
 
 constexpr const char* binary_path = ORCLI_BINARY;
+constexpr const char* creds_tool_path = ORCLI_FAKE_CREDS_TOOL;
 
 constexpr int exit_ok = 0;
 constexpr int exit_usage = 2;
@@ -47,16 +54,26 @@ constexpr int exit_refused = 3;
 constexpr int exit_model = 4;
 constexpr int exit_api = 5;
 constexpr int exit_incomplete = 6;
+constexpr int exit_config = 7;
 constexpr int exit_interrupted = 8;
+constexpr int exit_not_saved = 9;
 constexpr int exit_exec_failed = 127;
 constexpr int signal_exit_base = 128;
 
 constexpr int http_ok = 200;
+constexpr int http_unauthorized = 401;
+constexpr int http_forbidden = 403;
 constexpr int http_not_found = 404;
+constexpr int http_server_error = 500;
 constexpr int idle_timeout_seconds = 2;
 constexpr int total_timeout_seconds = 30;
 constexpr long long alpha_max_tokens = 8000;
 constexpr mode_t private_file_mode = S_IRUSR | S_IWUSR;
+constexpr std::size_t verifier_length = 86;
+constexpr int members_page_size = 100;
+constexpr int members_page_cap = 50;
+// Above the cost log's few records, far below the answer of Scenario::large.
+constexpr rlim_t answer_file_limit = 4096;
 
 constexpr std::chrono::milliseconds poll_interval{20};
 constexpr std::chrono::seconds output_wait{15};
@@ -67,6 +84,18 @@ constexpr std::chrono::seconds drip_hold{3};
 constexpr std::chrono::seconds interrupt_hold{60};
 
 constexpr std::string_view alpha = "test/alpha-1";
+
+std::string inference_key() {
+    return mock::fake_key('1');
+}
+
+std::string management_key() {
+    return mock::fake_key('2');
+}
+
+std::string bearer(std::string_view key) {
+    return "Bearer " + std::string(key);
+}
 
 std::string read_text(const fs::path& path) {
     std::ifstream in(path, std::ios::binary);
@@ -109,6 +138,28 @@ std::string line_starting(std::string_view text, std::string_view prefix) {
 
 std::string text_at(const json& object, const char* key) {
     return object.at(key).get<std::string>();
+}
+
+int offset_param(const RecordedRequest& request) {
+    const std::string text = request.param("offset");
+    int offset = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), offset);
+    return parsed.ec == std::errc{} ? offset : 0;
+}
+
+Reply data_reply(const json& data) {
+    return {.status = http_ok, .body = json{{"data", data}}.dump()};
+}
+
+// A full members page of people other than the key's creator.
+json other_members(int offset, int count) {
+    json page = json::array();
+    for (int index = 0; index < count; ++index) {
+        const int number = offset + index;
+        page.push_back(mock::member(std::format("user_other_{}", number),
+                                    std::format("other{}@example.com", number)));
+    }
+    return page;
 }
 
 class UniqueFd {
@@ -214,12 +265,17 @@ struct RunResult {
     int code = -1;
     std::string out;
     std::string err;
+
+    [[nodiscard]] std::string all() const { return out + err; }
 };
 
 struct Launch {
-    std::vector<std::string> args;
-    std::optional<std::string> stdin_text;
+    std::vector<std::string> args{};
+    std::optional<std::string> stdin_text{};
     bool closed_stdout = false; // stdout is a pipe whose read end is already closed
+    bool creds_tool = true;     // false: no test credential tool and nothing on PATH
+    std::optional<fs::path> home{};
+    std::optional<rlim_t> file_size_limit{}; // RLIMIT_FSIZE, with SIGXFSZ ignored
 };
 
 std::vector<char*> pointers_to(std::vector<std::string>& strings) {
@@ -232,11 +288,21 @@ std::vector<char*> pointers_to(std::vector<std::string>& strings) {
     return pointers;
 }
 
+struct ChildSetup {
+    int in = -1;
+    int out = -1;
+    int err = -1;
+    const char* workdir = nullptr;
+    char* const* argv = nullptr;
+    char* const* envp = nullptr;
+    bool limit_file_size = false;
+    rlim_t file_size_limit = 0;
+};
+
 // Runs between fork and execve in a multithreaded parent, so only async-signal-safe calls.
-[[noreturn]] void exec_child(int in, int out, int err, const char* workdir, char* const* argv,
-                             char* const* envp) noexcept {
-    if (::dup2(in, STDIN_FILENO) < 0 || ::dup2(out, STDOUT_FILENO) < 0 ||
-        ::dup2(err, STDERR_FILENO) < 0 || ::chdir(workdir) != 0) {
+[[noreturn]] void exec_child(const ChildSetup& setup) noexcept {
+    if (::dup2(setup.in, STDIN_FILENO) < 0 || ::dup2(setup.out, STDOUT_FILENO) < 0 ||
+        ::dup2(setup.err, STDERR_FILENO) < 0 || ::chdir(setup.workdir) != 0) {
         ::_exit(exit_exec_failed);
     }
     ::close_range(static_cast<unsigned int>(STDERR_FILENO + 1),
@@ -246,26 +312,34 @@ std::vector<char*> pointers_to(std::vector<std::string>& strings) {
     default_action.sa_handler = SIG_DFL;
     sigemptyset(&default_action.sa_mask);
     ::sigaction(SIGPIPE, &default_action, nullptr);
+    if (setup.limit_file_size) {
+        // Ignored, so a write past the limit fails with EFBIG instead of killing the CLI.
+        struct sigaction ignore_action{};
+        ignore_action.sa_handler = SIG_IGN;
+        sigemptyset(&ignore_action.sa_mask);
+        ::sigaction(SIGXFSZ, &ignore_action, nullptr);
+        const struct rlimit limit{.rlim_cur = setup.file_size_limit,
+                                  .rlim_max = setup.file_size_limit};
+        if (::setrlimit(RLIMIT_FSIZE, &limit) != 0) {
+            ::_exit(exit_exec_failed);
+        }
+    }
     sigset_t no_signals;
     sigemptyset(&no_signals);
     ::pthread_sigmask(SIG_SETMASK, &no_signals, nullptr);
-    ::execve(binary_path, argv, envp);
+    ::execve(binary_path, setup.argv, setup.envp);
     ::_exit(exit_exec_failed);
 }
 
-// A private temporary HOME and project directory wired to one mock server.
+// A private temporary HOME and project directory wired to one mock server. Keys go in through
+// `auth set` with the fake credential tool, never through .env.
 class Sandbox {
 public:
-    explicit Sandbox(int port) : root_(make_root()) {
-        for (const fs::path& dir : {home(), project(), work()}) {
+    explicit Sandbox(int port) : root_(make_root()), port_(port) {
+        for (const fs::path& dir : {home(), project(), work(), empty_bin()}) {
             make_private_dir(dir);
         }
-        write_text(project() / ".env",
-                   std::format("OPENROUTER_API_KEY=test-key\n"
-                               "OPENROUTER_CLI_BASE_URL=http://127.0.0.1:{}/api/v1\n"
-                               "OPENROUTER_CLI_IDLE_TIMEOUT_SECONDS={}\n"
-                               "OPENROUTER_CLI_TOTAL_TIMEOUT_SECONDS={}\n",
-                               port, idle_timeout_seconds, total_timeout_seconds));
+        write_env("");
     }
     Sandbox(const Sandbox&) = delete;
     Sandbox& operator=(const Sandbox&) = delete;
@@ -276,12 +350,29 @@ public:
         fs::remove_all(root_, ignored);
     }
 
+    [[nodiscard]] fs::path root() const { return root_; }
     [[nodiscard]] fs::path home() const { return root_ / "home"; }
     [[nodiscard]] fs::path project() const { return root_ / "project"; }
     [[nodiscard]] fs::path work() const { return root_ / "work"; }
+    [[nodiscard]] fs::path empty_bin() const { return root_ / "empty-bin"; }
     [[nodiscard]] fs::path state_dir() const { return project() / "state"; }
+    [[nodiscard]] fs::path api_credential() const {
+        return state_dir() / "credentials" / "api-key.cred";
+    }
+    [[nodiscard]] fs::path management_credential() const {
+        return state_dir() / "credentials" / "management-key.cred";
+    }
     [[nodiscard]] fs::path cost_log() const {
         return home() / ".local" / "state" / "openrouter-cli" / "costs.jsonl";
+    }
+
+    // The settings every test needs, followed by extra_lines.
+    void write_env(std::string_view extra_lines) const {
+        write_text(project() / ".env",
+                   std::format("OPENROUTER_CLI_BASE_URL=http://127.0.0.1:{}/api/v1\n"
+                               "OPENROUTER_CLI_IDLE_TIMEOUT_SECONDS={}\n"
+                               "OPENROUTER_CLI_TOTAL_TIMEOUT_SECONDS={}\n{}",
+                               port_, idle_timeout_seconds, total_timeout_seconds, extra_lines));
     }
 
     Child spawn(const Launch& launch) {
@@ -309,18 +400,31 @@ public:
         std::vector<std::string> arg_strings{binary_path};
         std::ranges::copy(launch.args, std::back_inserter(arg_strings));
         std::vector<std::string> env_strings{
-            "HOME=" + home().string(),
+            "HOME=" + launch.home.value_or(home()).string(),
             "OPENROUTER_CLI_HOME=" + project().string(),
-            "PATH=/usr/bin:/bin",
         };
+        if (launch.creds_tool) {
+            env_strings.emplace_back("PATH=/usr/bin:/bin");
+            env_strings.push_back(std::string("OPENROUTER_CLI_TEST_CREDS_TOOL=") + creds_tool_path);
+        } else {
+            env_strings.push_back("PATH=" + empty_bin().string());
+        }
         const std::vector<char*> argv = pointers_to(arg_strings);
         const std::vector<char*> envp = pointers_to(env_strings);
         const std::string workdir = work().string();
+        const ChildSetup setup{.in = in.get(),
+                               .out = out.get(),
+                               .err = err.get(),
+                               .workdir = workdir.c_str(),
+                               .argv = argv.data(),
+                               .envp = envp.data(),
+                               .limit_file_size = launch.file_size_limit.has_value(),
+                               .file_size_limit = launch.file_size_limit.value_or(0)};
 
         const pid_t pid = ::fork();
         REQUIRE(pid >= 0);
         if (pid == 0) {
-            exec_child(in.get(), out.get(), err.get(), workdir.c_str(), argv.data(), envp.data());
+            exec_child(setup);
         }
         return {pid, out_path, err_path};
     }
@@ -328,11 +432,30 @@ public:
     RunResult run_with(const Launch& launch) {
         Child child = spawn(launch);
         const int code = child.wait();
-        return {code, child.out(), child.err()};
+        return {.code = code, .out = child.out(), .err = child.err()};
     }
 
     RunResult run(std::vector<std::string> args) {
         return run_with(Launch{.args = std::move(args)});
+    }
+
+    // `printf 'KEY\n' | openrouter-cli auth set [flags]`.
+    RunResult auth_set(std::string_view key, std::vector<std::string> flags = {}) {
+        std::vector<std::string> args{"auth", "set"};
+        std::ranges::move(flags, std::back_inserter(args));
+        return run_with(Launch{.args = std::move(args), .stdin_text = std::string(key) + "\n"});
+    }
+
+    void store_api_key() {
+        const RunResult stored = auth_set(inference_key());
+        INFO(stored.err);
+        REQUIRE(stored.code == exit_ok);
+    }
+
+    void store_management_key() {
+        const RunResult stored = auth_set(management_key(), {"--management"});
+        INFO(stored.err);
+        REQUIRE(stored.code == exit_ok);
     }
 
     // Every cost log record in file order; a missing log has none.
@@ -382,6 +505,7 @@ private:
     }
 
     fs::path root_;
+    int port_;
     int runs_ = 0;
 };
 
@@ -399,11 +523,41 @@ std::string result_outcome(const Sandbox& sandbox) {
     return text_at(results.front(), "outcome");
 }
 
+bool file_exists(const fs::path& path) {
+    std::error_code error;
+    return fs::exists(path, error);
+}
+
+// Appends one finished call whose cost is unknown, as an older run of the CLI would have.
+void log_unpriced_call(const Sandbox& sandbox, const std::string& call_id,
+                       const std::string& generation) {
+    make_private_dir(sandbox.cost_log().parent_path());
+    const orcli::CostLog ledger(sandbox.cost_log(),
+                                sandbox.cost_log().parent_path() / "costs.lock");
+    orcli::PendingInfo pending;
+    pending.call_id = call_id;
+    pending.time = orcli::utc_now_iso();
+    pending.cwd = sandbox.work().string();
+    pending.requested_model = std::string(alpha);
+    pending.model_id = std::string(alpha);
+    pending.privacy = "zdr";
+    pending.answer_path = (sandbox.state_dir() / "answers" / (call_id + ".md")).string();
+    orcli::ResultInfo result;
+    result.call_id = call_id;
+    result.outcome = "complete";
+    REQUIRE(ledger.append(orcli::pending_record(pending)).has_value());
+    REQUIRE(ledger.append(orcli::generation_record(call_id, generation)).has_value());
+    REQUIRE(ledger.append(orcli::result_record(result)).has_value());
+}
+
 } // namespace
+
+// ----- asking a model ----------------------------------------------------------------------
 
 TEST_CASE("a streamed answer is printed, saved and logged with its cost") {
     MockServer server;
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult result = sandbox.run(ask("Review this plan."));
 
@@ -414,7 +568,7 @@ TEST_CASE("a streamed answer is printed, saved and logged with its cost") {
     CHECK(cost_line.contains("via MockProvider"));
     CHECK(server.post_count() == 1);
     CHECK(server.generation_count() == 0);
-    CHECK(server.last_authorization() == "Bearer test-key");
+    CHECK(server.last_authorization() == bearer(inference_key()));
     CHECK(sandbox.only_answer() == "Hello world");
 
     const std::vector<json> pending = sandbox.records_of("pending");
@@ -437,6 +591,7 @@ TEST_CASE("a streamed answer is printed, saved and logged with its cost") {
     CHECK(text_at(provider, "data_collection") == "deny");
     CHECK(provider.at("zdr").get<bool>());
     CHECK(provider.at("require_parameters").get<bool>());
+    CHECK_FALSE(provider.contains("only"));
     CHECK(body.at("plugins").dump() ==
           R"([{"enabled":false,"id":"web"},{"enabled":false,"id":"context-compression"}])");
     for (const char* absent : {"temperature", "top_p", "session_id", "cache_control"}) {
@@ -445,9 +600,46 @@ TEST_CASE("a streamed answer is printed, saved and logged with its cost") {
     }
 }
 
+TEST_CASE("-p slugs are forwarded unchanged as provider.only without an endpoints lookup") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    const RunResult result = sandbox.run({"-m", std::string(alpha), "-p", "mockcloud/fp8", "-p",
+                                          "Other-Cloud", "-p", "mockcloud/fp8", "question"});
+
+    CHECK(result.code == exit_ok);
+    CHECK(server.last_post().at("provider").at("only").dump() ==
+          R"(["mockcloud/fp8","Other-Cloud"])");
+    for (const RecordedRequest& request : server.requests()) {
+        INFO(request.path);
+        CHECK_FALSE(request.path.ends_with("/endpoints"));
+    }
+    CHECK(server.post_count() == 1);
+}
+
+TEST_CASE("an OpenRouter no-endpoints error exits 5 with a hint to inspect the model") {
+    MockServer server;
+    server.set_route("/chat/completions", [](const RecordedRequest&) {
+        return Reply{.status = http_not_found,
+                     .body = R"({"error":{"code":404,"message":"No endpoints found matching your )"
+                             R"(data policy (Zero data retention)."}})"};
+    });
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    const RunResult result = sandbox.run({"-m", std::string(alpha), "-p", "nowhere", "question"});
+
+    CHECK(result.code == exit_api);
+    CHECK(result.err.contains("No endpoints found"));
+    CHECK(result.err.contains("models show"));
+    CHECK(server.post_count() == 1);
+}
+
 TEST_CASE("a plain model name is resolved once and saved as an alias") {
     MockServer server;
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult first = sandbox.run({"-m", "alpha 1", "first question"});
     CHECK(first.code == exit_ok);
@@ -466,6 +658,7 @@ TEST_CASE("a plain model name is resolved once and saved as an alias") {
 TEST_CASE("an ambiguous model name lists the candidates and sends nothing") {
     MockServer server;
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult result = sandbox.run({"-m", "beta", "question"});
 
@@ -481,6 +674,7 @@ TEST_CASE("an unknown cost is looked up until the generation record appears") {
     server.set_scenario(Scenario::success_no_cost);
     server.set_generation_statuses({http_not_found, http_not_found}, http_ok);
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult result = sandbox.run(ask("question"));
 
@@ -489,6 +683,9 @@ TEST_CASE("an unknown cost is looked up until the generation record appears") {
     CHECK_FALSE(line_starting(result.err, "openrouter-cli: cost $0.0123").empty());
     CHECK(server.generation_count() == 3);
     CHECK(server.last_generation_id() == "gen-test-1");
+    for (const RecordedRequest& lookup : server.requests_to("/generation")) {
+        CHECK(lookup.authorization == bearer(inference_key()));
+    }
     CHECK(sandbox.records_of("resolved").size() == 1U);
     CHECK(server.post_count() == 1);
 }
@@ -498,6 +695,7 @@ TEST_CASE("a generation record that never appears leaves the cost unknown") {
     server.set_scenario(Scenario::success_no_cost);
     server.set_generation_statuses({}, http_not_found);
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult result = sandbox.run(ask("question"));
 
@@ -512,6 +710,7 @@ TEST_CASE("an HTTP error status is reported by type without echoing secrets") {
     MockServer server;
     server.set_scenario(Scenario::http_error);
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult result = sandbox.run(ask("question"));
 
@@ -529,6 +728,7 @@ TEST_CASE("an error body served with status 200 is an API error") {
     MockServer server;
     server.set_scenario(Scenario::error_in_200);
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult result = sandbox.run(ask("question"));
 
@@ -542,6 +742,7 @@ TEST_CASE("an error in the middle of the stream keeps the partial answer and its
     MockServer server;
     server.set_scenario(Scenario::midstream_error);
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult result = sandbox.run(ask("question"));
 
@@ -558,6 +759,7 @@ TEST_CASE("a stream that ends before the model finishes is incomplete") {
     MockServer server;
     server.set_scenario(Scenario::early_eof);
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult result = sandbox.run(ask("question"));
 
@@ -572,6 +774,7 @@ TEST_CASE("an output budget spent on reasoning is explained") {
     MockServer server;
     server.set_scenario(Scenario::length_empty);
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult result = sandbox.run(ask("question"));
 
@@ -586,6 +789,7 @@ TEST_CASE("an output budget spent on reasoning is explained") {
 TEST_CASE("a secret in an attached file stops the call before anything is sent") {
     MockServer server;
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
     const fs::path notes = sandbox.work() / "notes.txt";
     write_text(notes, "first line\nkey " + mock::fake_api_key() + "\n");
 
@@ -601,6 +805,7 @@ TEST_CASE("a secret in an attached file stops the call before anything is sent")
 TEST_CASE("a cost log that cannot be written stops the call before anything is sent") {
     MockServer server;
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
     for (fs::path dir = sandbox.cost_log(); dir != sandbox.home(); dir = dir.parent_path()) {
         make_private_dir(dir);
     }
@@ -609,12 +814,14 @@ TEST_CASE("a cost log that cannot be written stops the call before anything is s
 
     CHECK(result.code == exit_refused);
     CHECK(result.err.contains("nothing was sent"));
+    CHECK(sandbox.answer_files().empty());
     CHECK(server.post_count() == 0);
 }
 
 TEST_CASE("a session carries completed turns only and pins its model and system text") {
     MockServer server;
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult first = sandbox.run({"--session", "s1", "-m", std::string(alpha), "q1"});
     REQUIRE(first.code == exit_ok);
@@ -651,12 +858,12 @@ TEST_CASE("a session carries completed turns only and pins its model and system 
     CHECK(sandbox.run({"--session", "s1", "-s", "extra system text", "q5"}).code == exit_usage);
     CHECK(server.post_count() == 4);
 
-    const RunResult anthropic_session =
+    const RunResult other_session =
         sandbox.run({"--session", "s2", "-m", "anthropic/claude-test", "q1"});
-    CHECK(anthropic_session.code == exit_ok);
+    CHECK(other_session.code == exit_ok);
     CHECK(server.last_post().contains("session_id"));
-    const RunResult anthropic_plain = sandbox.run({"-m", "anthropic/claude-test", "q1"});
-    CHECK(anthropic_plain.code == exit_ok);
+    const RunResult no_session = sandbox.run({"-m", "anthropic/claude-test", "q1"});
+    CHECK(no_session.code == exit_ok);
     CHECK_FALSE(server.last_post().contains("session_id"));
     CHECK(server.post_count() == 6);
 
@@ -670,6 +877,7 @@ TEST_CASE("a session carries completed turns only and pins its model and system 
 TEST_CASE("the query can come from stdin") {
     MockServer server;
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult result = sandbox.run_with(
         Launch{.args = ask("-"), .stdin_text = std::string("question from stdin")});
@@ -679,7 +887,7 @@ TEST_CASE("the query can come from stdin") {
     CHECK(server.post_count() == 1);
 }
 
-TEST_CASE("models, spend and balance answer without asking a model") {
+TEST_CASE("models commands work without a stored key and spend totals the log") {
     MockServer server;
     Sandbox sandbox(server.port());
 
@@ -692,7 +900,9 @@ TEST_CASE("models, spend and balance answer without asking a model") {
     CHECK(shown.code == exit_ok);
     CHECK(shown.out.contains(alpha));
     CHECK(shown.out.contains("2.5"));
-    CHECK(shown.out.contains("10"));
+    CHECK(shown.out.contains("mockcloud/fp8"));
+    CHECK(shown.out.contains("othercloud"));
+    CHECK(server.requests_to("/models/test/alpha-1/endpoints").size() == 1U);
 
     const RunResult empty_list = sandbox.run({"models", "list"});
     CHECK(empty_list.code == exit_ok);
@@ -704,14 +914,13 @@ TEST_CASE("models, spend and balance answer without asking a model") {
     CHECK(listed.code == exit_ok);
     CHECK(listed.out.contains("mine -> test/beta-2"));
 
-    const RunResult balance = sandbox.run({"balance"});
-    CHECK(balance.code == exit_ok);
-    CHECK(balance.out.contains("usage today      $0.2500"));
-    CHECK(balance.out.contains("usage total      $1.5000"));
-    CHECK(balance.out.contains("key limit        n/a"));
-
+    for (const RecordedRequest& request : server.requests()) {
+        INFO(request.path);
+        CHECK(request.authorization.empty());
+    }
     CHECK(server.post_count() == 0);
 
+    sandbox.store_api_key();
     REQUIRE(sandbox.run(ask("question")).code == exit_ok);
     const RunResult spend = sandbox.run({"spend"});
     CHECK(spend.code == exit_ok);
@@ -724,6 +933,7 @@ TEST_CASE("a silent stream hits the idle timeout and keeps the partial answer") 
     server.set_scenario(Scenario::slow);
     server.set_hold(idle_hold);
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const auto started = Clock::now();
     const RunResult result = sandbox.run(ask("question"));
@@ -733,8 +943,10 @@ TEST_CASE("a silent stream hits the idle timeout and keeps the partial answer") 
     CHECK(result.err.contains("idle timeout"));
     CHECK(elapsed < idle_hold);
     CHECK(sandbox.only_answer() == "Hello");
+    CHECK(server.generation_count() == 0);
     CHECK(server.post_count() == 1);
     CHECK(result_outcome(sandbox) == "error");
+    CHECK(sandbox.records_of("generation").size() == 1U);
 }
 
 TEST_CASE("keepalive comments keep a quiet call alive past the idle limit") {
@@ -742,6 +954,7 @@ TEST_CASE("keepalive comments keep a quiet call alive past the idle limit") {
     server.set_scenario(Scenario::drip);
     server.set_hold(drip_hold);
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult result = sandbox.run(ask("question"));
 
@@ -755,6 +968,7 @@ TEST_CASE("SIGTERM mid-stream keeps the partial answer, and the busy session is 
     server.set_scenario(Scenario::slow);
     server.set_hold(interrupt_hold);
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     Child child =
         sandbox.spawn(Launch{.args = {"--session", "busy", "-m", std::string(alpha), "q"}});
@@ -771,15 +985,20 @@ TEST_CASE("SIGTERM mid-stream keeps the partial answer, and the busy session is 
     CHECK(child.err().contains("interrupted"));
     CHECK(sandbox.only_answer() == "Hello");
     CHECK(result_outcome(sandbox) == "interrupted");
+    CHECK(server.generation_count() == 0);
     CHECK(server.post_count() == 1);
 }
 
 TEST_CASE("command line grammar") {
     MockServer server;
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     CHECK(sandbox.run({"models"}).code == exit_usage);
+    CHECK(sandbox.run({"account"}).code == exit_usage);
+    CHECK(sandbox.run({"auth"}).code == exit_usage);
     CHECK(sandbox.run({"-m", "x", "spend"}).code == exit_usage);
+    CHECK(sandbox.run({"-p", "mockcloud", "status"}).code == exit_usage);
     CHECK(sandbox.run({}).code == exit_usage);
     CHECK(server.post_count() == 0);
 
@@ -792,6 +1011,7 @@ TEST_CASE("command line grammar") {
 TEST_CASE("a closed stdout still leaves a complete answer file") {
     MockServer server;
     Sandbox sandbox(server.port());
+    sandbox.store_api_key();
 
     const RunResult result =
         sandbox.run_with(Launch{.args = ask("question"), .closed_stdout = true});
@@ -800,4 +1020,757 @@ TEST_CASE("a closed stdout still leaves a complete answer file") {
     CHECK(sandbox.only_answer() == "Hello world");
     CHECK(result_outcome(sandbox) == "complete");
     CHECK(server.post_count() == 1);
+}
+
+// ----- exit 9: the call completed but saving failed -----------------------------------------
+
+TEST_CASE("an answer file that cannot be written after a completed call exits 9") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    REQUIRE(sandbox.run(ask("fills the catalog cache")).code == exit_ok);
+    server.set_scenario(Scenario::large);
+    // A fresh HOME keeps the cost log far below the file size limit that the answer exceeds.
+    const fs::path other_home = sandbox.root() / "home-limited";
+    make_private_dir(other_home);
+
+    const RunResult result = sandbox.run_with(
+        Launch{.args = ask("question"), .home = other_home, .file_size_limit = answer_file_limit});
+
+    CHECK(result.code == exit_not_saved);
+    CHECK(result.err.contains("answer"));
+    CHECK(server.post_count() == 2);
+}
+
+TEST_CASE("a result record that cannot be written after a completed call exits 9") {
+    MockServer server;
+    server.set_scenario(Scenario::gated);
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    Child child = sandbox.spawn(Launch{.args = ask("question")});
+    REQUIRE(child.wait_for_output("Hello"));
+    fs::permissions(sandbox.cost_log(), fs::perms::owner_read);
+    server.release_gate();
+    const int code = child.wait();
+
+    CHECK(code == exit_not_saved);
+    CHECK(child.out() == "Hello world\n");
+    CHECK(sandbox.only_answer() == "Hello world");
+    CHECK(sandbox.records_of("result").empty());
+    CHECK(server.post_count() == 1);
+}
+
+TEST_CASE("a session that cannot be saved after a completed call exits 9") {
+    MockServer server;
+    server.set_scenario(Scenario::gated);
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    Child child =
+        sandbox.spawn(Launch{.args = {"--session", "s9", "-m", std::string(alpha), "question"}});
+    REQUIRE(child.wait_for_output("Hello"));
+    const fs::path session_file = sandbox.state_dir() / "sessions" / "s9.json";
+    std::error_code ignored;
+    fs::remove(session_file, ignored);
+    fs::create_directories(session_file / "blocker");
+    server.release_gate();
+    const int code = child.wait();
+
+    CHECK(code == exit_not_saved);
+    CHECK(child.out() == "Hello world\n");
+    CHECK(child.err().contains("session"));
+    CHECK(result_outcome(sandbox) == "complete");
+    CHECK(server.post_count() == 1);
+}
+
+// ----- spend --resolve -------------------------------------------------------------------------
+
+TEST_CASE("spend --resolve prices calls whose charge has appeared and keeps the rest") {
+    MockServer server;
+    server.set_route("/generation", [](const RecordedRequest& request) {
+        if (request.param("id") == "gen-found") {
+            return Reply{.status = http_ok,
+                         .body = R"({"data":{"id":"gen-found","total_cost":0.0123,)"
+                                 R"("provider_name":"MockProvider","model":"test/alpha-1",)"
+                                 R"("native_tokens_prompt":10,"native_tokens_completion":5}})"};
+        }
+        return Reply{.status = http_not_found,
+                     .body = R"({"error":{"code":404,"message":"Generation not found"}})"};
+    });
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    const std::string found_call(32, 'a');
+    const std::string missing_call(32, 'b');
+    log_unpriced_call(sandbox, found_call, "gen-found");
+    log_unpriced_call(sandbox, missing_call, "gen-missing");
+
+    const RunResult first = sandbox.run({"spend", "--resolve"});
+
+    CHECK(first.code == exit_ok);
+    CHECK(first.out.contains(found_call));
+    const std::vector<json> resolved = sandbox.records_of("resolved");
+    REQUIRE(resolved.size() == 1U);
+    CHECK(text_at(resolved.front(), "call_id") == found_call);
+    CHECK(server.generation_count() == 2);
+    for (const RecordedRequest& lookup : server.requests_to("/generation")) {
+        CHECK(lookup.authorization == bearer(inference_key()));
+    }
+
+    const RunResult second = sandbox.run({"spend", "--resolve"});
+
+    CHECK(second.code == exit_ok);
+    const std::vector<RecordedRequest> lookups = server.requests_to("/generation");
+    REQUIRE(lookups.size() == 3U);
+    CHECK(lookups.back().param("id") == "gen-missing");
+    CHECK(sandbox.records_of("resolved").size() == 1U);
+    CHECK(server.post_count() == 0);
+}
+
+// ----- auth ------------------------------------------------------------------------------------
+
+TEST_CASE("auth set stores the key encrypted and asks use it") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+
+    const RunResult stored = sandbox.auth_set(inference_key());
+
+    CHECK(stored.code == exit_ok);
+    REQUIRE(file_exists(sandbox.api_credential()));
+    const std::string ciphertext = read_text(sandbox.api_credential());
+    CHECK(ciphertext.starts_with("FAKECRED:openrouter-cli-api-key:"));
+    CHECK_FALSE(ciphertext.contains(inference_key()));
+    CHECK_FALSE(stored.all().contains(inference_key()));
+    const std::vector<RecordedRequest> checks = server.requests_to("/key");
+    REQUIRE(checks.size() == 1U);
+    CHECK(checks.front().authorization == bearer(inference_key()));
+
+    REQUIRE(sandbox.run(ask("question")).code == exit_ok);
+    CHECK(server.last_authorization() == bearer(inference_key()));
+}
+
+TEST_CASE("auth set keeps a stored key unless --replace passes verification") {
+    MockServer server;
+    const std::string accepted = inference_key();
+    const std::string rejected = mock::fake_key('4');
+    const std::string replacement = mock::fake_key('5');
+    server.set_route("/key", [rejected](const RecordedRequest& request) {
+        if (request.authorization == bearer(rejected)) {
+            return Reply{.status = http_unauthorized,
+                         .body = R"({"error":{"code":401,"message":"User not found."}})"};
+        }
+        return data_reply(mock::key_data());
+    });
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    const std::string original = read_text(sandbox.api_credential());
+
+    const RunResult again = sandbox.auth_set(replacement);
+    CHECK(again.code == exit_refused);
+    CHECK(again.err.contains("--replace"));
+    CHECK(read_text(sandbox.api_credential()) == original);
+
+    const RunResult bad = sandbox.auth_set(rejected, {"--replace"});
+    CHECK(bad.code != exit_ok);
+    CHECK(read_text(sandbox.api_credential()) == original);
+    REQUIRE(sandbox.run(ask("question")).code == exit_ok);
+    CHECK(server.last_authorization() == bearer(accepted));
+
+    const RunResult good = sandbox.auth_set(replacement, {"--replace"});
+    CHECK(good.code == exit_ok);
+    REQUIRE(sandbox.run(ask("question")).code == exit_ok);
+    CHECK(server.last_authorization() == bearer(replacement));
+}
+
+TEST_CASE("auth set stores an API key only when /key says is_management_key is false") {
+    struct Case {
+        const char* name;
+        json value; // null: field left out
+        int status;
+    };
+    const std::vector<Case> cases{
+        {.name = "true", .value = true, .status = http_ok},
+        {.name = "missing", .value = nullptr, .status = http_ok},
+        {.name = "string", .value = "false", .status = http_ok},
+        {.name = "number", .value = 0, .status = http_ok},
+        {.name = "401", .value = false, .status = http_unauthorized},
+        {.name = "403", .value = false, .status = http_forbidden},
+        {.name = "false", .value = false, .status = http_ok},
+    };
+    for (const Case& entry : cases) {
+        INFO("is_management_key ", entry.name);
+        MockServer server;
+        server.set_route("/key", [entry](const RecordedRequest&) {
+            json data = mock::key_data();
+            data.erase("is_management_key");
+            if (!entry.value.is_null()) {
+                data["is_management_key"] = entry.value;
+            }
+            return Reply{.status = entry.status, .body = json{{"data", data}}.dump()};
+        });
+        Sandbox sandbox(server.port());
+
+        const RunResult result = sandbox.auth_set(inference_key());
+
+        const bool should_store = std::string_view(entry.name) == "false";
+        CHECK((result.code == exit_ok) == should_store);
+        CHECK(file_exists(sandbox.api_credential()) == should_store);
+        if (std::string_view(entry.name) == "true") {
+            CHECK(result.err.contains("auth set --management"));
+        }
+        CHECK(server.post_count() == 0);
+    }
+}
+
+TEST_CASE("auth set --management verifies with /credits and never touches inference endpoints") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+
+    sandbox.store_management_key();
+
+    CHECK(file_exists(sandbox.management_credential()));
+    CHECK_FALSE(file_exists(sandbox.api_credential()));
+    const std::vector<RecordedRequest> checks = server.requests_to("/credits");
+    REQUIRE(checks.size() == 1U);
+    CHECK(checks.front().authorization == bearer(management_key()));
+    CHECK(server.requests_to("/key").empty());
+}
+
+TEST_CASE("auth login exchanges the pasted code without an Authorization header") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+
+    const RunResult login =
+        sandbox.run_with(Launch{.args = {"auth", "login"}, .stdin_text = "mock-code\n"});
+
+    INFO(login.err);
+    CHECK(login.code == exit_ok);
+    const std::vector<RecordedRequest> exchanges = server.requests_to("/auth/keys");
+    REQUIRE(exchanges.size() == 1U);
+    const RecordedRequest& exchange = exchanges.front();
+    CHECK(exchange.method == "POST");
+    CHECK(exchange.authorization.empty());
+    const json body = json::parse(exchange.body, nullptr, false);
+    REQUIRE(body.is_object());
+    CHECK(text_at(body, "code") == "mock-code");
+    CHECK(text_at(body, "code_challenge_method") == "S256");
+    const std::string verifier = text_at(body, "code_verifier");
+    CHECK(verifier.size() == verifier_length);
+
+    const auto challenge = orcli::pkce_challenge(verifier);
+    REQUIRE(challenge.has_value());
+    CHECK(login.out.contains("https://openrouter.ai/auth?"));
+    CHECK(login.out.contains("code_challenge=" + *challenge));
+    CHECK(login.out.contains("code_challenge_method=S256"));
+    CHECK(login.out.contains("key_label="));
+    CHECK_FALSE(login.out.contains("callback_url"));
+    CHECK_FALSE(login.all().contains(mock::login_key()));
+
+    const std::vector<RecordedRequest> checks = server.requests_to("/key");
+    REQUIRE(checks.size() == 1U);
+    CHECK(checks.front().authorization == bearer(mock::login_key()));
+    REQUIRE(file_exists(sandbox.api_credential()));
+    REQUIRE(sandbox.run(ask("question")).code == exit_ok);
+    CHECK(server.last_authorization() == bearer(mock::login_key()));
+}
+
+TEST_CASE("a plaintext key in .env stops every command except auth set, login and logout") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    const std::string plaintext = mock::fake_key('7');
+
+    const std::vector<std::string> env_variants{
+        "OPENROUTER_API_KEY=" + plaintext + "\n",
+        "OPENROUTER_API_KEY=" + plaintext + "\nOPENROUTER_API_KEY=\n",
+        "OPENROUTER_MANAGEMENT_KEY=\"" + plaintext + "\"\n",
+    };
+    for (const std::string& variant : env_variants) {
+        INFO("env variant ", variant.substr(0, variant.find('=')),
+             variant.ends_with("=\n") ? " followed by an empty duplicate" : "");
+        sandbox.write_env(variant);
+        for (const std::vector<std::string>& args :
+             std::vector<std::vector<std::string>>{ask("question"),
+                                                   {"status"},
+                                                   {"models", "list"},
+                                                   {"models", "find", "beta"},
+                                                   {"spend"},
+                                                   {"account", "balance"}}) {
+            INFO("command ", args.front());
+            const RunResult refused = sandbox.run(args);
+            CHECK(refused.code == exit_config);
+            CHECK(refused.err.contains("line 4"));
+            CHECK_FALSE(refused.all().contains(plaintext));
+        }
+    }
+    CHECK(server.post_count() == 0);
+
+    sandbox.write_env("OPENROUTER_API_KEY=" + plaintext + "\n");
+    const RunResult replaced = sandbox.auth_set(inference_key(), {"--replace"});
+    CHECK(replaced.code == exit_ok);
+    CHECK(replaced.err.contains("line 4"));
+    CHECK_FALSE(replaced.all().contains(plaintext));
+
+    sandbox.write_env("");
+    REQUIRE(sandbox.run(ask("question")).code == exit_ok);
+    CHECK(server.last_authorization() == bearer(inference_key()));
+}
+
+TEST_CASE("the management key never reaches an inference endpoint") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.store_management_key();
+
+    REQUIRE(sandbox.run(ask("question")).code == exit_ok);
+    CHECK(sandbox.run({"status"}).code == exit_ok);
+    CHECK(sandbox.run({"account", "balance"}).code == exit_ok);
+    CHECK(sandbox.run({"account", "keys"}).code == exit_ok);
+    CHECK(sandbox.run({"account", "credits"}).code == exit_ok);
+    CHECK(sandbox.run({"account", "activity"}).code == exit_ok);
+
+    const std::vector<std::string_view> inference_paths{"/chat/completions", "/key", "/generation"};
+    const std::vector<std::string_view> management_paths{"/keys", "/credits", "/activity",
+                                                         "/organization/members"};
+    for (const RecordedRequest& request : server.requests()) {
+        INFO(request.method, " ", request.path);
+        if (std::ranges::contains(inference_paths, std::string_view(request.path))) {
+            CHECK(request.authorization == bearer(inference_key()));
+        } else if (std::ranges::contains(management_paths, std::string_view(request.path))) {
+            CHECK(request.authorization == bearer(management_key()));
+        } else {
+            CHECK(request.authorization.empty());
+        }
+    }
+    CHECK(server.post_count() == 1);
+}
+
+// ----- auth logout -----------------------------------------------------------------------------
+
+TEST_CASE("auth logout removes both keys, and logging out twice is fine") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.store_management_key();
+    const std::size_t requests_before = server.requests().size();
+
+    const RunResult logout = sandbox.run({"auth", "logout"});
+
+    CHECK(logout.code == exit_ok);
+    CHECK(logout.all().contains("https://openrouter.ai/settings/keys"));
+    CHECK_FALSE(file_exists(sandbox.api_credential()));
+    CHECK_FALSE(file_exists(sandbox.management_credential()));
+    CHECK(server.requests().size() == requests_before);
+
+    const RunResult asked = sandbox.run(ask("question"));
+    CHECK(asked.code == exit_config);
+    CHECK(asked.err.contains("auth login"));
+    CHECK(server.post_count() == 0);
+
+    const RunResult status = sandbox.run({"status"});
+    CHECK(status.code == exit_ok);
+    CHECK(status.out.contains("logged in: no"));
+
+    const RunResult again = sandbox.run({"auth", "logout"});
+    CHECK(again.code == exit_ok);
+    CHECK(again.all().contains("already logged out"));
+}
+
+TEST_CASE("auth logout --management keeps the API key") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.store_management_key();
+
+    CHECK(sandbox.run({"auth", "logout", "--management"}).code == exit_ok);
+
+    CHECK(file_exists(sandbox.api_credential()));
+    CHECK_FALSE(file_exists(sandbox.management_credential()));
+    CHECK(sandbox.run(ask("question")).code == exit_ok);
+    CHECK(sandbox.run({"account", "credits"}).code == exit_config);
+}
+
+TEST_CASE("auth logout works with a plaintext .env line, without a credential tool and with a "
+          "corrupt credential file") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+
+    sandbox.store_api_key();
+    sandbox.write_env("OPENROUTER_API_KEY=" + mock::fake_key('7') + "\n");
+    const RunResult with_plaintext = sandbox.run({"auth", "logout"});
+    CHECK(with_plaintext.code == exit_ok);
+    CHECK(with_plaintext.err.contains("line 4"));
+    CHECK_FALSE(file_exists(sandbox.api_credential()));
+    sandbox.write_env("");
+
+    sandbox.store_api_key();
+    const RunResult without_tool =
+        sandbox.run_with(Launch{.args = {"auth", "logout"}, .creds_tool = false});
+    CHECK(without_tool.code == exit_ok);
+    CHECK_FALSE(file_exists(sandbox.api_credential()));
+
+    sandbox.store_api_key();
+    write_text(sandbox.api_credential(), "not a credential");
+    const RunResult corrupt = sandbox.run({"auth", "logout"});
+    CHECK(corrupt.code == exit_ok);
+    CHECK_FALSE(file_exists(sandbox.api_credential()));
+}
+
+TEST_CASE("a credential that fails to decrypt is named and exits 7") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.store_management_key();
+
+    write_text(sandbox.management_credential(), "not a credential");
+    const RunResult management = sandbox.run({"account", "credits"});
+    CHECK(management.code == exit_config);
+    CHECK(management.err.contains("Management key"));
+    CHECK(sandbox.run({"status"}).code == exit_config);
+
+    write_text(sandbox.api_credential(), "not a credential");
+    const RunResult api = sandbox.run(ask("question"));
+    CHECK(api.code == exit_config);
+    CHECK(api.err.contains("API key"));
+    CHECK(sandbox.run({"status"}).code == exit_config);
+    CHECK(server.post_count() == 0);
+}
+
+// ----- status ----------------------------------------------------------------------------------
+
+TEST_CASE("status without a stored key says so and contacts nobody") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+
+    const RunResult status = sandbox.run({"status"});
+
+    CHECK(status.code == exit_ok);
+    CHECK(status.out.contains("logged in: no"));
+    CHECK(status.all().contains("auth login"));
+    CHECK(server.requests().empty());
+}
+
+TEST_CASE("status shows the key's identity and how to add a Management key") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    const RunResult status = sandbox.run({"status"});
+
+    CHECK(status.code == exit_ok);
+    CHECK(status.out.contains("logged in: yes"));
+    CHECK(status.out.contains(mock::creator_user_id));
+    CHECK(status.out.contains(mock::masked_key_label));
+    CHECK(status.out.contains("org_test_1"));
+    CHECK(status.out.contains("ws_test_1"));
+    CHECK(status.out.contains("management key: not stored"));
+    CHECK(status.out.contains("auth set --management"));
+    CHECK(status.out.contains("systemd-creds --user"));
+    CHECK_FALSE(status.all().contains(inference_key()));
+    CHECK(server.requests_to("/organization/members").empty());
+}
+
+TEST_CASE("status finds the key's creator among the organization members on a later page") {
+    MockServer server;
+    server.set_route("/organization/members", [](const RecordedRequest& request) {
+        const int offset = offset_param(request);
+        if (offset == 0) {
+            return data_reply(other_members(0, members_page_size));
+        }
+        if (offset == members_page_size) {
+            json page = other_members(offset, 2);
+            page.push_back(mock::member(mock::creator_user_id, "pat@example.com"));
+            return data_reply(page);
+        }
+        return data_reply(json::array());
+    });
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.store_management_key();
+
+    const RunResult status = sandbox.run({"status"});
+
+    CHECK(status.code == exit_ok);
+    CHECK(status.out.contains("logged in: yes"));
+    CHECK(status.out.contains("pat@example.com"));
+    CHECK(status.out.contains("Pat"));
+    CHECK(status.out.contains("Lee"));
+    CHECK(status.out.contains("org:admin"));
+    CHECK(status.out.contains("$12.5000"));
+    CHECK(server.requests_to("/organization/members").size() >= 2U);
+}
+
+TEST_CASE("status reports members it cannot search as not available or lookup failed") {
+    struct Case {
+        const char* name;
+        mock::Responder responder;
+        int exit;
+        const char* text;
+    };
+    const std::vector<Case> cases{
+        {.name = "404",
+         .responder = [](const RecordedRequest&) { return Reply{.status = http_not_found}; },
+         .exit = exit_ok,
+         .text = "not available"},
+        {.name = "403",
+         .responder = [](const RecordedRequest&) { return Reply{.status = http_forbidden}; },
+         .exit = exit_ok,
+         .text = "not available"},
+        {.name = "no match",
+         .responder =
+             [](const RecordedRequest& request) {
+                 const int offset = offset_param(request);
+                 if (offset == 0) {
+                     return data_reply(other_members(0, members_page_size));
+                 }
+                 return data_reply(offset == members_page_size ? other_members(offset, 3)
+                                                               : json::array());
+             },
+         .exit = exit_ok,
+         .text = "not available"},
+        {.name = "malformed page",
+         .responder =
+             [](const RecordedRequest&) {
+                 return Reply{.status = http_ok, .body = R"({"data":[{"id":7}]})"};
+             },
+         .exit = exit_api,
+         .text = "lookup failed"},
+        {.name = "500",
+         .responder =
+             [](const RecordedRequest&) {
+                 return Reply{.status = http_server_error,
+                              .body = R"({"error":{"code":500,"message":"boom"}})"};
+             },
+         .exit = exit_api,
+         .text = "lookup failed"},
+    };
+    for (const Case& entry : cases) {
+        INFO("members ", entry.name);
+        MockServer server;
+        server.set_route("/organization/members", entry.responder);
+        Sandbox sandbox(server.port());
+        sandbox.store_api_key();
+        sandbox.store_management_key();
+
+        const RunResult status = sandbox.run({"status"});
+
+        CHECK(status.code == entry.exit);
+        CHECK(status.all().contains(entry.text));
+        CHECK(status.out.contains("logged in: yes"));
+        CHECK(status.out.contains("$12.5000"));
+    }
+}
+
+TEST_CASE("status stops at the members page cap and reports the lookup as failed") {
+    MockServer server;
+    server.set_route("/organization/members", [](const RecordedRequest& request) {
+        return data_reply(other_members(offset_param(request), members_page_size));
+    });
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.store_management_key();
+
+    const RunResult status = sandbox.run({"status"});
+
+    CHECK(status.code == exit_api);
+    CHECK(status.all().contains("lookup failed"));
+    CHECK_FALSE(status.all().contains("not available"));
+    CHECK(server.requests_to("/organization/members").size() ==
+          static_cast<std::size_t>(members_page_cap));
+}
+
+TEST_CASE("status skips the members lookup without a creator id but still shows credits") {
+    MockServer server;
+    server.set_route("/key", [](const RecordedRequest&) {
+        json data = mock::key_data();
+        data["creator_user_id"] = nullptr;
+        return data_reply(data);
+    });
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.store_management_key();
+
+    const RunResult status = sandbox.run({"status"});
+
+    CHECK(status.code == exit_ok);
+    CHECK(status.out.contains("logged in: yes"));
+    CHECK(status.out.contains("not available"));
+    CHECK(status.out.contains("$12.5000"));
+    CHECK(server.requests_to("/organization/members").empty());
+}
+
+TEST_CASE("status shows null organization, workspace and member names as absent") {
+    MockServer server;
+    server.set_route("/key", [](const RecordedRequest&) {
+        json data = mock::key_data();
+        data["organization_id"] = nullptr;
+        data["workspace_id"] = nullptr;
+        return data_reply(data);
+    });
+    server.set_route("/organization/members", [](const RecordedRequest& request) {
+        if (offset_param(request) != 0) {
+            return data_reply(json::array());
+        }
+        json creator = mock::member(mock::creator_user_id, "solo@example.com");
+        creator["first_name"] = nullptr;
+        creator["last_name"] = nullptr;
+        return data_reply(json::array({creator}));
+    });
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.store_management_key();
+
+    const RunResult status = sandbox.run({"status"});
+
+    CHECK(status.code == exit_ok);
+    CHECK(status.out.contains("individual account"));
+    CHECK(status.out.contains("solo@example.com"));
+    CHECK(status.out.contains("n/a"));
+}
+
+TEST_CASE("status follows the real HTTP status of /key whatever the body says") {
+    struct Case {
+        int status;
+        const char* body;
+    };
+    const std::string valid_body = json{{"data", mock::key_data()}}.dump();
+    const std::vector<Case> cases{
+        {.status = http_unauthorized, .body = ""},
+        {.status = http_unauthorized, .body = "not json"},
+        {.status = http_unauthorized, .body = valid_body.c_str()},
+        {.status = http_forbidden, .body = ""},
+        {.status = http_forbidden, .body = R"({"error":{"code":401,"message":"bad key"}})"},
+        {.status = http_not_found, .body = valid_body.c_str()},
+        {.status = http_server_error, .body = valid_body.c_str()},
+    };
+    for (const Case& entry : cases) {
+        INFO("HTTP ", entry.status, " body ", entry.body);
+        MockServer server;
+        Sandbox sandbox(server.port());
+        sandbox.store_api_key();
+        server.set_route("/key", [entry](const RecordedRequest&) {
+            return Reply{.status = entry.status, .body = entry.body};
+        });
+
+        const RunResult status = sandbox.run({"status"});
+
+        CHECK(status.code == exit_api);
+        CHECK_FALSE(status.out.contains("logged in: yes"));
+        CHECK(status.all().contains("key rejected") == (entry.status == http_unauthorized));
+        if (entry.status == http_unauthorized) {
+            CHECK(status.all().contains("auth login --replace"));
+        }
+    }
+}
+
+TEST_CASE("status keeps the login state when only the Management key is rejected") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.store_management_key();
+    server.set_route("/credits", [](const RecordedRequest&) {
+        return Reply{.status = http_unauthorized,
+                     .body = R"({"error":{"code":401,"message":"Invalid management key"}})"};
+    });
+    server.set_route("/organization/members", [](const RecordedRequest&) {
+        return Reply{.status = http_unauthorized,
+                     .body = R"({"error":{"code":401,"message":"Invalid management key"}})"};
+    });
+
+    const RunResult status = sandbox.run({"status"});
+
+    CHECK(status.code == exit_api);
+    CHECK(status.out.contains("logged in: yes"));
+    CHECK(status.out.contains("management key: stored but rejected"));
+    CHECK(status.all().contains("auth set --management --replace"));
+}
+
+// ----- account ---------------------------------------------------------------------------------
+
+TEST_CASE("account balance and credits show the mocked amounts") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.store_management_key();
+
+    const RunResult balance = sandbox.run({"account", "balance"});
+    CHECK(balance.code == exit_ok);
+    CHECK(balance.out.contains(mock::masked_key_label));
+    CHECK(balance.out.contains("$0.2500"));
+    CHECK(balance.out.contains("$1.5000"));
+
+    const RunResult credits = sandbox.run({"account", "credits"});
+    CHECK(credits.code == exit_ok);
+    CHECK(credits.out.contains("$20.0000"));
+    CHECK(credits.out.contains("$7.5000"));
+    CHECK(credits.out.contains("$12.5000"));
+}
+
+TEST_CASE("account keys reads every page, disabled and expired keys included") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_management_key();
+
+    const RunResult keys = sandbox.run({"account", "keys"});
+
+    CHECK(keys.code == exit_ok);
+    for (const char* name : {"ci-runner", "laptop", "old-key", "disabled"}) {
+        INFO(name);
+        CHECK(keys.out.contains(name));
+    }
+    const std::vector<RecordedRequest> pages = server.requests_to("/keys");
+    REQUIRE(pages.size() == 3U);
+    CHECK(offset_param(pages.at(0)) == 0);
+    CHECK(pages.at(1).param("offset") == "2");
+    CHECK(pages.at(2).param("offset") == "3");
+    for (const RecordedRequest& page : pages) {
+        CHECK(page.param("include_disabled") == "true");
+        CHECK(page.param("include_expired") == "true");
+        CHECK(page.authorization == bearer(management_key()));
+    }
+}
+
+TEST_CASE("account keys prints nothing partial when a later page fails") {
+    MockServer server;
+    server.set_route("/keys", [](const RecordedRequest& request) {
+        if (offset_param(request) == 0) {
+            return Reply{.status = http_ok,
+                         .body = json{{"data", json::array({json{{"hash", "h1"},
+                                                                 {"name", "first-page-key"},
+                                                                 {"label", "sk-or-v1-a...0000"},
+                                                                 {"disabled", false}}})}}
+                                     .dump()};
+        }
+        return Reply{.status = http_forbidden,
+                     .body = R"({"error":{"code":403,"message":"Forbidden"}})"};
+    });
+    Sandbox sandbox(server.port());
+    sandbox.store_management_key();
+
+    const RunResult keys = sandbox.run({"account", "keys"});
+
+    CHECK(keys.code == exit_api);
+    CHECK_FALSE(keys.out.contains("first-page-key"));
+}
+
+TEST_CASE("account activity sums endpoint rows and filters --days by completed UTC days") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_management_key();
+
+    const RunResult recent = sandbox.run({"account", "activity", "--days", "2"});
+    CHECK(recent.code == exit_ok);
+    CHECK(recent.out.contains("test/alpha-1"));
+    CHECK(recent.out.contains("1,234"));
+    CHECK(recent.out.contains("Total: 42 requests"));
+    CHECK_FALSE(recent.out.contains("test/beta-2"));
+
+    const RunResult week = sandbox.run({"account", "activity", "--days", "7"});
+    CHECK(week.code == exit_ok);
+    CHECK(week.out.contains("test/beta-2"));
+    CHECK(week.out.contains("Total: 44 requests"));
+
+    CHECK(sandbox.run({"account", "activity", "--days", "0"}).code == exit_usage);
+    CHECK(sandbox.run({"account", "activity", "--days", "31"}).code == exit_usage);
+    CHECK(server.requests_to("/activity").size() == 2U);
 }

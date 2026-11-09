@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <charconv>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <expected>
 #include <filesystem>
@@ -24,6 +25,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #ifndef ORCLI_DEFAULT_HOME
 #error "ORCLI_DEFAULT_HOME must be defined by the build (see target orcli_core in CMakeLists.txt)"
@@ -37,7 +39,8 @@ using EnvMap = std::map<std::string, std::string>;
 constexpr std::string_view blank_chars = " \t\r";
 constexpr std::size_t quote_pair_length = 2;
 
-constexpr std::string_view api_key_name = "OPENROUTER_API_KEY";
+constexpr auto plaintext_key_names =
+    std::to_array<std::string_view>({"OPENROUTER_API_KEY", "OPENROUTER_MANAGEMENT_KEY"});
 constexpr std::string_view https_scheme = "https://";
 constexpr auto loopback_origins =
     std::to_array<std::string_view>({"http://127.0.0.1", "http://localhost"});
@@ -101,6 +104,35 @@ bool is_key_char(char character) {
 
 bool is_valid_key(std::string_view key) {
     return !key.empty() && is_key_start(key.front()) && std::ranges::all_of(key, is_key_char);
+}
+
+struct EnvLine {
+    enum class Kind : std::uint8_t { skip, assignment, missing_equals, bad_key };
+    Kind kind = Kind::skip;
+    std::string_view key;
+    std::string_view value; // trimmed and unquoted
+};
+
+EnvLine non_assignment(EnvLine::Kind kind) {
+    return EnvLine{.kind = kind, .key = {}, .value = {}};
+}
+
+EnvLine classify_line(std::string_view raw) {
+    const std::string_view line = trim(raw);
+    if (line.empty() || line.starts_with('#')) {
+        return non_assignment(EnvLine::Kind::skip);
+    }
+    const std::size_t equals = line.find('=');
+    if (equals == std::string_view::npos) {
+        return non_assignment(EnvLine::Kind::missing_equals);
+    }
+    const std::string_view key = trim(line.substr(0, equals));
+    if (!is_valid_key(key)) {
+        return non_assignment(EnvLine::Kind::bad_key);
+    }
+    return EnvLine{.kind = EnvLine::Kind::assignment,
+                   .key = key,
+                   .value = unquote(trim(line.substr(equals + 1)))};
 }
 
 // Empty for a missing key, so callers treat missing and empty alike: a copied .env.example with a
@@ -184,12 +216,6 @@ Result<Privacy> parse_privacy(std::string_view value) {
 
 Result<Config> config_from_env(const EnvMap& env) {
     Config config;
-    config.api_key = std::string{lookup(env, api_key_name)};
-    if (config.api_key.empty()) {
-        return fail(Exit::config, std::format("{} is missing or empty; set it to a key from "
-                                              "https://openrouter.ai/settings/keys",
-                                              api_key_name));
-    }
     Result<std::string> base_url = parse_base_url(text_setting(env, base_url_setting));
     if (!base_url.has_value()) {
         return std::unexpected(std::move(base_url.error()));
@@ -212,16 +238,14 @@ Result<Config> config_from_env(const EnvMap& env) {
 }
 
 // Swapping the file between these checks and the read needs write access to the project
-// directory, which already gives control of this configuration.
+// directory, which already gives control of this configuration. A missing file reads as empty,
+// so every setting takes its default.
 Result<std::string> read_private_file(const std::filesystem::path& path) {
     const std::string shown = path.string();
     std::error_code status_error;
     const std::filesystem::file_status status = std::filesystem::symlink_status(path, status_error);
     if (status.type() == std::filesystem::file_type::not_found) {
-        return fail(Exit::config,
-                    std::format("{} does not exist; copy .env.example to it, set {}, then run "
-                                "`chmod 600 {}`",
-                                shown, api_key_name, shown));
+        return std::string{};
     }
     if (status_error) {
         return fail(Exit::config,
@@ -270,23 +294,34 @@ Result<std::string> read_private_file(const std::filesystem::path& path) {
 Result<std::map<std::string, std::string>> parse_env(std::string_view text) {
     EnvMap values;
     for (const auto [index, piece] : text | std::views::split('\n') | std::views::enumerate) {
-        const std::string_view line = trim(std::string_view{piece.begin(), piece.end()});
-        if (line.empty() || line.starts_with('#')) {
-            continue;
-        }
-        const std::size_t equals = line.find('=');
-        if (equals == std::string_view::npos) {
+        const EnvLine line = classify_line(std::string_view{piece.begin(), piece.end()});
+        switch (line.kind) {
+        case EnvLine::Kind::skip:
+            break;
+        case EnvLine::Kind::missing_equals:
             return fail(Exit::config, std::format("line {}: expected KEY=VALUE", index + 1));
-        }
-        const std::string_view key = trim(line.substr(0, equals));
-        if (!is_valid_key(key)) {
+        case EnvLine::Kind::bad_key:
             return fail(Exit::config,
                         std::format("line {}: a key must match [A-Z_][A-Z0-9_]*", index + 1));
+        case EnvLine::Kind::assignment:
+            values.insert_or_assign(std::string{line.key}, std::string{line.value});
+            break;
         }
-        values.insert_or_assign(std::string{key},
-                                std::string{unquote(trim(line.substr(equals + 1)))});
     }
     return values;
+}
+
+std::vector<PlaintextKey> find_plaintext_keys(std::string_view env_text) {
+    std::vector<PlaintextKey> keys;
+    for (const auto [index, piece] : env_text | std::views::split('\n') | std::views::enumerate) {
+        const EnvLine line = classify_line(std::string_view{piece.begin(), piece.end()});
+        if (line.kind == EnvLine::Kind::assignment && !line.value.empty() &&
+            std::ranges::contains(plaintext_key_names, line.key)) {
+            keys.push_back(PlaintextKey{.name = std::string{line.key},
+                                        .line = static_cast<std::size_t>(index) + 1});
+        }
+    }
+    return keys;
 }
 
 std::filesystem::path default_home() {
@@ -322,6 +357,7 @@ Result<Config> load_config(const std::filesystem::path& home,
     config->home = home;
     config->state_dir = home / "state";
     config->cost_log = state_root / "openrouter-cli" / "costs.jsonl";
+    config->plaintext_keys = find_plaintext_keys(*text);
     return config;
 }
 

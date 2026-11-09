@@ -1,7 +1,10 @@
+#include "auth.hpp"
+#include "commands.hpp"
 #include "common.hpp"
 #include "config.hpp"
 #include "context.hpp"
 #include "costlog.hpp"
+#include "credentials.hpp"
 #include "fsutil.hpp"
 #include "http.hpp"
 #include "models.hpp"
@@ -17,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -34,6 +38,7 @@
 #include <utility>
 #include <vector>
 
+#include <sys/prctl.h>
 #include <unistd.h>
 
 namespace orcli {
@@ -50,17 +55,15 @@ constexpr std::size_t max_display_chars = 400;
 constexpr std::size_t stdin_chunk_bytes = 65536;
 constexpr int internal_error_exit = 1;
 constexpr long http_unauthorized = 401;
+constexpr long http_not_found = 404;
+constexpr int default_activity_days = 30;
+constexpr int max_activity_days = 30;
 constexpr int hours_per_day = 24;
 constexpr int week_days = 7;
 constexpr int month_days = 30;
 
 int code_of(Exit exit) {
-    return static_cast<int>(exit);
-}
-
-int report(const Error& error) {
-    std::println(stderr, "openrouter-cli: {}", error.message);
-    return code_of(error.code);
+    return exit_code(exit);
 }
 
 struct AskArgs {
@@ -103,6 +106,17 @@ Result<std::string> read_stdin(std::size_t max_bytes) {
     return text;
 }
 
+std::string join(const std::vector<std::string>& parts, std::string_view separator) {
+    std::string joined;
+    for (const auto& part : parts) {
+        if (!joined.empty()) {
+            joined += separator;
+        }
+        joined += part;
+    }
+    return joined;
+}
+
 std::string iso_days_ago(int days) {
     const auto then = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()) -
                       std::chrono::hours{hours_per_day * days};
@@ -110,7 +124,7 @@ std::string iso_days_ago(int days) {
 }
 
 FetchText catalog_fetcher(const Http& http) {
-    return [&http]() { return http.get("/models", GetOptions{.auth = false}); };
+    return [&http]() { return http.get("/models", GetOptions{.auth = Auth::none}); };
 }
 
 Result<Catalog> catalog_for(const Config& config, const Http& http, bool refresh) {
@@ -184,35 +198,12 @@ Result<ModelInfo> resolve_or_report(const Config& config, const Http& http,
 }
 
 Result<std::vector<Endpoint>> endpoints_for(const Http& http, const std::string& model_id) {
-    const auto body = http.get("/models/" + model_id + "/endpoints", GetOptions{.auth = false});
+    const auto body =
+        http.get("/models/" + model_id + "/endpoints", GetOptions{.auth = Auth::none});
     if (!body) {
         return std::unexpected(body.error());
     }
     return parse_endpoints(*body);
-}
-
-// A mistyped provider would otherwise surface as a routing error from a billed request.
-Result<void> check_providers(const Http& http, const ModelInfo& model,
-                             const std::vector<std::string>& providers) {
-    if (providers.empty()) {
-        return {};
-    }
-    const auto endpoints = endpoints_for(http, model.id);
-    if (!endpoints) {
-        return std::unexpected(endpoints.error());
-    }
-    for (const auto& slug : providers) {
-        const bool served = std::ranges::any_of(*endpoints, [&slug](const Endpoint& endpoint) {
-            return provider_matches(slug, endpoint.tag);
-        });
-        if (!served) {
-            std::print(stderr, "{}", format_endpoints(*endpoints));
-            return fail(Exit::model, std::format("no endpoint of {} matches provider \"{}\"; "
-                                                 "use a tag from the list above",
-                                                 model.id, slug));
-        }
-    }
-    return {};
 }
 
 int cmd_models_show(const Config& config, const Http& http, const std::string& name) {
@@ -273,7 +264,32 @@ int cmd_models_list(const Config& config) {
     return code_of(Exit::ok);
 }
 
-// ----- spend and balance ------------------------------------------------------------------
+// ----- spend ------------------------------------------------------------------------------
+
+// The whole cost log, or an empty string when nothing has been logged yet.
+Result<std::string> read_cost_log(const Config& config) {
+    std::error_code error;
+    if (!fs::exists(config.cost_log, error)) {
+        return std::string();
+    }
+    if (auto checked = check_private_file(config.cost_log); !checked) {
+        return std::unexpected(checked.error());
+    }
+    FilePtr file(std::fopen(config.cost_log.c_str(), "rb"));
+    if (file == nullptr) {
+        return fail(Exit::config, "cannot read " + config.cost_log.string());
+    }
+    std::string contents;
+    std::string chunk(stdin_chunk_bytes, '\0');
+    std::size_t got = 0;
+    while ((got = std::fread(chunk.data(), 1, chunk.size(), file.get())) > 0) {
+        contents.append(chunk, 0, got);
+    }
+    if (std::ferror(file.get()) != 0) {
+        return fail(Exit::config, "error reading " + config.cost_log.string());
+    }
+    return contents;
+}
 
 int cmd_spend(const Config& config, const std::string& since) {
     std::string since_iso;
@@ -284,55 +300,119 @@ int cmd_spend(const Config& config, const std::string& since) {
     } else if (since == "30d") {
         since_iso = iso_days_ago(month_days);
     }
-    std::error_code error;
-    if (!fs::exists(config.cost_log, error)) {
+    const auto contents = read_cost_log(config);
+    if (!contents) {
+        return report(contents.error());
+    }
+    if (contents->empty()) {
         std::println("no calls logged yet ({})", config.cost_log.string());
         return code_of(Exit::ok);
     }
-    if (auto checked = check_private_file(config.cost_log); !checked) {
-        return report(checked.error());
-    }
-    FilePtr file(std::fopen(config.cost_log.c_str(), "rb"));
-    if (file == nullptr) {
-        return report(
-            Error{.code = Exit::config, .message = "cannot read " + config.cost_log.string()});
-    }
-    std::string contents;
-    std::string chunk(stdin_chunk_bytes, '\0');
-    std::size_t got = 0;
-    while ((got = std::fread(chunk.data(), 1, chunk.size(), file.get())) > 0) {
-        contents.append(chunk, 0, got);
-    }
-    std::print("{}", format_spend(fold_log(contents, since_iso)));
+    std::print("{}", format_spend(fold_log(*contents, since_iso)));
     return code_of(Exit::ok);
 }
 
-std::string dollars(const nlohmann::json& value) {
-    return value.is_number() ? std::format("${:.4f}", value.get<double>()) : "n/a";
+struct ResolveCandidate {
+    std::string call_id;
+    std::string model;
+    std::string generation_id;
+};
+
+std::vector<ResolveCandidate> resolve_candidates(std::string_view log_contents) {
+    std::vector<ResolveCandidate> candidates;
+    for (const auto& call : fold_log(log_contents, "").unresolved) {
+        if (!call.cost.has_value() && call.generation_id.has_value()) {
+            candidates.push_back(ResolveCandidate{.call_id = call.call_id,
+                                                  .model = call.model,
+                                                  .generation_id = *call.generation_id});
+        }
+    }
+    return candidates;
 }
 
-int cmd_balance(const Http& http) {
-    const auto body = http.get("/key", GetOptions{});
-    if (!body) {
-        return report(body.error());
+enum class LookupOutcome : std::uint8_t { resolved, unknown, failed };
+
+// One /generation lookup for spend --resolve; appends the charge when OpenRouter has one.
+Result<LookupOutcome> resolve_one(const Http& http, const CostLog& cost_log,
+                                  const ResolveCandidate& call) {
+    const auto response = http.fetch("/generation?id=" + percent_encode(call.generation_id),
+                                     GetOptions{.auth = Auth::inference});
+    if (!response) {
+        if (response.error().code == Exit::interrupted) {
+            return std::unexpected(response.error());
+        }
+        std::println(stderr, "openrouter-cli: {}: {}", call.call_id, response.error().message);
+        return LookupOutcome::failed;
     }
-    const auto json = nlohmann::json::parse(*body, nullptr, false);
-    if (json.is_discarded() || !json.contains("data") || !json["data"].is_object()) {
-        return report(Error{.code = Exit::api, .message = "unexpected response from /key"});
+    if (response->status == http_not_found) {
+        return LookupOutcome::unknown;
     }
-    const auto& data = json["data"];
-    const auto field = [&data](const char* name) {
-        return data.contains(name) ? data[name] : nlohmann::json();
-    };
-    std::println("usage today      {}", dollars(field("usage_daily")));
-    std::println("usage this week  {}", dollars(field("usage_weekly")));
-    std::println("usage this month {}", dollars(field("usage_monthly")));
-    std::println("usage total      {}", dollars(field("usage")));
-    std::println("key limit        {}", dollars(field("limit")));
-    std::println("limit remaining  {}", dollars(field("limit_remaining")));
-    const auto reset = field("limit_reset");
-    std::println("limit resets     {}", reset.is_string() ? reset.get<std::string>() : "n/a");
-    return code_of(Exit::ok);
+    if (!http_success(response->status)) {
+        std::println(stderr, "openrouter-cli: {}: HTTP {}", call.call_id, response->status);
+        return LookupOutcome::failed;
+    }
+    const auto stats = parse_generation(response->body);
+    if (!stats) {
+        std::println(stderr, "openrouter-cli: {}: {}", call.call_id, stats.error().message);
+        return LookupOutcome::failed;
+    }
+    if (!stats->total_cost.has_value()) {
+        return LookupOutcome::unknown;
+    }
+    if (auto logged = cost_log.append(resolved_record(call.call_id, *stats)); !logged) {
+        return fail(Exit::persist, "cost log write failed: " + logged.error().message);
+    }
+    std::println("{}  {}  ${:.6f}", call.call_id, call.model, *stats->total_cost);
+    return LookupOutcome::resolved;
+}
+
+// Looks up, oldest first, every logged call whose cost is unknown but whose generation id is
+// known. No cap: the lookups are free, and a fixed batch could starve older calls behind ids
+// that never resolve. Each found charge is appended at once, so Ctrl-C loses nothing.
+int cmd_spend_resolve(const Config& config) {
+    const auto contents = read_cost_log(config);
+    if (!contents) {
+        return report(contents.error());
+    }
+    const auto candidates = resolve_candidates(*contents);
+    if (candidates.empty()) {
+        std::println("no unresolved calls with a generation id");
+        return code_of(Exit::ok);
+    }
+    auto key = load_stored_key(config, KeyKind::inference);
+    if (!key) {
+        return report(key.error());
+    }
+    const Http http(config, HttpKeys{.inference = std::move(*key), .management = {}});
+    const CostLog cost_log(config.cost_log, config.cost_log.parent_path() / "costs.lock");
+
+    int resolved = 0;
+    int failed = 0;
+    std::vector<std::string> still_unknown;
+    for (const auto& call : candidates) {
+        const auto outcome = resolve_one(http, cost_log, call);
+        if (!outcome) {
+            report(outcome.error());
+            return code_of(outcome.error().code);
+        }
+        switch (*outcome) {
+        case LookupOutcome::resolved:
+            ++resolved;
+            break;
+        case LookupOutcome::unknown:
+            still_unknown.push_back(call.call_id);
+            break;
+        case LookupOutcome::failed:
+            ++failed;
+            break;
+        }
+    }
+    if (!still_unknown.empty()) {
+        std::println("no charge yet at OpenRouter: {}", join(still_unknown, ", "));
+    }
+    std::println("resolved {}, still unknown {}, failed {}, of {} unresolved calls", resolved,
+                 still_unknown.size(), failed, candidates.size());
+    return failed > 0 ? code_of(Exit::api) : code_of(Exit::ok);
 }
 
 // ----- ask --------------------------------------------------------------------------------
@@ -517,9 +597,6 @@ Result<Prepared> prepare(const AskArgs& args, const Config& config, const Http& 
                     : args.privacy == "no-training" ? Privacy::no_training
                                                     : Privacy::zdr;
     input.providers = args.providers;
-    if (auto checked = check_providers(http, prepared.model, args.providers); !checked) {
-        return std::unexpected(checked.error());
-    }
     if (prepared.session.has_value()) {
         input.session_id = prepared.session->data().session_uuid;
     }
@@ -577,7 +654,20 @@ struct StreamRun {
     StreamResult transfer;
     StreamOutcome outcome;
     std::optional<Error> parse_error;
+    // From X-Generation-Id or the first chunk, whichever arrived first.
+    std::optional<std::string> generation_id;
+    // The id reached the cost log; when false, cmd_ask retries once so `spend --resolve` can
+    // still recover the charge later.
+    bool generation_saved = false;
     long long latency_ms = 0;
+
+    // The stream reached its end (complete, incomplete or a provider error), so the
+    // generation is finished and its charge can be looked up. After a timeout, transport
+    // error or interrupt it may still be running.
+    [[nodiscard]] bool ended() const {
+        return !transfer.interrupted && !transfer.idle_timeout && !transfer.total_timeout &&
+               transfer.transport_error.empty() && !parse_error.has_value();
+    }
 };
 
 StreamRun run_stream(const Http& http, const Prepared& prepared, AnswerSink& sink,
@@ -593,7 +683,10 @@ StreamRun run_stream(const Http& http, const Prepared& prepared, AnswerSink& sin
             return;
         }
         generation_logged = true;
-        if (auto logged = cost_log.append(generation_record(call_id, std::string(id))); !logged) {
+        run.generation_id = std::string(id);
+        if (auto logged = cost_log.append(generation_record(call_id, std::string(id))); logged) {
+            run.generation_saved = true;
+        } else {
             std::println(stderr, "openrouter-cli: cost log write failed: {}",
                          logged.error().message);
         }
@@ -715,7 +808,10 @@ Verdict judge(const StreamRun& run, long long max_tokens) {
             text += ": " + sanitize_for_display(*outcome.error_message, max_display_chars);
         }
         if (run.transfer.status == http_unauthorized) {
-            text += "; check OPENROUTER_API_KEY in the project .env";
+            text += "; the stored API key was rejected: run `openrouter-cli auth login --replace`";
+        } else if (run.transfer.status == http_not_found) {
+            text += "; check the -p tags with `openrouter-cli models show MODEL`, and under "
+                    "--privacy zdr try --privacy no-training";
         }
         return {"error", Exit::api, text};
     }
@@ -725,61 +821,60 @@ Verdict judge(const StreamRun& run, long long max_tokens) {
     return {"complete", Exit::ok, ""};
 }
 
-int cmd_ask(const AskArgs& args, const Config& config, const Http& http) {
-    auto prepared = prepare(args, config, http);
-    if (!prepared) {
-        return report(prepared.error());
-    }
-
-    const fs::path answers = config.state_dir / "answers";
-    for (const auto& dir : {config.state_dir, answers}) {
-        if (auto ready = ensure_private_dir(dir); !ready) {
-            return report(ready.error());
+// Looks up the charge of a generation whose stream ended without one. Returns the stats, or
+// nullopt when OpenRouter has none yet; Exit::interrupted when Ctrl-C stopped the wait.
+Result<std::optional<GenerationStats>> look_up_cost(const Http& http, const std::string& id) {
+    const auto body =
+        http.get("/generation?id=" + percent_encode(id),
+                 GetOptions{.auth = Auth::inference, .retry_404_for = generation_lookup_window});
+    if (!body) {
+        if (body.error().code == Exit::interrupted) {
+            return std::unexpected(body.error());
         }
+        return std::optional<GenerationStats>();
     }
-    const std::string call_id = new_call_id();
-    const fs::path answer_path = answers / (call_id + ".md");
+    auto stats = parse_generation(*body);
+    if (!stats) {
+        return std::optional<GenerationStats>();
+    }
+    return std::optional<GenerationStats>(std::move(*stats));
+}
+
+// Creates answers/<call_id>.md exclusively; the path is never reused or overwritten.
+Result<AnswerSink> open_answer(const fs::path& answer_path) {
     auto fd = create_exclusive(answer_path);
     if (!fd) {
-        return report(fd.error());
+        return std::unexpected(fd.error());
     }
     FilePtr answer_file(fdopen(*fd, "wb"));
     if (answer_file == nullptr) {
         ::close(*fd);
-        return report(
-            Error{.code = Exit::refused, .message = "cannot open " + answer_path.string()});
+        std::error_code ignored;
+        fs::remove(answer_path, ignored);
+        return fail(Exit::refused, "cannot open " + answer_path.string());
     }
-    AnswerSink sink(std::move(answer_file));
+    return AnswerSink(std::move(answer_file));
+}
 
-    const CostLog cost_log(config.cost_log, config.cost_log.parent_path() / "costs.lock");
+PendingInfo pending_for(const AskArgs& args, const Prepared& prepared, const std::string& call_id,
+                        const fs::path& answer_path) {
     std::error_code cwd_error;
     PendingInfo pending;
     pending.call_id = call_id;
     pending.time = utc_now_iso();
     pending.cwd = fs::current_path(cwd_error).string();
-    pending.requested_model = args.model.empty() ? prepared->model.id : args.model;
-    pending.model_id = prepared->model.id;
-    pending.privacy = privacy_name(prepared->request.body);
-    pending.effort = prepared->request.effort_sent;
+    pending.requested_model = args.model.empty() ? prepared.model.id : args.model;
+    pending.model_id = prepared.model.id;
+    pending.privacy = privacy_name(prepared.request.body);
+    pending.effort = prepared.request.effort_sent;
     if (!args.session.empty()) {
         pending.session = args.session;
     }
     pending.answer_path = answer_path.string();
-    if (auto logged = cost_log.append(pending_record(pending)); !logged) {
-        return report(Error{.code = Exit::refused,
-                            .message = "nothing was sent because the cost log could not be "
-                                       "written: " +
-                                       logged.error().message});
-    }
+    return pending;
+}
 
-    std::println(stderr, "openrouter-cli: asking {} (effort {}, up to {} output tokens, {})",
-                 prepared->model.id, prepared->request.effort_sent.value_or("default"),
-                 prepared->request.max_tokens, pending.privacy);
-
-    const StreamRun run = run_stream(http, *prepared, sink, cost_log, call_id);
-    sink.finish();
-    const Verdict verdict = judge(run, prepared->request.max_tokens);
-
+ResultInfo result_for(const std::string& call_id, const Verdict& verdict, const StreamRun& run) {
     ResultInfo result;
     result.call_id = call_id;
     result.outcome = verdict.outcome;
@@ -789,60 +884,170 @@ int cmd_ask(const AskArgs& args, const Config& config, const Http& http) {
     result.finish_reason = run.outcome.finish_reason;
     result.error_type = run.outcome.error_type;
     result.latency_ms = run.latency_ms;
-    if (auto logged = cost_log.append(result_record(result)); !logged) {
-        std::println(stderr, "openrouter-cli: cost log write failed: {}", logged.error().message);
-    }
+    return result;
+}
 
-    ResultInfo shown = result;
-    if (!result.usage.cost.has_value() && run.outcome.generation_id.has_value() &&
-        !interrupt_requested()) {
-        const auto body =
-            http.get("/generation?id=" + *run.outcome.generation_id,
-                     GetOptions{.auth = true, .retry_404_for = generation_lookup_window});
-        if (body) {
-            if (auto stats = parse_generation(*body); stats) {
-                if (auto logged = cost_log.append(resolved_record(call_id, *stats)); !logged) {
-                    std::println(stderr, "openrouter-cli: cost log write failed: {}",
-                                 logged.error().message);
-                }
-                shown.usage.cost = stats->total_cost;
-                if (!shown.provider.has_value()) {
-                    shown.provider = stats->provider;
-                }
-            }
+// What happened after the stream: the cost line to show, whether Ctrl-C stopped the cost
+// lookup, and every record that could not be saved.
+struct Aftermath {
+    ResultInfo shown;
+    bool lookup_interrupted = false;
+    std::vector<std::string> unsaved;
+};
+
+void note_unsaved(Aftermath& after, const Result<void>& saved, std::string_view what) {
+    if (!saved) {
+        std::println(stderr, "openrouter-cli: saving {} failed: {}", what, saved.error().message);
+        after.unsaved.emplace_back(what);
+    }
+}
+
+Aftermath record_outcome(const Http& http, const CostLog& cost_log, const std::string& call_id,
+                         const StreamRun& run, const Verdict& verdict) {
+    Aftermath after;
+    after.shown = result_for(call_id, verdict, run);
+    // A first append that failed mid-stream is retried here; without the id `spend --resolve`
+    // could never recover this call's charge.
+    if (run.generation_id.has_value() && !run.generation_saved) {
+        note_unsaved(after, cost_log.append(generation_record(call_id, *run.generation_id)),
+                     "the generation id");
+    }
+    note_unsaved(after, cost_log.append(result_record(after.shown)), "the cost record");
+    if (after.shown.usage.cost.has_value() || !run.generation_id.has_value() || !run.ended()) {
+        return after;
+    }
+    const auto stats = look_up_cost(http, *run.generation_id);
+    if (!stats) {
+        after.lookup_interrupted = true;
+        return after;
+    }
+    if (stats->has_value() && (*stats)->total_cost.has_value()) {
+        note_unsaved(after, cost_log.append(resolved_record(call_id, **stats)),
+                     "the looked-up cost");
+        after.shown.usage.cost = (*stats)->total_cost;
+        if (!after.shown.provider.has_value()) {
+            after.shown.provider = (*stats)->provider;
         }
     }
+    return after;
+}
+
+// Precedence: Ctrl-C (also during the cost lookup), then API/incomplete outcomes, then a
+// failed save of a call that may have been billed.
+int final_exit(const Verdict& verdict, const Aftermath& after) {
+    if (verdict.exit == Exit::interrupted || after.lookup_interrupted) {
+        if (after.lookup_interrupted) {
+            std::println(stderr, "openrouter-cli: interrupted while looking up the cost; run "
+                                 "`openrouter-cli spend --resolve` later");
+        }
+        return code_of(Exit::interrupted);
+    }
+    if (verdict.exit != Exit::ok) {
+        return code_of(verdict.exit);
+    }
+    if (!after.unsaved.empty()) {
+        std::println(stderr,
+                     "openrouter-cli: the answer arrived (the call may have been billed) but "
+                     "saving failed: {}; do not retry automatically",
+                     join(after.unsaved, ", "));
+        return code_of(Exit::persist);
+    }
+    return code_of(Exit::ok);
+}
+
+int cmd_ask(const AskArgs& args, const Config& config, const Http& http) {
+    auto prepared = prepare(args, config, http);
+    if (!prepared) {
+        return report(prepared.error());
+    }
+    const fs::path answers = config.state_dir / "answers";
+    for (const auto& dir : {config.state_dir, answers}) {
+        if (auto ready = ensure_private_dir(dir); !ready) {
+            return report(ready.error());
+        }
+    }
+    const std::string call_id = new_call_id();
+    const fs::path answer_path = answers / (call_id + ".md");
+    auto sink = open_answer(answer_path);
+    if (!sink) {
+        return report(sink.error());
+    }
+
+    const CostLog cost_log(config.cost_log, config.cost_log.parent_path() / "costs.lock");
+    const PendingInfo pending = pending_for(args, *prepared, call_id, answer_path);
+    if (auto logged = cost_log.append(pending_record(pending)); !logged) {
+        // Nothing was sent, so the empty answer file would only mislead.
+        std::error_code ignored;
+        fs::remove(answer_path, ignored);
+        return report(Error{.code = Exit::refused,
+                            .message = "nothing was sent because the cost log could not be "
+                                       "written: " +
+                                       logged.error().message});
+    }
+    std::println(stderr, "openrouter-cli: asking {} (effort {}, up to {} output tokens, {}{})",
+                 prepared->model.id, prepared->request.effort_sent.value_or("default"),
+                 prepared->request.max_tokens, pending.privacy,
+                 args.providers.empty() ? std::string()
+                                        : ", providers " + join(args.providers, ","));
+
+    const StreamRun run = run_stream(http, *prepared, *sink, cost_log, call_id);
+    sink->finish();
+    const Verdict verdict = judge(run, prepared->request.max_tokens);
+    Aftermath after = record_outcome(http, cost_log, call_id, run, verdict);
 
     if (verdict.exit == Exit::ok && prepared->session.has_value()) {
-        if (auto saved = prepared->session->commit(prepared->user_turn,
-                                                   Message{"assistant", run.outcome.text});
-            !saved) {
-            std::println(stderr, "openrouter-cli: session not updated: {}", saved.error().message);
-        }
+        note_unsaved(
+            after,
+            prepared->session->commit(prepared->user_turn, Message{"assistant", run.outcome.text}),
+            "the session");
     }
-    if (!sink.file_ok()) {
+    if (!sink->file_ok()) {
         std::println(stderr, "openrouter-cli: writing {} failed; the answer is incomplete on disk",
                      answer_path.string());
+        after.unsaved.emplace_back("the answer file");
     }
     if (!verdict.message.empty()) {
         std::println(stderr, "openrouter-cli: {}", verdict.message);
     }
     std::println(stderr, "openrouter-cli: {}",
-                 format_cost_line(shown, prepared->model.id, answer_path.string()));
-    return code_of(verdict.exit);
+                 format_cost_line(after.shown, prepared->model.id, answer_path.string()));
+    return final_exit(verdict, after);
 }
 
 // ----- command line -----------------------------------------------------------------------
 
-int run(int argc, char** argv) {
-    CLI::App app{"Ask any OpenRouter model to review a plan or code. Options come first; the "
-                 "query is last (use - to read it from stdin).",
-                 "openrouter-cli"};
-    app.set_version_flag("--version", std::string(version_text));
-    app.require_subcommand(0, 1);
-    app.fallthrough(false);
-
+// Every parsed option and subcommand of the command line.
+struct Cli {
     AskArgs ask;
+    std::string find_name;
+    bool refresh = false;
+    std::string show_name;
+    std::string save_alias_name;
+    std::string save_model_id;
+    std::string since = "all";
+    bool resolve = false;
+    bool login_replace = false;
+    bool set_management = false;
+    bool set_replace = false;
+    bool logout_management = false;
+    int activity_days = default_activity_days;
+
+    CLI::App* find = nullptr;
+    CLI::App* show = nullptr;
+    CLI::App* save = nullptr;
+    CLI::App* list = nullptr;
+    CLI::App* spend = nullptr;
+    CLI::App* login = nullptr;
+    CLI::App* set_key = nullptr;
+    CLI::App* logout = nullptr;
+    CLI::App* status = nullptr;
+    CLI::App* balance = nullptr;
+    CLI::App* keys = nullptr;
+    CLI::App* credits = nullptr;
+    CLI::App* activity = nullptr;
+};
+
+void add_ask_options(CLI::App& app, AskArgs& ask) {
     app.add_option("-m,--model", ask.model, "Model alias, id, ~author/family-latest, or name");
     app.add_option("-f,--file", ask.files, "File to include, line-numbered (repeatable)");
     app.add_option("--role", ask.role, "System prompt: review (default) or plain")
@@ -854,35 +1059,173 @@ int run(int argc, char** argv) {
                    "Output budget including reasoning")
         ->check(CLI::PositiveNumber);
     app.add_option("-p,--provider", ask.providers,
-                   "Use only this provider (slug or endpoint tag from `models show`; repeatable)");
+                   "Use only this provider (endpoint tag from `models show`; repeatable)");
     app.add_option("--privacy", ask.privacy, "zdr (default) or no-training")
         ->check(CLI::IsMember({"zdr", "no-training"}));
     app.add_option("--session", ask.session, "Keep history under this name for follow-ups");
     app.add_option("query", ask.query, "The question; - reads it from stdin");
+}
 
+void add_models_commands(CLI::App& app, Cli& cli) {
     auto* models = app.add_subcommand("models", "Find, inspect and save model ids");
     models->require_subcommand(1);
     models->fallthrough(false);
-    std::string find_name;
-    bool refresh = false;
-    auto* find = models->add_subcommand("find", "List models matching words");
-    find->add_flag("--refresh", refresh, "Refetch the catalog first");
-    find->add_option("name", find_name, "Words to match")->required();
-    std::string show_name;
-    auto* show = models->add_subcommand("show", "Prices, limits and efforts of one model");
-    show->add_option("model", show_name, "Alias, id or name")->required();
-    std::string save_alias_name;
-    std::string save_model_id;
-    auto* save = models->add_subcommand("save", "Save an alias for a model id");
-    save->add_option("alias", save_alias_name, "Alias to save")->required();
-    save->add_option("model_id", save_model_id, "Exact model id")->required();
-    auto* list = models->add_subcommand("list", "List saved aliases");
+    cli.find = models->add_subcommand("find", "List models matching words");
+    cli.find->add_flag("--refresh", cli.refresh, "Refetch the catalog first");
+    cli.find->add_option("name", cli.find_name, "Words to match")->required();
+    cli.show = models->add_subcommand("show", "Prices, limits, efforts and provider tags");
+    cli.show->add_option("model", cli.show_name, "Alias, id or name")->required();
+    cli.save = models->add_subcommand("save", "Save an alias for a model id");
+    cli.save->add_option("alias", cli.save_alias_name, "Alias to save")->required();
+    cli.save->add_option("model_id", cli.save_model_id, "Exact model id")->required();
+    cli.list = models->add_subcommand("list", "List saved aliases");
+}
 
-    std::string since = "all";
-    auto* spend = app.add_subcommand("spend", "Totals from the global cost log");
-    spend->add_option("--since", since, "today, 7d, 30d or all")
+void add_account_commands(CLI::App& app, Cli& cli) {
+    cli.spend = app.add_subcommand("spend", "Totals from the global cost log");
+    cli.spend->add_option("--since", cli.since, "today, 7d, 30d or all")
         ->check(CLI::IsMember({"today", "7d", "30d", "all"}));
-    auto* balance = app.add_subcommand("balance", "Usage and limit of the API key");
+    cli.spend->add_flag("--resolve", cli.resolve,
+                        "Look up the charge of earlier calls whose cost is still unknown (free)");
+
+    auto* auth = app.add_subcommand("auth", "Log in to OpenRouter and manage the stored keys");
+    auth->require_subcommand(1);
+    auth->fallthrough(false);
+    cli.login = auth->add_subcommand(
+        "login", "Sign in with your OpenRouter account in a browser; stores a new API key");
+    cli.login->add_flag("--replace", cli.login_replace, "Replace the stored API key");
+    cli.set_key = auth->add_subcommand(
+        "set", "Store an existing key, read from a hidden prompt or from stdin");
+    cli.set_key->add_flag("--management", cli.set_management, "The key is a Management key");
+    cli.set_key->add_flag("--replace", cli.set_replace, "Replace a stored key of the same kind");
+    cli.logout = auth->add_subcommand("logout", "Delete the stored keys from this PC");
+    cli.logout->add_flag("--management", cli.logout_management, "Delete only the Management key");
+
+    cli.status =
+        app.add_subcommand("status", "Who is logged in: account identity, key usage and limits");
+
+    auto* account = app.add_subcommand("account", "OpenRouter account information");
+    account->require_subcommand(1);
+    account->fallthrough(false);
+    cli.balance = account->add_subcommand("balance", "Usage and limit of the stored API key");
+    cli.keys = account->add_subcommand("keys", "Every API key (needs a Management key)");
+    cli.credits =
+        account->add_subcommand("credits", "Credits bought and used (needs a Management key)");
+    cli.activity = account->add_subcommand(
+        "activity", "Usage per day, model and provider (needs a Management key)");
+    cli.activity
+        ->add_option("--days", cli.activity_days,
+                     "Completed UTC days to show, 1 to 30 (default 30)")
+        ->check(CLI::Range(1, max_activity_days));
+}
+
+// Commands that never touch a decrypted key or the plaintext guard come first: set and login
+// are how keys move out of .env, logout is how stored keys are removed.
+std::optional<int> dispatch_auth(const Cli& cli, const Config& config) {
+    if (cli.login->parsed()) {
+        return cmd_auth_login(config, cli.login_replace);
+    }
+    if (cli.set_key->parsed()) {
+        return cmd_auth_set(config, cli.set_management, cli.set_replace);
+    }
+    if (cli.logout->parsed()) {
+        return cmd_auth_logout(config, cli.logout_management);
+    }
+    return std::nullopt;
+}
+
+std::optional<int> dispatch_account(const Cli& cli, const Config& config) {
+    if (cli.status->parsed()) {
+        return cmd_status(config);
+    }
+    if (cli.balance->parsed()) {
+        return cmd_account_balance(config);
+    }
+    if (cli.keys->parsed()) {
+        return cmd_account_keys(config);
+    }
+    if (cli.credits->parsed()) {
+        return cmd_account_credits(config);
+    }
+    if (cli.activity->parsed()) {
+        return cmd_account_activity(config, cli.activity_days);
+    }
+    if (cli.spend->parsed()) {
+        return cli.resolve ? cmd_spend_resolve(config) : cmd_spend(config, cli.since);
+    }
+    return std::nullopt;
+}
+
+std::optional<int> dispatch_models(const Cli& cli, const Config& config) {
+    const Http public_http(config, HttpKeys{});
+    if (cli.find->parsed()) {
+        return cmd_models_find(config, public_http, cli.find_name, cli.refresh);
+    }
+    if (cli.show->parsed()) {
+        return cmd_models_show(config, public_http, cli.show_name);
+    }
+    if (cli.save->parsed()) {
+        return cmd_models_save(config, public_http, cli.save_alias_name, cli.save_model_id);
+    }
+    if (cli.list->parsed()) {
+        return cmd_models_list(config);
+    }
+    return std::nullopt;
+}
+
+int dispatch(const Cli& cli, const Config& config) {
+    if (auto code = dispatch_auth(cli, config)) {
+        return *code;
+    }
+    if (warn_plaintext_keys(config)) {
+        return report(Error{.code = Exit::config,
+                            .message = "refusing to run while .env holds a plaintext key; "
+                                       "keys are stored only encrypted"});
+    }
+    if (auto code = dispatch_account(cli, config)) {
+        return *code;
+    }
+    if (auto code = dispatch_models(cli, config)) {
+        return *code;
+    }
+    auto key = load_stored_key(config, KeyKind::inference);
+    if (!key) {
+        return report(key.error());
+    }
+    const Http http(config, HttpKeys{.inference = std::move(*key), .management = {}});
+    return cmd_ask(cli.ask, config, http);
+}
+
+// Question options and subcommands are separate grammars; mixing them is almost always a
+// query that happens to be a subcommand name.
+std::optional<Error> check_grammar(const CLI::App& app, const AskArgs& ask) {
+    const bool subcommand_used = !app.get_subcommands().empty();
+    const bool ask_options_used = std::ranges::any_of(
+        std::vector<std::string>{"-m", "-f", "--role", "-s", "-e", "--max-output-tokens",
+                                 "--privacy", "--provider", "--session", "query"},
+        [&app](const std::string& name) { return app.count(name) > 0; });
+    if (subcommand_used && ask_options_used) {
+        return Error{.code = Exit::usage,
+                     .message = "question options cannot be combined with a subcommand; put a "
+                                "query that is a subcommand name after --"};
+    }
+    if (!subcommand_used && ask.query.empty()) {
+        return Error{.code = Exit::usage, .message = "missing query; see --help"};
+    }
+    return std::nullopt;
+}
+
+int run(int argc, char** argv) {
+    CLI::App app{"Ask any OpenRouter model to review a plan or code. Options come first; the "
+                 "query is last (use - to read it from stdin).",
+                 "openrouter-cli"};
+    app.set_version_flag("--version", std::string(version_text));
+    app.require_subcommand(0, 1);
+    app.fallthrough(false);
+    Cli cli;
+    add_ask_options(app, cli.ask);
+    add_models_commands(app, cli);
+    add_account_commands(app, cli);
 
     try {
         app.parse(argc, argv);
@@ -890,23 +1233,18 @@ int run(int argc, char** argv) {
         const int code = app.exit(error);
         return code == 0 ? code_of(Exit::ok) : code_of(Exit::usage);
     }
-
-    ask.role_given = app.count("--role") > 0;
-    const bool subcommand_used = !app.get_subcommands().empty();
-    const bool ask_options_used = std::ranges::any_of(
-        std::vector<std::string>{"-m", "-f", "--role", "-s", "-e", "--max-output-tokens",
-                                 "--privacy", "--provider", "--session", "query"},
-        [&app](const std::string& name) { return app.count(name) > 0; });
-    if (subcommand_used && ask_options_used) {
-        return report(Error{.code = Exit::usage,
-                            .message = "question options cannot be combined with a "
-                                       "subcommand; put a query that is a subcommand name "
-                                       "after --"});
-    }
-    if (!subcommand_used && ask.query.empty()) {
-        return report(Error{.code = Exit::usage, .message = "missing query; see --help"});
+    cli.ask.role_given = app.count("--role") > 0;
+    if (auto invalid = check_grammar(app, cli.ask)) {
+        return report(*invalid);
     }
 
+    // A crash must not leave a core dump holding a decrypted key, so a failure here stops the
+    // command before any key is read.
+    if (::prctl(PR_SET_DUMPABLE, 0) != 0) {
+        return report(Error{.code = Exit::config,
+                            .message = "could not disable core dumps (prctl PR_SET_DUMPABLE); "
+                                       "refusing to handle keys"});
+    }
     install_signal_handlers();
     const CurlGlobal curl;
     if (!curl.ok()) {
@@ -919,27 +1257,7 @@ int run(int argc, char** argv) {
     if (!config) {
         return report(config.error());
     }
-    const Http http(*config);
-
-    if (find->parsed()) {
-        return cmd_models_find(*config, http, find_name, refresh);
-    }
-    if (show->parsed()) {
-        return cmd_models_show(*config, http, show_name);
-    }
-    if (save->parsed()) {
-        return cmd_models_save(*config, http, save_alias_name, save_model_id);
-    }
-    if (list->parsed()) {
-        return cmd_models_list(*config);
-    }
-    if (spend->parsed()) {
-        return cmd_spend(*config, since);
-    }
-    if (balance->parsed()) {
-        return cmd_balance(http);
-    }
-    return cmd_ask(ask, *config, http);
+    return dispatch(cli, *config);
 }
 
 } // namespace

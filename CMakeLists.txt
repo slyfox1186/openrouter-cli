@@ -117,7 +117,6 @@ target_compile_options(orcli_flags INTERFACE
     -fcf-protection=full -fzero-call-used-regs=used-gpr
     -fno-delete-null-pointer-checks -fno-strict-overflow -fno-strict-aliasing
     -ftrivial-auto-var-init=zero
-    $<$<CXX_COMPILER_ID:GNU>:-Wtrampolines -Wbidi-chars=any -fzero-init-padding-bits=all>
     $<$<CONFIG:Release>:-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3>
     $<$<AND:$<CONFIG:Release>,$<BOOL:${ORCLI_NATIVE}>>:-march=native>)
 target_compile_definitions(orcli_flags INTERFACE _GLIBCXX_ASSERTIONS)
@@ -131,7 +130,13 @@ if(ORCLI_SANITIZE)
 endif()
 
 add_library(orcli_core STATIC
+    src/account.cpp
+    src/account_commands.cpp
+    src/auth.cpp
+    src/auth_commands.cpp
+    src/commands.cpp
     src/config.cpp
+    src/credentials.cpp
     src/context.cpp
     src/costlog.cpp
     src/fsutil.cpp
@@ -142,9 +147,17 @@ add_library(orcli_core STATIC
     src/session.cpp
     src/sse.cpp)
 target_include_directories(orcli_core PUBLIC src)
-target_link_libraries(orcli_core PUBLIC nlohmann_json::nlohmann_json CURL::libcurl orcli_flags)
+# OpenSSL::Crypto is linked directly because auth.cpp (RAND_bytes, EVP SHA-256) and
+# credentials.cpp (OPENSSL_cleanse) call it, not only libcurl.
+target_link_libraries(orcli_core PUBLIC
+    nlohmann_json::nlohmann_json CURL::libcurl OpenSSL::Crypto orcli_flags)
 # The project directory is compiled in so the binary finds .env and state/ from any directory.
 target_compile_definitions(orcli_core PRIVATE ORCLI_DEFAULT_HOME="${CMAKE_SOURCE_DIR}")
+# Test builds may swap systemd-creds for a fake (OPENROUTER_CLI_TEST_CREDS_TOOL); the release
+# preset turns BUILD_TESTING off, so the installed binary never honours that variable.
+if(BUILD_TESTING)
+    target_compile_definitions(orcli_core PRIVATE ORCLI_TEST_HOOKS)
+endif()
 
 add_executable(openrouter-cli src/main.cpp)
 target_link_libraries(openrouter-cli PRIVATE orcli_core CLI11::CLI11 orcli_flags)

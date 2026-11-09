@@ -36,6 +36,8 @@ constexpr std::chrono::seconds max_retry_after{60};
 constexpr std::chrono::milliseconds sleep_slice{200};
 constexpr std::size_t max_get_body_bytes = std::size_t{64} << 20U;
 constexpr std::size_t max_error_body_bytes = std::size_t{1} << 20U;
+// The PKCE exchange answers with a key and a user id; far below this.
+constexpr std::size_t max_json_post_body_bytes = std::size_t{64} << 10U;
 constexpr std::size_t max_display_chars = 400;
 constexpr long http_ok_min = 200;
 constexpr long http_ok_max = 299;
@@ -110,10 +112,16 @@ std::optional<std::pair<std::string, std::string_view>> split_header(std::string
     return std::pair{lowercase(trim(line.substr(0, colon))), trim(line.substr(colon + 1))};
 }
 
-Result<HeaderList> base_headers(const Config& config, bool auth) {
+// An empty key sends no Authorization header (public metadata and the PKCE exchange).
+Result<HeaderList> base_headers(const Config& config, std::string_view key) {
     HeaderList list;
-    if (auth) {
-        if (auto added = append_header(list, "Authorization: Bearer " + config.api_key); !added) {
+    if (!key.empty()) {
+        std::string header = "Authorization: Bearer ";
+        header += key;
+        // curl_slist_append copies the text, so this copy of the key is cleared at once.
+        auto added = append_header(list, header);
+        cleanse(header);
+        if (!added) {
             return std::unexpected(added.error());
         }
     }
@@ -201,13 +209,14 @@ std::string describe_error_body(long status, std::string_view body) {
 
 struct GetBuffer {
     std::string body;
+    std::size_t limit = max_get_body_bytes;
     bool too_large = false;
 };
 
 std::size_t get_write(char* data, std::size_t size, std::size_t count, void* user) {
     auto* buffer = static_cast<GetBuffer*>(user);
     const std::size_t bytes = size * count;
-    if (buffer->body.size() + bytes > max_get_body_bytes) {
+    if (buffer->body.size() + bytes > buffer->limit) {
         buffer->too_large = true;
         return 0;
     }
@@ -217,6 +226,111 @@ std::size_t get_write(char* data, std::size_t size, std::size_t count, void* use
         return 0;
     }
     return bytes;
+}
+
+// Lets Ctrl-C stop a GET or JSON POST at once instead of after its whole timeout.
+int abort_on_interrupt(void* /*user*/, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
+                       curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
+    return interrupt_flag.load() ? progress_abort : progress_continue;
+}
+
+// One finished transfer: curl's result, the HTTP status, Retry-After and the body.
+struct Attempt {
+    CURLcode code = CURLE_OK;
+    long status = 0;
+    curl_off_t retry_after = 0;
+    std::string body;
+    bool too_large = false;
+};
+
+struct Request {
+    const Config* config = nullptr;
+    std::string url;
+    std::string_view key;                      // empty: no Authorization header
+    std::optional<std::string_view> json_body; // set: POST with this body
+    std::size_t body_limit = max_get_body_bytes;
+};
+
+// Performs one transfer. When body_limit is small (the PKCE exchange) the buffer is reserved
+// up front, so a response holding a key is never spread over reallocated, uncleared memory.
+Result<Attempt> perform(const Request& request) {
+    if (interrupt_flag.load()) {
+        return fail(Exit::interrupted, "interrupted");
+    }
+    auto handle = new_handle(request.url, get_timeout_seconds);
+    if (!handle) {
+        return std::unexpected(handle.error());
+    }
+    auto headers = base_headers(*request.config, request.key);
+    if (!headers) {
+        return std::unexpected(headers.error());
+    }
+    if (request.json_body.has_value()) {
+        for (const char* header : {"Content-Type: application/json", "Accept: application/json"}) {
+            if (auto added = append_header(*headers, std::string(header)); !added) {
+                return std::unexpected(added.error());
+            }
+        }
+    }
+    GetBuffer buffer;
+    buffer.limit = request.body_limit;
+    if (request.body_limit < max_get_body_bytes) {
+        buffer.body.reserve(request.body_limit);
+    }
+    CURL* raw = handle->get();
+    const std::array setup{
+        set_option(raw, CURLOPT_HTTPHEADER, headers->get()),
+        set_option(raw, CURLOPT_WRITEFUNCTION, &get_write),
+        set_option(raw, CURLOPT_WRITEDATA, static_cast<void*>(&buffer)),
+        set_option(raw, CURLOPT_XFERINFOFUNCTION, &abort_on_interrupt),
+        set_option(raw, CURLOPT_NOPROGRESS, 0L),
+    };
+    for (const auto& result : setup) {
+        if (!result) {
+            return std::unexpected(result.error());
+        }
+    }
+    if (request.json_body.has_value()) {
+        const std::string_view body = *request.json_body;
+        const std::array post_setup{
+            set_option(raw, CURLOPT_POST, 1L),
+            set_option(raw, CURLOPT_POSTFIELDS, body.data()),
+            set_option(raw, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size())),
+        };
+        for (const auto& result : post_setup) {
+            if (!result) {
+                return std::unexpected(result.error());
+            }
+        }
+    }
+    Attempt attempt;
+    attempt.code = curl_easy_perform(raw);
+    curl_easy_getinfo(raw, CURLINFO_RESPONSE_CODE, &attempt.status);
+    curl_easy_getinfo(raw, CURLINFO_RETRY_AFTER, &attempt.retry_after);
+    attempt.too_large = buffer.too_large;
+    attempt.body = std::move(buffer.body);
+    if (interrupt_flag.load()) {
+        return fail(Exit::interrupted, "interrupted");
+    }
+    return attempt;
+}
+
+bool should_retry(const Attempt& attempt, int retries, bool within_404_window) {
+    if (attempt.code != CURLE_OK) {
+        return retryable_transport_error(attempt.code) && retries < max_get_retries;
+    }
+    if (attempt.status == http_not_found) {
+        return within_404_window;
+    }
+    return retryable_status(attempt.status) && retries < max_get_retries;
+}
+
+std::chrono::milliseconds retry_wait(const Attempt& attempt, std::chrono::milliseconds backoff) {
+    if (attempt.retry_after > 0) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::min(std::chrono::seconds{attempt.retry_after}, max_retry_after));
+    }
+    return backoff;
 }
 
 struct StreamState {
@@ -318,74 +432,75 @@ CurlGlobal::~CurlGlobal() {
     }
 }
 
-Http::Http(const Config& config) : config_(config) {}
+Http::Http(const Config& config, HttpKeys keys) : config_(config), keys_(std::move(keys)) {}
+
+Result<std::string_view> Http::key_for(Auth auth) const {
+    switch (auth) {
+    case Auth::none:
+        return std::string_view{};
+    case Auth::inference:
+        if (keys_.inference.empty()) {
+            return fail(Exit::config, "no API key is stored; run `openrouter-cli auth login` "
+                                      "(or `auth set`)");
+        }
+        return keys_.inference.view();
+    case Auth::management:
+        if (keys_.management.empty()) {
+            return fail(Exit::config, "no Management key is stored; create one at "
+                                      "https://openrouter.ai/settings/management-keys and run "
+                                      "`openrouter-cli auth set --management`");
+        }
+        return keys_.management.view();
+    }
+    return fail(Exit::config, "unknown credential kind");
+}
 
 Result<std::string> Http::get(std::string_view path_and_query, const GetOptions& options) const {
-    const std::string url = config_.base_url + std::string(path_and_query);
+    auto response = fetch(path_and_query, options);
+    if (!response) {
+        return std::unexpected(response.error());
+    }
+    if (response->status >= http_ok_min && response->status <= http_ok_max) {
+        return std::move(response->body);
+    }
+    return fail(Exit::api, std::format("GET {}: {}", path_and_query,
+                                       describe_error_body(response->status, response->body)));
+}
+
+Result<HttpResponse> Http::fetch(std::string_view path_and_query, const GetOptions& options) const {
+    const auto key = key_for(options.auth);
+    if (!key) {
+        return std::unexpected(key.error());
+    }
+    const Request request{.config = &config_,
+                          .url = config_.base_url + std::string(path_and_query),
+                          .key = *key,
+                          .json_body = std::nullopt,
+                          .body_limit = max_get_body_bytes};
     const auto started = Clock::now();
     int retries = 0;
     auto backoff = std::chrono::duration_cast<std::chrono::milliseconds>(first_backoff);
 
     while (true) {
-        auto handle = new_handle(url, get_timeout_seconds);
-        if (!handle) {
-            return std::unexpected(handle.error());
+        auto attempt = perform(request);
+        if (!attempt) {
+            return std::unexpected(attempt.error());
         }
-        auto headers = base_headers(config_, options.auth);
-        if (!headers) {
-            return std::unexpected(headers.error());
-        }
-        GetBuffer buffer;
-        CURL* raw = handle->get();
-        const std::array setup{
-            set_option(raw, CURLOPT_HTTPHEADER, headers->get()),
-            set_option(raw, CURLOPT_WRITEFUNCTION, &get_write),
-            set_option(raw, CURLOPT_WRITEDATA, static_cast<void*>(&buffer)),
-        };
-        for (const auto& result : setup) {
-            if (!result) {
-                return std::unexpected(result.error());
-            }
-        }
-
-        const CURLcode code = curl_easy_perform(raw);
-        long status = 0;
-        curl_easy_getinfo(raw, CURLINFO_RESPONSE_CODE, &status);
-        curl_off_t retry_after = 0;
-        curl_easy_getinfo(raw, CURLINFO_RETRY_AFTER, &retry_after);
-
-        if (interrupt_flag.load()) {
-            return fail(Exit::interrupted, "interrupted");
-        }
-        if (buffer.too_large) {
+        if (attempt->too_large) {
             return fail(Exit::api, std::format("GET {}: response larger than {} bytes",
                                                path_and_query, max_get_body_bytes));
         }
-        if (code == CURLE_OK && status >= http_ok_min && status <= http_ok_max) {
-            return std::move(buffer.body);
-        }
-
-        const bool retry_transport = code != CURLE_OK && retryable_transport_error(code);
-        const bool retry_http = code == CURLE_OK && retryable_status(status);
-        const bool retry_404 = code == CURLE_OK && status == http_not_found &&
-                               Clock::now() - started < options.retry_404_for;
-        const bool can_retry =
-            retry_404 || ((retry_transport || retry_http) && retries < max_get_retries);
-        if (!can_retry) {
-            if (code != CURLE_OK) {
-                return fail(Exit::api,
-                            std::format("GET {}: {}", path_and_query, curl_easy_strerror(code)));
+        const bool success = attempt->code == CURLE_OK && attempt->status >= http_ok_min &&
+                             attempt->status <= http_ok_max;
+        if (success ||
+            !should_retry(*attempt, retries, Clock::now() - started < options.retry_404_for)) {
+            if (attempt->code != CURLE_OK) {
+                return fail(Exit::api, std::format("GET {}: {}", path_and_query,
+                                                   curl_easy_strerror(attempt->code)));
             }
-            return fail(Exit::api, std::format("GET {}: {}", path_and_query,
-                                               describe_error_body(status, buffer.body)));
+            return HttpResponse{.status = attempt->status, .body = std::move(attempt->body)};
         }
-
-        auto wait = backoff;
-        if (retry_after > 0) {
-            wait = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::min(std::chrono::seconds{retry_after}, max_retry_after));
-        }
-        if (!interruptible_sleep(wait)) {
+        if (!interruptible_sleep(retry_wait(*attempt, backoff))) {
             return fail(Exit::interrupted, "interrupted");
         }
         backoff *= 2;
@@ -403,7 +518,12 @@ StreamResult Http::post_stream(std::string_view path, const std::string& body,
         result.transport_error = handle.error().message;
         return result;
     }
-    auto headers = base_headers(config_, true);
+    const auto key = key_for(Auth::inference);
+    if (!key) {
+        result.transport_error = key.error().message;
+        return result;
+    }
+    auto headers = base_headers(config_, *key);
     if (!headers) {
         result.transport_error = headers.error().message;
         return result;
@@ -456,6 +576,39 @@ StreamResult Http::post_stream(std::string_view path, const std::string& body,
             state.callback_error.empty() ? curl_easy_strerror(code) : state.callback_error;
     }
     return result;
+}
+
+Result<std::string> Http::post_json(std::string_view path, const std::string& body,
+                                    Auth auth) const {
+    const auto key = key_for(auth);
+    if (!key) {
+        return std::unexpected(key.error());
+    }
+    // One attempt only: the PKCE exchange code is single-use, so a retry after an ambiguous
+    // failure could never succeed and would hide the first error.
+    auto attempt = perform(Request{.config = &config_,
+                                   .url = config_.base_url + std::string(path),
+                                   .key = *key,
+                                   .json_body = body,
+                                   .body_limit = max_json_post_body_bytes});
+    if (!attempt) {
+        return std::unexpected(attempt.error());
+    }
+    if (attempt->too_large) {
+        cleanse(attempt->body);
+        return fail(Exit::api, std::format("POST {}: response larger than {} bytes", path,
+                                           max_json_post_body_bytes));
+    }
+    if (attempt->code != CURLE_OK) {
+        return fail(Exit::api, std::format("POST {}: {}", path, curl_easy_strerror(attempt->code)));
+    }
+    if (attempt->status < http_ok_min || attempt->status > http_ok_max) {
+        std::string message =
+            std::format("POST {}: {}", path, describe_error_body(attempt->status, attempt->body));
+        cleanse(attempt->body);
+        return fail(Exit::api, std::move(message));
+    }
+    return std::move(attempt->body);
 }
 
 } // namespace orcli

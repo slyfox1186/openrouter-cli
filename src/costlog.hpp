@@ -79,6 +79,8 @@ struct CallSummary {
     std::string time;
     std::string model;
     std::optional<std::string> provider;
+    // From the `generation` record; lets `spend --resolve` look up an unknown cost later.
+    std::optional<std::string> generation_id;
     std::optional<double> cost; // result cost if numeric, else resolved cost, else unknown
     std::string state;          // "complete", "incomplete", "error", "interrupted" or "pending"
 };
@@ -88,7 +90,7 @@ struct SpendReport {
     std::map<std::string, double> cost_by_day;
     std::map<std::string, double> cost_by_model;
     double known_total = 0.0;
-    std::vector<CallSummary> unresolved; // pending with no result, or cost unknown
+    std::vector<CallSummary> unresolved;    // pending with no result, or cost unknown
     std::vector<std::size_t> corrupt_lines; // 1-based line numbers that are not valid records
 };
 

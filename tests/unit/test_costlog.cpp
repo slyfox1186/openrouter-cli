@@ -102,6 +102,10 @@ std::string result_line(const std::string& call_id, std::optional<double> cost) 
     return record_line(orcli::result_record(info));
 }
 
+std::string generation_line(const std::string& call_id, const std::string& generation_id) {
+    return record_line(orcli::generation_record(call_id, generation_id));
+}
+
 std::string resolved_line(const std::string& call_id, std::optional<double> cost) {
     orcli::GenerationStats stats;
     stats.total_cost = cost;
@@ -369,4 +373,49 @@ TEST_CASE("CostLog::append serializes a record holding invalid UTF-8 without thr
     CHECK(report.corrupt_lines.empty());
     REQUIRE(report.calls.size() == 1);
     CHECK(report.calls.at(0).call_id == "c1");
+}
+
+TEST_CASE("fold_log carries the generation id onto the call") {
+    const std::string log = pending_line("c1", "2026-11-09T10:00:00Z", "vendor/model") +
+                            generation_line("c1", "gen-1") + result_line("c1", quarter);
+    const auto report = orcli::fold_log(log, "");
+    REQUIRE(report.calls.size() == 1);
+    CHECK(report.calls.at(0).generation_id == "gen-1");
+    CHECK(report.unresolved.empty());
+}
+
+TEST_CASE("a call killed before its result is unresolved with its generation id") {
+    const std::string log =
+        pending_line("c1", "2026-11-09T10:00:00Z", "vendor/model") + generation_line("c1", "gen-1");
+    const auto report = orcli::fold_log(log, "");
+    REQUIRE(report.unresolved.size() == 1);
+    CHECK(report.unresolved.at(0).call_id == "c1");
+    CHECK(report.unresolved.at(0).state == "pending");
+    CHECK(report.unresolved.at(0).generation_id == "gen-1");
+    CHECK_FALSE(report.unresolved.at(0).cost.has_value());
+}
+
+TEST_CASE("fold_log keeps the first non-empty generation id") {
+    const std::string log = pending_line("c1", "2026-11-09T10:00:00Z", "vendor/model") +
+                            generation_line("c1", "") + generation_line("c1", "gen-first") +
+                            generation_line("c1", "gen-second");
+    const auto report = orcli::fold_log(log, "");
+    REQUIRE(report.calls.size() == 1);
+    CHECK(report.calls.at(0).generation_id == "gen-first");
+
+    const auto without = orcli::fold_log(pending_line("c2", "2026-11-09T10:00:00Z", "m"), "");
+    REQUIRE(without.calls.size() == 1);
+    CHECK_FALSE(without.calls.at(0).generation_id.has_value());
+}
+
+TEST_CASE("a generation id does not change how a resolved charge is counted") {
+    const std::string log = pending_line("c1", "2026-11-09T10:00:00Z", "vendor/model") +
+                            generation_line("c1", "gen-1") + result_line("c1", std::nullopt) +
+                            resolved_line("c1", half) + resolved_line("c1", half);
+    const auto report = orcli::fold_log(log, "");
+    REQUIRE(report.calls.size() == 1);
+    CHECK(report.calls.at(0).generation_id == "gen-1");
+    CHECK(report.calls.at(0).cost == half);
+    CHECK(report.known_total == half);
+    CHECK(report.unresolved.empty());
 }

@@ -465,15 +465,6 @@ TEST_CASE("parse_endpoints rejects a body without data.endpoints") {
     }
 }
 
-TEST_CASE("provider_matches accepts the tag or a whole-segment prefix") {
-    CHECK(orcli::provider_matches("google-vertex", "google-vertex"));
-    CHECK(orcli::provider_matches("google-vertex", "google-vertex/us"));
-    CHECK(orcli::provider_matches("google-vertex", "google-vertex/global/priority"));
-    CHECK_FALSE(orcli::provider_matches("google", "google-vertex"));
-    CHECK_FALSE(orcli::provider_matches("google-vertex/us", "google-vertex"));
-    CHECK_FALSE(orcli::provider_matches("Google-Vertex", "google-vertex"));
-}
-
 TEST_CASE("format_endpoints lists each endpoint and the --provider hint") {
     const std::string table =
         orcli::format_endpoints(orcli::parse_endpoints(endpoints_json).value());

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <initializer_list>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,6 +26,7 @@ constexpr long long completion_tokens = 450;
 constexpr long long reasoning_tokens = 200;
 constexpr double reported_cost = 0.00042;
 constexpr std::size_t small_limit = 16;
+constexpr std::size_t max_error_type_length = 64;
 
 // Router comment, content split across chunks (with a two-byte UTF-8 character), duplicate
 // finish chunk, usage chunk carrying router metadata, then [DONE]. Values match the constants.
@@ -108,6 +110,16 @@ void check_realistic(const StreamOutcome& outcome) {
     CHECK(outcome.done);
     CHECK_FALSE(outcome.error_code.has_value());
     CHECK(outcome.complete());
+}
+
+// Takes the error type already escaped for a JSON string literal.
+std::optional<std::string> error_type_of(std::string_view escaped_type) {
+    std::string body{R"({"error":{"code":400,"metadata":{"error_type":")"};
+    body.append(escaped_type);
+    body.append(R"("}}})");
+    StreamOutcome outcome;
+    REQUIRE(orcli::parse_error_body(body, outcome));
+    return outcome.error_type;
 }
 
 } // namespace
@@ -343,6 +355,35 @@ TEST_CASE("parse_error_body reads an error body") {
     CHECK(outcome.error_type == "rate_limit_exceeded");
     CHECK(outcome.provider == "Example");
     CHECK_FALSE(outcome.complete());
+}
+
+TEST_CASE("provider error types are kept only as short plain tokens") {
+    const std::string longest(max_error_type_length, 'a');
+    const std::string too_long(max_error_type_length + 1, 'a');
+    CHECK(error_type_of("rate_limit_exceeded") == "rate_limit_exceeded");
+    CHECK(error_type_of("v1.provider-error_2") == "v1.provider-error_2");
+    CHECK(error_type_of(longest) == longest);
+    CHECK(error_type_of(too_long) == "unrecognized");
+    CHECK(error_type_of("") == "unrecognized");
+    CHECK(error_type_of("sk-or-v1-0123abcd leaked") == "unrecognized");
+    CHECK(error_type_of(R"(sk-or-v1-0123abcd\"leaked)") == "unrecognized");
+    CHECK(error_type_of(R"(\u001b[31mred\u001b[0m)") == "unrecognized");
+    CHECK(error_type_of(R"(line\nbreak)") == "unrecognized");
+    CHECK(error_type_of(R"(\u00e9t\u00e9)") == "unrecognized");
+}
+
+TEST_CASE("error types shaped like known keys are rejected") {
+    const std::string openrouter_key = "sk-or-v1-" + std::string(max_error_type_length, 'a');
+    CHECK(error_type_of(openrouter_key) == "unrecognized");
+    CHECK(error_type_of("sk-ant-api03-0123456789abcdefghij") == "unrecognized");
+    CHECK(error_type_of("AKIA0123456789ABCDEF") == "unrecognized");
+}
+
+TEST_CASE("a mid-stream error type is sanitized") {
+    const StreamOutcome outcome = apply_all({
+        R"({"error":{"code":500,"message":"x","metadata":{"error_type":"bad\u0007type"}},"choices":[]})",
+    });
+    CHECK(outcome.error_type == "unrecognized");
 }
 
 TEST_CASE("parse_error_body rejects bodies that are not error JSON") {

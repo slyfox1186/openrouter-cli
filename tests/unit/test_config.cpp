@@ -16,13 +16,14 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace {
 
 namespace fs = std::filesystem;
 
-constexpr std::string_view test_key = "sk-or-v1-test";
-constexpr std::string_view key_line = "OPENROUTER_API_KEY=sk-or-v1-test\n";
+constexpr std::string_view settings_line = "OPENROUTER_CLI_APP_TITLE=openrouter-cli\n";
+constexpr std::string_view secret_marker = "secret-value";
 constexpr fs::perms owner_read_write = fs::perms::owner_read | fs::perms::owner_write;
 constexpr fs::perms world_readable =
     owner_read_write | fs::perms::group_read | fs::perms::others_read;
@@ -88,6 +89,10 @@ orcli::Error load_error(const TempDir& dir, std::string_view env_text) {
 
 bool contains(std::string_view text, std::string_view part) {
     return text.find(part) != std::string_view::npos;
+}
+
+bool is_key_at(const orcli::PlaintextKey& key, std::string_view name, std::size_t line) {
+    return key.name == name && key.line == line;
 }
 
 } // namespace
@@ -156,10 +161,9 @@ TEST_CASE("config: invalid key names are rejected without echoing the line") {
     }
 }
 
-TEST_CASE("config: defaults with only the API key") {
+TEST_CASE("config: defaults with an empty .env") {
     const TempDir dir("defaults");
-    const orcli::Config config = load_ok(dir, key_line);
-    CHECK(config.api_key == test_key);
+    const orcli::Config config = load_ok(dir, "");
     CHECK(config.base_url == "https://openrouter.ai/api/v1");
     CHECK(config.app_referer.empty());
     CHECK(config.app_title == "openrouter-cli");
@@ -176,6 +180,7 @@ TEST_CASE("config: defaults with only the API key") {
     CHECK(config.state_dir == dir.path() / "state");
     CHECK(config.cost_log ==
           dir.user_home() / ".local" / "state" / "openrouter-cli" / "costs.jsonl");
+    CHECK(config.plaintext_keys.empty());
     CHECK_FALSE(fs::exists(config.state_dir));
 }
 
@@ -188,8 +193,7 @@ TEST_CASE("config: every setting can be overridden and unknown keys are ignored"
     constexpr std::size_t max_input_bytes = 8192;
     const TempDir dir("overrides");
     const orcli::Config config =
-        load_ok(dir, std::format("OPENROUTER_API_KEY=\"sk-or-v1-custom\"\n"
-                                 "OPENROUTER_CLI_BASE_URL=https://eu.openrouter.ai/api/v1/\n"
+        load_ok(dir, std::format("OPENROUTER_CLI_BASE_URL=https://eu.openrouter.ai/api/v1/\n"
                                  "OPENROUTER_CLI_APP_REFERER=https://example.com\n"
                                  "OPENROUTER_CLI_APP_TITLE='My Tool'\n"
                                  "OPENROUTER_CLI_APP_CATEGORIES=cli-agent,review\n"
@@ -204,7 +208,6 @@ TEST_CASE("config: every setting can be overridden and unknown keys are ignored"
                                  "UNRELATED_SETTING=whatever\n",
                                  max_output_tokens, catalog_ttl_hours, idle_timeout_seconds,
                                  total_timeout_seconds, max_file_bytes, max_input_bytes));
-    CHECK(config.api_key == "sk-or-v1-custom");
     CHECK(config.base_url == "https://eu.openrouter.ai/api/v1");
     CHECK(config.app_referer == "https://example.com");
     CHECK(config.app_title == "My Tool");
@@ -224,7 +227,7 @@ TEST_CASE("config: empty setting values select the defaults") {
     const orcli::Config config = load_ok(dir, std::format("{}OPENROUTER_CLI_MAX_OUTPUT_TOKENS=\n"
                                                           "OPENROUTER_CLI_PRIVACY=\n"
                                                           "OPENROUTER_CLI_APP_TITLE=\n",
-                                                          key_line));
+                                                          settings_line));
     CHECK(config.max_output_tokens == default_max_output_tokens);
     CHECK(config.privacy == orcli::Privacy::zdr);
     CHECK(config.app_title == "openrouter-cli");
@@ -232,7 +235,7 @@ TEST_CASE("config: empty setting values select the defaults") {
 
 TEST_CASE("config: .env readable by group or others is rejected") {
     const TempDir dir("mode");
-    write_file(dir.env_file(), key_line, world_readable);
+    write_file(dir.env_file(), settings_line, world_readable);
     const auto config = orcli::load_config(dir.path(), dir.user_home(), fs::path{});
     REQUIRE_FALSE(config.has_value());
     CHECK(config.error().code == orcli::Exit::config);
@@ -243,7 +246,7 @@ TEST_CASE("config: .env readable by group or others is rejected") {
 TEST_CASE("config: symlinked .env is rejected") {
     const TempDir dir("symlink");
     const fs::path target = dir.path() / "real.env";
-    write_file(target, key_line, owner_read_write);
+    write_file(target, settings_line, owner_read_write);
     fs::create_symlink(target, dir.env_file());
     const auto config = orcli::load_config(dir.path(), dir.user_home(), fs::path{});
     REQUIRE_FALSE(config.has_value());
@@ -252,13 +255,23 @@ TEST_CASE("config: symlinked .env is rejected") {
     CHECK(contains(config.error().message, "symlink"));
 }
 
-TEST_CASE("config: missing .env or a directory in its place is rejected") {
+TEST_CASE("config: missing .env gives every default") {
     const TempDir dir("missing");
-    const auto missing = orcli::load_config(dir.path(), dir.user_home(), fs::path{});
-    REQUIRE_FALSE(missing.has_value());
-    CHECK(missing.error().code == orcli::Exit::config);
-    CHECK(contains(missing.error().message, dir.env_file().string()));
+    const auto config = orcli::load_config(dir.path(), dir.user_home(), fs::path{});
+    REQUIRE(config.has_value());
+    CHECK(config->base_url == "https://openrouter.ai/api/v1");
+    CHECK(config->privacy == orcli::Privacy::zdr);
+    CHECK(config->max_output_tokens == default_max_output_tokens);
+    CHECK(config->max_input_bytes == default_max_input_bytes);
+    CHECK(config->home == dir.path());
+    CHECK(config->state_dir == dir.path() / "state");
+    CHECK(config->cost_log ==
+          dir.user_home() / ".local" / "state" / "openrouter-cli" / "costs.jsonl");
+    CHECK(config->plaintext_keys.empty());
+}
 
+TEST_CASE("config: a directory in place of .env is rejected") {
+    const TempDir dir("directory");
     REQUIRE(fs::create_directory(dir.env_file()));
     fs::permissions(dir.env_file(), fs::perms::owner_all);
     const auto directory = orcli::load_config(dir.path(), dir.user_home(), fs::path{});
@@ -266,16 +279,60 @@ TEST_CASE("config: missing .env or a directory in its place is rejected") {
     CHECK(directory.error().code == orcli::Exit::config);
 }
 
-TEST_CASE("config: missing or empty API key is rejected") {
-    const TempDir dir("api-key");
-    CHECK(contains(load_error(dir, "OPENROUTER_CLI_PRIVACY=zdr\n").message, "OPENROUTER_API_KEY"));
-    CHECK(contains(load_error(dir, "OPENROUTER_API_KEY=\n").message, "OPENROUTER_API_KEY"));
-    CHECK(contains(load_error(dir, "OPENROUTER_API_KEY=''\n").message, "OPENROUTER_API_KEY"));
+TEST_CASE("config: plaintext keys are found by name and line, never by value") {
+    const std::vector<orcli::PlaintextKey> keys =
+        orcli::find_plaintext_keys("# OPENROUTER_API_KEY=commented-secret-value\n"
+                                   "OPENROUTER_API_KEY=unquoted-secret-value\n"
+                                   "OPENROUTER_API_KEY=\"quoted-secret-value\"\n"
+                                   "  OPENROUTER_MANAGEMENT_KEY = 'management-secret-value'\n"
+                                   "OPENROUTER_API_KEY=''\n"
+                                   "OPENROUTER_MANAGEMENT_KEY=\n"
+                                   "OTHER_KEY=other-secret-value\n");
+    REQUIRE(keys.size() == std::size_t{3});
+    CHECK(is_key_at(keys.at(0), "OPENROUTER_API_KEY", 2));
+    CHECK(is_key_at(keys.at(1), "OPENROUTER_API_KEY", 3));
+    CHECK(is_key_at(keys.at(2), "OPENROUTER_MANAGEMENT_KEY", 4));
+    for (const orcli::PlaintextKey& key : keys) {
+        CHECK_FALSE(contains(key.name, secret_marker));
+    }
+}
+
+TEST_CASE("config: a plaintext key followed by an empty duplicate is still found") {
+    const std::vector<orcli::PlaintextKey> keys =
+        orcli::find_plaintext_keys("OPENROUTER_API_KEY=first-secret-value\nOPENROUTER_API_KEY=\n");
+    REQUIRE(keys.size() == std::size_t{1});
+    CHECK(is_key_at(keys.at(0), "OPENROUTER_API_KEY", 1));
+}
+
+TEST_CASE("config: plaintext scan skips malformed lines and finds nothing in a clean file") {
+    const std::vector<orcli::PlaintextKey> keys =
+        orcli::find_plaintext_keys("not a setting\nOPENROUTER_API_KEY=late-secret-value\n");
+    REQUIRE(keys.size() == std::size_t{1});
+    CHECK(is_key_at(keys.at(0), "OPENROUTER_API_KEY", 2));
+    CHECK(orcli::find_plaintext_keys(settings_line).empty());
+    CHECK(orcli::find_plaintext_keys("").empty());
+}
+
+TEST_CASE("config: load_config reports plaintext keys without failing or keeping values") {
+    const TempDir dir("plaintext");
+    const orcli::Config config =
+        load_ok(dir, std::format("{}OPENROUTER_API_KEY=loaded-secret-value\n"
+                                 "OPENROUTER_MANAGEMENT_KEY=\"managed-secret-value\"\n",
+                                 settings_line));
+    REQUIRE(config.plaintext_keys.size() == std::size_t{2});
+    CHECK(is_key_at(config.plaintext_keys.at(0), "OPENROUTER_API_KEY", 2));
+    CHECK(is_key_at(config.plaintext_keys.at(1), "OPENROUTER_MANAGEMENT_KEY", 3));
+    for (const std::string_view field :
+         {std::string_view{config.base_url}, std::string_view{config.app_referer},
+          std::string_view{config.app_title}, std::string_view{config.app_categories},
+          std::string_view{config.default_effort}}) {
+        CHECK_FALSE(contains(field, secret_marker));
+    }
 }
 
 TEST_CASE("config: malformed .env line is reported with the path and line") {
     const TempDir dir("malformed");
-    const orcli::Error error = load_error(dir, std::format("{}not-a-setting\n", key_line));
+    const orcli::Error error = load_error(dir, std::format("{}not-a-setting\n", settings_line));
     CHECK(contains(error.message, dir.env_file().string()));
     CHECK(contains(error.message, "line 2"));
     CHECK_FALSE(contains(error.message, "not-a-setting"));
@@ -287,33 +344,33 @@ TEST_CASE("config: bad numbers name the key, never the value") {
          {"abc", "0", "-5", "12abc", "1.5", "+7", "99999999999999999999999"}) {
         CAPTURE(value);
         const orcli::Error error = load_error(
-            dir, std::format("{}OPENROUTER_CLI_MAX_OUTPUT_TOKENS={}\n", key_line, value));
+            dir, std::format("{}OPENROUTER_CLI_MAX_OUTPUT_TOKENS={}\n", settings_line, value));
         CHECK(contains(error.message, "OPENROUTER_CLI_MAX_OUTPUT_TOKENS"));
         CHECK_FALSE(contains(error.message, std::format("={}", value)));
     }
-    const orcli::Error overflow =
-        load_error(dir, std::format("{}OPENROUTER_CLI_CATALOG_TTL_HOURS=4294967296\n", key_line));
+    const orcli::Error overflow = load_error(
+        dir, std::format("{}OPENROUTER_CLI_CATALOG_TTL_HOURS=4294967296\n", settings_line));
     CHECK(contains(overflow.message, "OPENROUTER_CLI_CATALOG_TTL_HOURS"));
     const orcli::Error negative_size =
-        load_error(dir, std::format("{}OPENROUTER_CLI_MAX_FILE_BYTES=-1\n", key_line));
+        load_error(dir, std::format("{}OPENROUTER_CLI_MAX_FILE_BYTES=-1\n", settings_line));
     CHECK(contains(negative_size.message, "OPENROUTER_CLI_MAX_FILE_BYTES"));
 }
 
 TEST_CASE("config: privacy values") {
     const TempDir dir("privacy");
-    CHECK(load_ok(dir, std::format("{}OPENROUTER_CLI_PRIVACY=zdr\n", key_line)).privacy ==
+    CHECK(load_ok(dir, std::format("{}OPENROUTER_CLI_PRIVACY=zdr\n", settings_line)).privacy ==
           orcli::Privacy::zdr);
-    CHECK(load_ok(dir, std::format("{}OPENROUTER_CLI_PRIVACY=no-training\n", key_line)).privacy ==
-          orcli::Privacy::no_training);
+    CHECK(load_ok(dir, std::format("{}OPENROUTER_CLI_PRIVACY=no-training\n", settings_line))
+              .privacy == orcli::Privacy::no_training);
     const orcli::Error error =
-        load_error(dir, std::format("{}OPENROUTER_CLI_PRIVACY=off\n", key_line));
+        load_error(dir, std::format("{}OPENROUTER_CLI_PRIVACY=off\n", settings_line));
     CHECK(contains(error.message, "OPENROUTER_CLI_PRIVACY"));
 }
 
 TEST_CASE("config: base URL validation") {
     const TempDir dir("base-url");
     const auto base_url_env = [](std::string_view url) {
-        return std::format("{}OPENROUTER_CLI_BASE_URL={}\n", key_line, url);
+        return std::format("{}OPENROUTER_CLI_BASE_URL={}\n", settings_line, url);
     };
 
     CHECK(load_ok(dir, base_url_env("https://openrouter.ai/api/v1//")).base_url ==
@@ -334,7 +391,7 @@ TEST_CASE("config: base URL validation") {
 
 TEST_CASE("config: cost log follows XDG_STATE_HOME when it is absolute") {
     const TempDir dir("cost-log");
-    write_file(dir.env_file(), key_line, owner_read_write);
+    write_file(dir.env_file(), settings_line, owner_read_write);
     const fs::path xdg = dir.path() / "xdg-state";
 
     const auto with_xdg = orcli::load_config(dir.path(), dir.user_home(), xdg);

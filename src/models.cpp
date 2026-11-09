@@ -687,13 +687,6 @@ Result<std::vector<Endpoint>> parse_endpoints(std::string_view json_text) {
     return endpoints;
 }
 
-bool provider_matches(std::string_view slug, std::string_view tag) {
-    if (tag == slug) {
-        return true;
-    }
-    return tag.size() > slug.size() && tag.starts_with(slug) && tag.at(slug.size()) == '/';
-}
-
 std::string normalize_alias(std::string_view name) {
     std::string alias;
     bool separator_pending = false;

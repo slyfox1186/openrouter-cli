@@ -55,14 +55,14 @@ struct AliasEntry {
 struct Resolution {
     enum class Kind { found, ambiguous, none };
     Kind kind = Kind::none;
-    std::optional<ModelInfo> model;     // concrete model (a "~...-latest" alias is followed)
-    std::vector<ModelInfo> candidates;  // for ambiguous
+    std::optional<ModelInfo> model;       // concrete model (a "~...-latest" alias is followed)
+    std::vector<ModelInfo> candidates;    // for ambiguous
     std::optional<std::string> new_alias; // set when a plain-name match should be saved
 };
 
 // One provider endpoint of a model, from GET /api/v1/models/{id}/endpoints.
 struct Endpoint {
-    std::string tag; // routing slug, e.g. "google-vertex/global"; what --provider matches
+    std::string tag; // routing slug, e.g. "google-vertex/global"; accepted by --provider
     std::string provider_name;
     std::optional<std::string> prompt_price; // decimal USD per token as published
     std::optional<std::string> completion_price;
@@ -75,9 +75,6 @@ struct Endpoint {
 // Pure functions.
 Result<std::vector<ModelInfo>> parse_catalog(std::string_view json_text);
 Result<std::vector<Endpoint>> parse_endpoints(std::string_view json_text);
-// OpenRouter slug matching: equal, or `slug` is a whole-segment prefix of `tag`
-// ("google-vertex" matches "google-vertex/us"; "google" does not match "google-vertex").
-bool provider_matches(std::string_view slug, std::string_view tag);
 std::string format_endpoints(const std::vector<Endpoint>& endpoints);
 std::string normalize_alias(std::string_view name);
 std::vector<ModelInfo> search(std::string_view query, const std::vector<ModelInfo>& catalog);

@@ -1,6 +1,7 @@
 #include "sse.hpp"
 
 #include "common.hpp"
+#include "secrets.hpp"
 
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
@@ -21,6 +22,10 @@ using nlohmann::json;
 constexpr std::string_view line_breaks{"\r\n"};
 constexpr std::string_view data_field{"data"};
 constexpr std::string_view done_marker{"[DONE]"};
+constexpr std::size_t max_error_type_length = 64;
+constexpr std::string_view error_type_characters{
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"};
+constexpr std::string_view unrecognized_error_type{"unrecognized"};
 
 // Value of a `data` field line, or nullopt for any other field. Comment lines have an empty
 // field name, so they are skipped like unknown fields.
@@ -110,9 +115,22 @@ void record_provider(const json& body, StreamOutcome& outcome) {
     }
 }
 
+// The error type is provider-controlled text that reaches stderr and the cost log, so only a
+// short token of plain identifier characters survives; anything else could carry control
+// sequences or echoed input. A token that is itself a known key format is rejected as well.
+std::string classify_error_type(std::string_view value) {
+    if (value.empty() || value.size() > max_error_type_length ||
+        value.find_first_not_of(error_type_characters) != std::string_view::npos ||
+        !scan_text(value, "error type").empty()) {
+        return std::string{unrecognized_error_type};
+    }
+    return std::string{value};
+}
+
 void record_error(const json& error, StreamOutcome& outcome) {
     outcome.error_code = code_member(error, "code");
-    outcome.error_type = string_member(member(error, "metadata"), "error_type");
+    outcome.error_type =
+        string_member(member(error, "metadata"), "error_type").transform(classify_error_type);
     // An error object must block completion even when the provider sent no message.
     outcome.error_message = string_member(error, "message").value_or(std::string{});
 }
