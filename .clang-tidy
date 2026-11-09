@@ -1,0 +1,24 @@
+# C++ Core Guidelines (cppcoreguidelines-*) and SEI CERT (cert-*) are enforced alongside the
+# general families. Two exclusions, each because no code change can satisfy them:
+# - modernize-use-trailing-return-type: a style that contradicts the return-type style the other
+#   checks and clang-format assume.
+# - cppcoreguidelines-pro-type-vararg: libcurl's only option API, curl_easy_setopt, is variadic.
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  -cppcoreguidelines-pro-type-vararg,
+  misc-*,
+  modernize-*,
+  -modernize-use-trailing-return-type,
+  performance-*,
+  portability-*,
+  readability-*
+WarningsAsErrors: '*'
+CheckOptions:
+  # The binary links glibc only, so thread safety is judged by glibc's own MT-Safe annotations
+  # (getenv is "MT-Safe env" there) rather than the stricter generic POSIX list.
+  concurrency-mt-unsafe.FunctionSet: glibc
+HeaderFilterRegex: '.*/(src|tests)/.*'

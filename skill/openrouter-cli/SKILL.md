@@ -1,0 +1,126 @@
+---
+name: openrouter-cli
+description: "Second opinion, critique or peer review from another AI model hosted on OpenRouter (Gemini, GPT, Grok, DeepSeek, Qwen, Llama, Mistral, Kimi, GLM, Claude and others) through the `openrouter-cli` command. Use when the user asks for an outside opinion, wants a different model to check, critique or improve a plan, design, diff or code, names an OpenRouter-hosted model (\"ask Gemini 4 Argon to check this\"), asks for a follow-up round with that model, or asks about OpenRouter model prices, spend or key balance. Every question to a model is a billed call that needs the user's approval first."
+---
+
+# openrouter-cli
+
+`openrouter-cli` sends a question, plus any files you attach, to one OpenRouter model and prints
+its answer. The default `review` role makes the model act as a peer reviewer of a plan or code.
+
+## Billing
+
+Every question is a billed call. Before one:
+
+1. Resolve the model and read its prices with `openrouter-cli models show <model>` (free).
+2. Tell the user the model id, how many calls you will make, and the published input, cached
+   input and output prices per million tokens from that output.
+3. Wait for approval, unless the user already approved that exact call in this turn.
+
+After the call, report the final `cost` line from stderr to the user. These commands are free
+and need no approval: `models find`, `models show`, `models save`, `models list`, `spend`,
+`balance`.
+
+## Choosing the model
+
+- `openrouter-cli models list` shows saved aliases. Check it first.
+- `openrouter-cli models find "gemini 4 argon"` lists matching ids. Quote multi-word names.
+- `-m` accepts a saved alias, an exact id (`google/gemini-4-argon`), a `~author/family-latest`
+  id, or plain words (`-m "gemini 4 argon"`). A plain name that matches exactly one model is used
+  and saved as an alias automatically (stderr says `saved alias ...`).
+- `openrouter-cli models save ALIAS MODEL_ID` saves an alias by hand.
+- Exit `4` means the name is unknown or matches several models; the candidates are printed. Pick
+  the exact id the user meant, or ask them.
+
+## Sending a question
+
+Options come first and the query comes last:
+
+```bash
+openrouter-cli -m google/gemini-4-argon -f src/http.cpp -f src/http.hpp \
+  "Goal: retry free GET requests safely. Constraints: ... Review the retry logic."
+```
+
+- `-f FILE` (repeatable) attaches a file, sent line-numbered so the reviewer cites `path:line`.
+- For a long prompt, pass `-` as the query and feed it on stdin with a quoted heredoc. One
+  command-line argument is limited to about 128 KiB.
+
+  ```bash
+  openrouter-cli -m google/gemini-4-argon -f plan.md - <<'EOF'
+  Goal, constraints, what changed, what you want checked...
+  EOF
+  ```
+
+- Put `--` before a query that starts with `-` or equals a subcommand word (`models`, `spend`,
+  `balance`).
+- The reviewer cannot read files, run commands or see this conversation. Send everything it
+  needs: the user's goal, constraints, acceptance criteria, the plan or code, relevant excerpts of
+  docs, and checks already run with their results.
+- Never send secrets, `.env` files, credentials or private data unrelated to the question. The
+  CLI refuses known secret formats and credential files (exit `3`, nothing sent), but it cannot
+  catch everything; choosing safe context is your job.
+
+## Roles and options
+
+- `--role review` (default) returns `Assumptions`, a `Verdict` (`APPROVE`,
+  `APPROVE WITH CHANGES` or `RETHINK`), severity-ordered findings with location, evidence and
+  exact fix, optional enhancements, and what was not verified.
+- `--role plain` sends no review instructions; use it for a plain question.
+- `-s TEXT` or `-s @FILE` adds system text.
+- `-e EFFORT` sets reasoning effort (`max`, `xhigh`, `high`, `medium`, `low`, `minimal`, `none`);
+  the default comes from the project `.env`. Models that cannot select effort ignore it.
+- `--max-output-tokens N` sets the output budget, reasoning included.
+
+## Follow-up rounds
+
+`--session NAME` (letters, digits, `.`, `_`, `-`) keeps the history and pins the model and system
+text from the first call. For the next round, reuse the same name without `-m`, `-s` or
+`--role`, for example to rebut a finding or to ask the model to verify your fixes:
+
+```bash
+openrouter-cli -m google/gemini-4-argon --session http-retry -f src/http.cpp "Review ..."
+openrouter-cli --session http-retry -f src/http.cpp "I fixed findings 1 and 3; verify them."
+```
+
+Each round is another billed call and resends the whole history. Only complete answers are
+added to a session.
+
+## Long calls
+
+Replies often take 3 to 25 minutes. stderr prints a heartbeat every 30 seconds; silence on stdout
+does not mean the call is stuck.
+
+- Claude Code: run the command with `run_in_background: true` and an explicit long `timeout`.
+  Unattended runs cap background commands at 30 minutes by default (10 for text `-p` runs) and
+  up to 2 hours when a timeout is passed. Wait for the completion notice instead of polling.
+- Codex: run it as a long-running command and keep polling until it exits.
+
+stdout is the answer only. The answer is also saved to the file named at the end of the `cost`
+line, so read that file if stdout was lost.
+
+## Exit codes
+
+| Code | Meaning | What to do |
+| --- | --- | --- |
+| `0` | Complete answer | Judge it (below) and report the cost line. |
+| `1` | Internal error | Report the message to the user. |
+| `2` | Usage error | Fix the command; `openrouter-cli --help`. |
+| `3` | Refused before sending: secret found, input too large, session busy, credential file, cost log not writable | Nothing was sent or billed. Remove the flagged content, shrink the input, wait until the other call on that session ends, or report the cost log problem. |
+| `4` | Unknown or ambiguous model | Choose from the printed candidates or ask the user. |
+| `5` | API or network failure | Report the message. A retry is another billed call; ask first. |
+| `6` | Incomplete answer (budget ran out, stream ended early, content filter) | The partial answer is in the answer file and the session is unchanged. Retry with a lower `--effort` or a higher `--max-output-tokens` only after telling the user it costs another call. |
+| `7` | Configuration problem (project `.env` missing, wrong mode or invalid) | Report it to the user; never read or print `.env`. |
+| `8` | Interrupted | The partial answer was kept; report the cost line. |
+
+## Privacy
+
+The default `--privacy zdr` routes only to providers that do not train on prompts and keep no
+prompt data; whether Safety Retention endpoints (abuse monitoring only) count is set in the
+user's OpenRouter privacy settings. Use `--privacy no-training` only for a model that has no ZDR endpoint, and tell the user
+before the call that the provider may retain the prompt.
+
+## Judging the answer
+
+Treat the reply as claims to check. Verify every finding against the code,
+tests and current documentation before acting on it, fix the ones that hold, and tell the user
+which you rejected and why. Agreement between models is not proof.
