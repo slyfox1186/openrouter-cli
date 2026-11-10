@@ -306,7 +306,7 @@ TEST_CASE("load_key without a stored key names the command that stores one") {
     const auto inference = orcli::load_key(fake_tool(), temp.state(), KeyKind::inference);
     REQUIRE_FALSE(inference.has_value());
     CHECK(inference.error().code == Exit::config);
-    CHECK(contains(inference.error().message, "openrouter-cli auth login"));
+    CHECK(contains(inference.error().message, "openrouter-cli login"));
 
     const auto management = orcli::load_key(fake_tool(), temp.state(), KeyKind::management);
     REQUIRE_FALSE(management.has_value());
@@ -323,7 +323,7 @@ TEST_CASE("load_key reports a credential file that does not decrypt") {
     REQUIRE_FALSE(loaded.has_value());
     CHECK(loaded.error().code == Exit::config);
     CHECK(loaded.error().message.starts_with("could not decrypt the stored API key"));
-    CHECK(contains(loaded.error().message, "openrouter-cli auth logout"));
+    CHECK(contains(loaded.error().message, "openrouter-cli logout"));
 }
 
 TEST_CASE("remove_keys removes the requested keys once") {

@@ -10,6 +10,7 @@
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <expected>
@@ -113,6 +114,14 @@ Result<Pkce> new_pkce() {
     }
     pkce.challenge = std::move(*challenge);
     return pkce;
+}
+
+std::string login_key_label(std::string_view host) {
+    constexpr std::string_view whitespace = " \t\n\r\f\v";
+    std::string label = std::format("openrouter-cli-on-{}", host);
+    std::ranges::replace_if(
+        label, [&](char character) { return whitespace.contains(character); }, '-');
+    return label;
 }
 
 // No callback_url: OpenRouter's headless flow then shows the code on the page for the user to

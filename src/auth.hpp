@@ -33,6 +33,10 @@ struct Pkce {
 // Fresh pair for each login attempt; fails closed (Exit::config) when RAND_bytes or EVP fail.
 Result<Pkce> new_pkce();
 
+// "openrouter-cli-on-HOST": the name OpenRouter gives the key this login creates. Whitespace in
+// the host name becomes a dash, so the label is one word wherever OpenRouter lists it.
+std::string login_key_label(std::string_view host);
+
 // https://openrouter.ai/auth?code_challenge=C&code_challenge_method=S256&key_label=L with every
 // query value percent-encoded and no callback_url, so the page shows the code to paste.
 std::string authorization_url(std::string_view challenge, std::string_view key_label);

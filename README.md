@@ -113,7 +113,7 @@ Using Zsh? Put the same two lines in `~/.zshrc` instead. Using Fish? Run `fish_a
 Run this once:
 
 ```bash
-openrouter-cli auth login
+openrouter-cli login
 ```
 
 The program walks you through four steps:
@@ -237,7 +237,7 @@ openrouter-cli -m reviewer -- "--force: is this flag safe?"
 | `models find`, `models show`, `models save`, `models list` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
 | `status`, `account balance`, `account keys`, `account credits`, `account activity` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
 | `spend`, `spend --resolve` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
-| `auth login`, `auth set`, `auth logout`, `--help`, `--version` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
+| `login`, `logout`, `auth set`, `--help`, `--version` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
 
 A question costs whatever the model's published price says, so it is free only when `models show` lists a price of zero.
 
@@ -338,7 +338,7 @@ scripts/build.sh --uninstall
 
 If you installed with `--bin-dir`, pass the same `--bin-dir` again. Uninstalling removes the program and the skill links. It leaves your keys, settings, history and cost log where they are.
 
-To remove your stored keys as well, run `openrouter-cli auth logout` **before** uninstalling. Your key still works at OpenRouter until you delete it in your [OpenRouter key settings](https://openrouter.ai/settings/keys).
+To remove your stored keys as well, run `openrouter-cli logout` **before** uninstalling. Your key still works at OpenRouter until you delete it in your [OpenRouter key settings](https://openrouter.ai/settings/keys).
 
 ## Reference
 
@@ -357,16 +357,16 @@ Everything below is optional detail. Click a heading to open it.
 | `models save ALIAS MODEL_ID` | Save a nickname for an exact model ID. |
 | `models list` | List saved nicknames. |
 | `spend [--since PERIOD] [--resolve]` | Totals from the cost log. PERIOD is `today`, `7d`, `30d` or `all`. |
-| `auth login [--replace]` | Sign in with your browser and store a new key. |
+| `login [--replace]` | Sign in with your browser and store a new key. |
+| `logout [--management]` | Delete stored keys from this computer. `--management` deletes only the Management key. |
 | `auth set [--management] [--replace]` | Store an existing key, typed at a hidden prompt or piped in. |
-| `auth logout [--management]` | Delete stored keys from this computer. `--management` deletes only the Management key. |
 | `status` | Who is signed in, plus key usage and limits. |
 | `account balance` | Usage and limit of your key. |
 | `account keys` | Every key on your account (Management key). |
 | `account credits` | Credits bought and used (Management key). |
 | `account activity [--days N]` | Usage per day, model and provider (Management key). |
 
-`auth login` and `auth set` never overwrite a stored key unless you add `--replace`. Keys are checked with OpenRouter before they are stored. Deleting a key from this computer does not delete it at OpenRouter.
+`login` and `auth set` never overwrite a stored key unless you add `--replace`. Keys are checked with OpenRouter before they are stored. Deleting a key from this computer does not delete it at OpenRouter.
 
 **How model names are matched.** `-m` accepts an exact ID, a saved nickname, an `~author/family-latest` ID or plain words. An exact ID wins over a nickname, and a nickname wins over plain words. Plain words that match exactly one model are used without saving anything. Only `models save` creates a nickname. The model list is cached; if an automatic refresh fails, the old list is used with a dated warning, but a failed `--refresh` is reported as an error.
 
@@ -452,7 +452,7 @@ Then edit the file. Exported environment variables with the same names do **not*
 | `OPENROUTER_CLI_MAX_FILE_BYTES` | `1048576` | Largest single attached file (1 MiB). |
 | `OPENROUTER_CLI_MAX_INPUT_BYTES` | `4194304` | Largest total input per question (4 MiB). |
 
-The API address must use HTTPS; plain HTTP is allowed only for exact local loopback addresses used in testing. Addresses with user names, queries or fragments are refused, and so are header settings containing control characters. A key in the settings file is refused; store it with `auth login` or `auth set`, then delete the old line without displaying it.
+The API address must use HTTPS; plain HTTP is allowed only for exact local loopback addresses used in testing. Addresses with user names, queries or fragments are refused, and so are header settings containing control characters. A key in the settings file is refused; store it with `login` or `auth set`, then delete the old line without displaying it.
 
 </details>
 

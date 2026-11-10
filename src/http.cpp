@@ -659,7 +659,7 @@ Result<std::string_view> Http::key_for(Auth auth) const {
         return std::string_view{};
     case Auth::inference:
         if (keys_.inference.empty()) {
-            return fail(Exit::config, "no API key is stored; run `openrouter-cli auth login` "
+            return fail(Exit::config, "no API key is stored; run `openrouter-cli login` "
                                       "(or `auth set`)");
         }
         return keys_.inference.view();

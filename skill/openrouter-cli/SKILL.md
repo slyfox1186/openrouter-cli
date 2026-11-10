@@ -25,10 +25,10 @@ and need no approval: `models find`, `models show`, `models save`, `models list`
 
 ## Keys and sign-in
 
-Never run `auth login`, `auth set` or `auth logout`, and never read, print, pipe or ask for a
+Never run `login`, `logout` or `auth set`, and never read, print, pipe or ask for a
 key. Keys are the user's to manage. If a command exits `7`, run `openrouter-cli status` and tell
 the user what it says; when it shows no stored key or a rejected key, ask them to run
-`openrouter-cli auth login` (or `auth login --replace`) in their own terminal.
+`openrouter-cli login` (or `login --replace`) in their own terminal.
 
 ## Choosing the model and provider
 

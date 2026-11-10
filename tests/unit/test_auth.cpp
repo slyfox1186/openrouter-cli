@@ -80,11 +80,19 @@ TEST_CASE("percent_encode keeps unreserved characters and encodes every other by
     CHECK(orcli::percent_encode("").empty());
 }
 
+TEST_CASE("login_key_label joins its words with dashes and never holds whitespace") {
+    CHECK(orcli::login_key_label("JSERVERPC") == "openrouter-cli-on-JSERVERPC");
+    CHECK(orcli::login_key_label("this PC") == "openrouter-cli-on-this-PC");
+    CHECK(orcli::login_key_label("a\tb\nc\rd\fe\vf") == "openrouter-cli-on-a-b-c-d-e-f");
+    CHECK(orcli::login_key_label("my_box.lan") == "openrouter-cli-on-my_box.lan");
+}
+
 TEST_CASE("authorization_url carries the challenge and label but no callback_url") {
-    const std::string url = orcli::authorization_url("abc-_123", "openrouter-cli on box");
+    const std::string url = orcli::authorization_url("abc-_123", orcli::login_key_label("this PC"));
     CHECK(url == "https://openrouter.ai/auth?code_challenge=abc-_123&code_challenge_method=S256"
-                 "&key_label=openrouter-cli%20on%20box");
+                 "&key_label=openrouter-cli-on-this-PC");
     CHECK(url.find("callback_url") == std::string::npos);
+    CHECK(orcli::authorization_url("abc", "a&b c").ends_with("&key_label=a%26b%20c"));
 }
 
 TEST_CASE("exchange_body holds the code, verifier and S256 method") {

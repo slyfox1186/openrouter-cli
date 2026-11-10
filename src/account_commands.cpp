@@ -31,7 +31,7 @@ constexpr int max_pages = 50;
 constexpr int members_page_size = 100;
 constexpr std::size_t date_length = 10; // YYYY-MM-DD
 
-constexpr std::string_view login_replace_hint = "openrouter-cli auth login --replace";
+constexpr std::string_view login_replace_hint = "openrouter-cli login --replace";
 constexpr std::string_view management_replace_hint =
     "openrouter-cli auth set --management --replace";
 constexpr std::string_view seen_by_organization = " (as seen by the Management key's organization)";
@@ -141,7 +141,7 @@ LoginOutcome show_login(const Config& config) {
         return outcome;
     }
     if (!*present) {
-        std::println("logged in: no (run `openrouter-cli auth login`)");
+        std::println("logged in: no (run `openrouter-cli login`)");
         return outcome;
     }
     auto key = load_stored_key(config, KeyKind::inference);

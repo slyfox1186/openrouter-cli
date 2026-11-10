@@ -74,7 +74,7 @@ Result<SecretString> decrypt_key(const CredsTool& tool, KeyKind kind, std::strin
 Result<bool> key_stored(const std::filesystem::path& state_dir, KeyKind kind);
 
 // Reads and decrypts the stored key. Exit::config when none is stored (the message names
-// `openrouter-cli auth login` or `auth set`), when the file fails check_private_file, or when
+// `openrouter-cli login` or `auth set`), when the file fails check_private_file, or when
 // decryption fails.
 Result<SecretString> load_key(const CredsTool& tool, const std::filesystem::path& state_dir,
                               KeyKind kind);

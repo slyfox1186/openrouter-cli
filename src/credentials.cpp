@@ -93,7 +93,7 @@ std::string_view key_with_article(KeyKind kind) {
 std::string_view store_hint(KeyKind kind) {
     return kind == KeyKind::management
                ? "run `openrouter-cli auth set --management`"
-               : "run `openrouter-cli auth login` (or `openrouter-cli auth set`)";
+               : "run `openrouter-cli login` (or `openrouter-cli auth set`)";
 }
 
 class Descriptor {
@@ -546,7 +546,7 @@ Result<SecretString> load_key(const CredsTool& tool, const fs::path& state_dir, 
     if (!key && key.error().code != Exit::interrupted) {
         return fail(Exit::config,
                     std::format("could not decrypt the stored {} ({}): {}; run `openrouter-cli "
-                                "auth logout` and log in again",
+                                "logout` and log in again",
                                 key_noun(kind), file.string(), key.error().message));
     }
     return key;

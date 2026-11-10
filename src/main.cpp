@@ -887,7 +887,7 @@ Verdict judge(const StreamRun& run, long long max_tokens) {
             text += ": " + sanitize_for_display(*outcome.error_message, max_display_chars);
         }
         if (run.transfer.status == http_unauthorized) {
-            text += "; the stored API key was rejected: run `openrouter-cli auth login --replace`";
+            text += "; the stored API key was rejected: run `openrouter-cli login --replace`";
         } else if (run.transfer.status == http_not_found ||
                    run.transfer.status == http_unavailable) {
             text += "; check the -p tags with `openrouter-cli models show MODEL`, and under "
@@ -1198,18 +1198,19 @@ void add_account_commands(CLI::App& app, Cli& cli) {
     cli.spend->add_flag("--resolve", cli.resolve,
                         "Look up the charge of earlier calls whose cost is still unknown (free)");
 
-    auto* auth = app.add_subcommand("auth", "Log in to OpenRouter and manage the stored keys");
-    auth->require_subcommand(1);
-    auth->fallthrough(false);
-    cli.login = auth->add_subcommand(
+    cli.login = app.add_subcommand(
         "login", "Sign in with your OpenRouter account in a browser; stores a new API key");
     cli.login->add_flag("--replace", cli.login_replace, "Replace the stored API key");
+    cli.logout = app.add_subcommand("logout", "Delete the stored keys from this PC");
+    cli.logout->add_flag("--management", cli.logout_management, "Delete only the Management key");
+
+    auto* auth = app.add_subcommand("auth", "Store an API or Management key you already have");
+    auth->require_subcommand(1);
+    auth->fallthrough(false);
     cli.set_key = auth->add_subcommand(
         "set", "Store an existing key, read from a hidden prompt or from stdin");
     cli.set_key->add_flag("--management", cli.set_management, "The key is a Management key");
     cli.set_key->add_flag("--replace", cli.set_replace, "Replace a stored key of the same kind");
-    cli.logout = auth->add_subcommand("logout", "Delete the stored keys from this PC");
-    cli.logout->add_flag("--management", cli.logout_management, "Delete only the Management key");
 
     cli.status =
         app.add_subcommand("status", "Who is logged in: account identity, key usage and limits");
@@ -1234,13 +1235,13 @@ void add_account_commands(CLI::App& app, Cli& cli) {
 // are how keys move out of .env, logout is how stored keys are removed.
 std::optional<int> dispatch_auth(const Cli& cli, const Config& config) {
     if (cli.login->parsed()) {
-        return cmd_auth_login(config, cli.login_replace);
+        return cmd_login(config, cli.login_replace);
     }
     if (cli.set_key->parsed()) {
         return cmd_auth_set(config, cli.set_management, cli.set_replace);
     }
     if (cli.logout->parsed()) {
-        return cmd_auth_logout(config, cli.logout_management);
+        return cmd_logout(config, cli.logout_management);
     }
     return std::nullopt;
 }

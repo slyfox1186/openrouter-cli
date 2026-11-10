@@ -1052,6 +1052,11 @@ TEST_CASE("command line grammar") {
     CHECK(sandbox.run({"models"}).code == exit_usage);
     CHECK(sandbox.run({"account"}).code == exit_usage);
     CHECK(sandbox.run({"auth"}).code == exit_usage);
+    CHECK(sandbox.run({"auth", "login"}).code == exit_usage);
+    CHECK(sandbox.run({"auth", "logout"}).code == exit_usage);
+    CHECK(sandbox.run({"-m", "x", "login"}).code == exit_usage);
+    CHECK(sandbox.run({"-m", "x", "logout"}).code == exit_usage);
+    CHECK(file_exists(sandbox.api_credential()));
     CHECK(sandbox.run({"-m", "x", "spend"}).code == exit_usage);
     CHECK(sandbox.run({"-p", "mockcloud", "status"}).code == exit_usage);
     CHECK(sandbox.run({}).code == exit_usage);
@@ -1079,10 +1084,10 @@ TEST_CASE("help is shown for -h and --help on every command") {
         {.path = {"models", "save"}, .usage = "  openrouter-cli models save ALIAS MODEL_ID\n"},
         {.path = {"models", "list"}, .usage = "  openrouter-cli models list\n"},
         {.path = {"spend"}, .usage = "  openrouter-cli spend [OPTIONS]\n"},
+        {.path = {"login"}, .usage = "  openrouter-cli login [OPTIONS]\n"},
+        {.path = {"logout"}, .usage = "  openrouter-cli logout [OPTIONS]\n"},
         {.path = {"auth"}, .usage = "  openrouter-cli auth COMMAND\n"},
-        {.path = {"auth", "login"}, .usage = "  openrouter-cli auth login [OPTIONS]\n"},
         {.path = {"auth", "set"}, .usage = "  openrouter-cli auth set [OPTIONS]\n"},
-        {.path = {"auth", "logout"}, .usage = "  openrouter-cli auth logout [OPTIONS]\n"},
         {.path = {"status"}, .usage = "  openrouter-cli status\n"},
         {.path = {"account"}, .usage = "  openrouter-cli account COMMAND\n"},
         {.path = {"account", "balance"}, .usage = "  openrouter-cli account balance\n"},
@@ -1467,12 +1472,12 @@ TEST_CASE("auth set --management verifies with /credits and never touches infere
     CHECK(server.requests_to("/key").empty());
 }
 
-TEST_CASE("auth login exchanges the pasted code without an Authorization header") {
+TEST_CASE("login exchanges the pasted code without an Authorization header") {
     MockServer server;
     Sandbox sandbox(server.port());
 
     const RunResult login =
-        sandbox.run_with(Launch{.args = {"auth", "login"}, .stdin_text = "mock-code\n"});
+        sandbox.run_with(Launch{.args = {"login"}, .stdin_text = "mock-code\n"});
 
     INFO(login.err);
     CHECK(login.code == exit_ok);
@@ -1493,7 +1498,8 @@ TEST_CASE("auth login exchanges the pasted code without an Authorization header"
     CHECK(login.out.contains("https://openrouter.ai/auth?"));
     CHECK(login.out.contains("code_challenge=" + *challenge));
     CHECK(login.out.contains("code_challenge_method=S256"));
-    CHECK(login.out.contains("key_label="));
+    CHECK(login.out.contains("key_label=openrouter-cli-on-"));
+    CHECK_FALSE(login.out.contains("%20"));
     CHECK_FALSE(login.out.contains("callback_url"));
     CHECK_FALSE(login.all().contains(mock::login_key()));
     CHECK_FALSE(login.all().contains("mock-code"));
@@ -1518,14 +1524,14 @@ TEST_CASE("auth login exchanges the pasted code without an Authorization header"
     CHECK(server.last_authorization() == bearer(mock::login_key()));
 }
 
-TEST_CASE("auth login shows its prompt before the user supplies a code") {
+TEST_CASE("login shows its prompt before the user supplies a code") {
     MockServer server;
     Sandbox sandbox(server.port());
     const fs::path input_path = sandbox.root() / "login-input";
     REQUIRE(::mkfifo(input_path.c_str(), private_file_mode) == 0);
     // Keep a writer open so login waits for input instead of seeing EOF.
     const UniqueFd input = open_fd(input_path, O_RDWR | O_NONBLOCK);
-    Child child = sandbox.spawn(Launch{.args = {"auth", "login"}, .stdin_path = input_path});
+    Child child = sandbox.spawn(Launch{.args = {"login"}, .stdin_path = input_path});
     constexpr std::string_view prompt = "Paste the code here, then press Enter: ";
     const auto deadline = Clock::now() + output_wait;
     while (!child.err().contains(prompt) && Clock::now() < deadline) {
@@ -1540,12 +1546,11 @@ TEST_CASE("auth login shows its prompt before the user supplies a code") {
     CHECK(child.err().contains("logged in;"));
 }
 
-TEST_CASE("auth login reports blank input and EOF beneath the prompt without sending") {
+TEST_CASE("login reports blank input and EOF beneath the prompt without sending") {
     for (const std::string& input : {std::string(), std::string("\n"), std::string(" \t\r\n")}) {
         MockServer server;
         Sandbox sandbox(server.port());
-        const RunResult login =
-            sandbox.run_with(Launch{.args = {"auth", "login"}, .stdin_text = input});
+        const RunResult login = sandbox.run_with(Launch{.args = {"login"}, .stdin_text = input});
         CHECK(login.code == exit_usage);
         CHECK(login.err.contains("Paste the code here, then press Enter: \nopenrouter-cli:"));
         CHECK(login.err.contains("no code was pasted"));
@@ -1555,7 +1560,7 @@ TEST_CASE("auth login reports blank input and EOF beneath the prompt without sen
     }
 }
 
-TEST_CASE("a plaintext key in .env stops every command except auth set, login and logout") {
+TEST_CASE("a plaintext key in .env stops every command except login, logout and auth set") {
     MockServer server;
     Sandbox sandbox(server.port());
     sandbox.store_api_key();
@@ -1628,16 +1633,16 @@ TEST_CASE("the management key never reaches an inference endpoint") {
     CHECK(server.generation_count() > 0);
 }
 
-// ----- auth logout -----------------------------------------------------------------------------
+// ----- logout ----------------------------------------------------------------------------------
 
-TEST_CASE("auth logout removes both keys, and logging out twice is fine") {
+TEST_CASE("logout removes both keys, and logging out twice is fine") {
     MockServer server;
     Sandbox sandbox(server.port());
     sandbox.store_api_key();
     sandbox.store_management_key();
     const std::size_t requests_before = server.requests().size();
 
-    const RunResult logout = sandbox.run({"auth", "logout"});
+    const RunResult logout = sandbox.run({"logout"});
 
     CHECK(logout.code == exit_ok);
     CHECK(logout.all().contains("https://openrouter.ai/settings/keys"));
@@ -1647,25 +1652,25 @@ TEST_CASE("auth logout removes both keys, and logging out twice is fine") {
 
     const RunResult asked = sandbox.run(ask("question"));
     CHECK(asked.code == exit_config);
-    CHECK(asked.err.contains("auth login"));
+    CHECK(asked.err.contains("openrouter-cli login`"));
     CHECK(server.post_count() == 0);
 
     const RunResult status = sandbox.run({"status"});
     CHECK(status.code == exit_ok);
     CHECK(status.out.contains("logged in: no"));
 
-    const RunResult again = sandbox.run({"auth", "logout"});
+    const RunResult again = sandbox.run({"logout"});
     CHECK(again.code == exit_ok);
     CHECK(again.all().contains("already logged out"));
 }
 
-TEST_CASE("auth logout --management keeps the API key") {
+TEST_CASE("logout --management keeps the API key") {
     MockServer server;
     Sandbox sandbox(server.port());
     sandbox.store_api_key();
     sandbox.store_management_key();
 
-    CHECK(sandbox.run({"auth", "logout", "--management"}).code == exit_ok);
+    CHECK(sandbox.run({"logout", "--management"}).code == exit_ok);
 
     CHECK(file_exists(sandbox.api_credential()));
     CHECK_FALSE(file_exists(sandbox.management_credential()));
@@ -1673,14 +1678,14 @@ TEST_CASE("auth logout --management keeps the API key") {
     CHECK(sandbox.run({"account", "credits"}).code == exit_config);
 }
 
-TEST_CASE("auth logout works with a plaintext .env line, without a credential tool and with a "
+TEST_CASE("logout works with a plaintext .env line, without a credential tool and with a "
           "corrupt credential file") {
     MockServer server;
     Sandbox sandbox(server.port());
 
     sandbox.store_api_key();
     sandbox.write_env("OPENROUTER_API_KEY=" + mock::fake_key('7') + "\n");
-    const RunResult with_plaintext = sandbox.run({"auth", "logout"});
+    const RunResult with_plaintext = sandbox.run({"logout"});
     CHECK(with_plaintext.code == exit_ok);
     CHECK(with_plaintext.err.contains("line 4"));
     CHECK_FALSE(file_exists(sandbox.api_credential()));
@@ -1688,13 +1693,13 @@ TEST_CASE("auth logout works with a plaintext .env line, without a credential to
 
     sandbox.store_api_key();
     const RunResult without_tool =
-        sandbox.run_with(Launch{.args = {"auth", "logout"}, .creds_tool = false});
+        sandbox.run_with(Launch{.args = {"logout"}, .creds_tool = false});
     CHECK(without_tool.code == exit_ok);
     CHECK_FALSE(file_exists(sandbox.api_credential()));
 
     sandbox.store_api_key();
     write_text(sandbox.api_credential(), "not a credential");
-    const RunResult corrupt = sandbox.run({"auth", "logout"});
+    const RunResult corrupt = sandbox.run({"logout"});
     CHECK(corrupt.code == exit_ok);
     CHECK_FALSE(file_exists(sandbox.api_credential()));
 }
@@ -1729,7 +1734,7 @@ TEST_CASE("status without a stored key says so and contacts nobody") {
 
     CHECK(status.code == exit_ok);
     CHECK(status.out.contains("logged in: no"));
-    CHECK(status.all().contains("auth login"));
+    CHECK(status.all().contains("openrouter-cli login`"));
     CHECK(server.requests().empty());
 }
 
@@ -1941,7 +1946,7 @@ TEST_CASE("status follows the real HTTP status of /key whatever the body says") 
         CHECK_FALSE(status.out.contains("logged in: yes"));
         CHECK(status.all().contains("key rejected") == (entry.status == http_unauthorized));
         if (entry.status == http_unauthorized) {
-            CHECK(status.all().contains("auth login --replace"));
+            CHECK(status.all().contains("openrouter-cli login --replace"));
         }
     }
 }
@@ -2100,8 +2105,7 @@ TEST_CASE("interrupted idle login preserves the parent's stdin file-status flags
     const UniqueFd write_end(ends.back());
     const int flags = ::fcntl(read_end.get(), F_GETFL);
     REQUIRE(flags >= 0);
-    Child child =
-        sandbox.spawn(Launch{.args = {"auth", "login"}, .stdin_descriptor = read_end.get()});
+    Child child = sandbox.spawn(Launch{.args = {"login"}, .stdin_descriptor = read_end.get()});
     const auto deadline = Clock::now() + output_wait;
     while (!child.err().contains("Paste the code here") && Clock::now() < deadline) {
         std::this_thread::sleep_for(poll_interval);
@@ -2268,8 +2272,7 @@ TEST_CASE("auth set and logout finish their work when stderr cannot be written")
     CHECK(stored.code == exit_ok);
     CHECK(file_exists(sandbox.api_credential()));
 
-    const RunResult removed =
-        sandbox.run_with(Launch{.args = {"auth", "logout"}, .failed_stderr = true});
+    const RunResult removed = sandbox.run_with(Launch{.args = {"logout"}, .failed_stderr = true});
     CHECK(removed.code == exit_ok);
     CHECK_FALSE(file_exists(sandbox.api_credential()));
 }

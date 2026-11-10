@@ -213,7 +213,7 @@ Result<std::string> read_code() {
     }
     trim_in_place(code);
     if (code.empty()) {
-        return fail(Exit::usage, "no code was pasted; run `openrouter-cli auth login` again");
+        return fail(Exit::usage, "no code was pasted; run `openrouter-cli login` again");
     }
     return code;
 }
@@ -227,7 +227,7 @@ void print_minted_key_hint(std::string_view label, bool certainly_created) {
 
 } // namespace
 
-int cmd_auth_login(const Config& config, bool replace) {
+int cmd_login(const Config& config, bool replace) {
     const auto tool = find_creds_tool();
     if (!tool) {
         return report(tool.error());
@@ -246,7 +246,7 @@ int cmd_auth_login(const Config& config, bool replace) {
     if (!pkce) {
         return report(pkce.error());
     }
-    const std::string label = std::format("openrouter-cli on {}", host_name());
+    const std::string label = login_key_label(host_name());
     std::println(stderr, "Sign in to OpenRouter\n\n"
                          "1. Open this link in your browser. Over SSH, use any computer:\n");
     std::println("{}", authorization_url(pkce->challenge, label));
@@ -296,7 +296,7 @@ int cmd_auth_login(const Config& config, bool replace) {
         print_minted_key_hint(label, true);
         return status;
     }
-    warn_if_not_durable(KeyKind::inference, *stored, "openrouter-cli auth login");
+    warn_if_not_durable(KeyKind::inference, *stored, "openrouter-cli login");
     diagnostic("openrouter-cli: logged in; the key is stored encrypted in {}",
                credential_file(config.state_dir, KeyKind::inference).string());
     warn_plaintext_keys(config);
@@ -325,7 +325,7 @@ int cmd_auth_set(const Config& config, bool management, bool replace) {
     return exit_code(Exit::ok);
 }
 
-int cmd_auth_logout(const Config& config, bool management_only) {
+int cmd_logout(const Config& config, bool management_only) {
     const auto removed = remove_keys(config.state_dir, !management_only);
     if (!removed) {
         return report(removed.error());

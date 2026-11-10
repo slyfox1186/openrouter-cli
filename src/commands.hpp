@@ -59,7 +59,7 @@ bool warn_plaintext_keys(const Config& config);
 // Headless OAuth PKCE: prints the authorization URL, reads the pasted code from stdin,
 // exchanges it (POST /auth/keys, no Authorization header, never retried), verifies the new key
 // (GET /key, is_management_key must be false) and stores it with store_key().
-int cmd_auth_login(const Config& config, bool replace);
+int cmd_login(const Config& config, bool replace);
 
 // Reads a key from a hidden terminal prompt or from piped stdin, checks the sk-or- prefix,
 // verifies it (inference: GET /key with is_management_key false; management: GET /credits)
@@ -68,7 +68,7 @@ int cmd_auth_set(const Config& config, bool management, bool replace);
 
 // Deletes the stored credentials (only the Management key when management_only). Never
 // decrypts, never needs systemd-creds, never contacts OpenRouter.
-int cmd_auth_logout(const Config& config, bool management_only);
+int cmd_logout(const Config& config, bool management_only);
 
 // ----- status and account (account_commands.cpp) ------------------------------------------
 

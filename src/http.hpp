@@ -44,7 +44,7 @@ enum class Auth : std::uint8_t {
 };
 
 // Keys loaded by this process; an empty key means that kind was not loaded, and a request
-// needing it fails with Exit::config naming the `auth` command that stores one.
+// needing it fails with Exit::config naming the command that stores one.
 struct HttpKeys {
     SecretString inference;
     SecretString management;
