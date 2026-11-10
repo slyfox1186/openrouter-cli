@@ -22,6 +22,8 @@
 #include <utility>
 #include <vector>
 
+#include <chrono>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace fs = std::filesystem;
@@ -347,4 +349,50 @@ TEST_CASE("concurrent append_record calls keep every line intact") {
     CHECK(lines.size() == expected.size());
     const std::set<std::string> seen(lines.begin(), lines.end());
     CHECK(seen == expected);
+}
+
+TEST_CASE("private files and locks reject nonregular objects") {
+    const TempDir temp;
+    const auto fifo = temp.path() / "pipe";
+    REQUIRE(::mkfifo(fifo.c_str(), S_IRUSR | S_IWUSR) == 0);
+    CHECK_FALSE(orcli::check_private_file(fifo).has_value());
+    CHECK_FALSE(orcli::FileLock::acquire(fifo, false).has_value());
+    CHECK_FALSE(orcli::check_private_file(temp.path()).has_value());
+    CHECK_FALSE(orcli::FileLock::acquire(temp.path(), false).has_value());
+}
+
+TEST_CASE("lock cleanup uses a caller supplied absolute deadline") {
+    const TempDir temp;
+    const auto path = temp.path() / "lock";
+    const auto held = orcli::FileLock::acquire(path, false);
+    REQUIRE(held.has_value());
+    const auto result = orcli::FileLock::acquire(path, true, std::chrono::steady_clock::now());
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == Exit::interrupted);
+}
+
+TEST_CASE("regular reads enforce bounds and do not treat inspection errors as absence") {
+    const TempDir temp;
+    const auto file = temp.path() / "data";
+    REQUIRE(orcli::atomic_write(file, "abcd").has_value());
+    const auto exact = orcli::read_regular_file(file, 4);
+    REQUIRE(exact.has_value());
+    CHECK(*exact == "abcd");
+    CHECK_FALSE(orcli::read_regular_file(file, 3).has_value());
+    CHECK_FALSE(orcli::read_regular_file(file / "child", 4, true).has_value());
+    CHECK_FALSE(orcli::read_regular_file(temp.path(), 4, true).has_value());
+    const auto absent = orcli::read_regular_file(temp.path() / "absent", 4, true);
+    REQUIRE(absent.has_value());
+    CHECK(absent->empty());
+}
+
+TEST_CASE("unsafe lock links and shared permissions are rejected") {
+    const TempDir temp;
+    const auto lock = temp.path() / "lock";
+    REQUIRE(orcli::atomic_write(lock, "").has_value());
+    fs::create_hard_link(lock, temp.path() / "alias");
+    CHECK_FALSE(orcli::FileLock::acquire(lock, false).has_value());
+    fs::remove(temp.path() / "alias");
+    fs::permissions(lock, shared_file_perms);
+    CHECK_FALSE(orcli::FileLock::acquire(lock, false).has_value());
 }

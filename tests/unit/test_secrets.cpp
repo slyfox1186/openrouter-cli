@@ -218,3 +218,15 @@ TEST_CASE("sanitize_for_display truncates without splitting UTF-8") {
                                     "cd";
     CHECK(orcli::sanitize_for_display(accent_text, 3) == "ab...");
 }
+
+TEST_CASE("display metadata neutralizes terminal controls and preserves Unicode") {
+    CHECK(orcli::display_metadata("a\x1b[31m\n\t\x7f") == "a [31m   ");
+    CHECK(orcli::display_metadata("caf\xc3\xa9 \xe2\x82\xac") == "caf\xc3\xa9 \xe2\x82\xac");
+    CHECK(orcli::display_metadata("a\xc2\x9b"
+                                  "b\x9b"
+                                  "c") == "a b c");
+}
+
+TEST_CASE("display metadata rejects overlong control encodings") {
+    CHECK(orcli::display_metadata("\xe0\x82\x9b") == "   ");
+}

@@ -167,6 +167,44 @@ TEST_CASE("parse_catalog keeps models with string ids and drops batch rows") {
         models, [](const ModelInfo& model) { return model.id.ends_with(":batch"); }));
 }
 
+TEST_CASE("exact model IDs cannot be shadowed by saved aliases") {
+    const std::map<std::string, AliasEntry> aliases{
+        {"google-gemini-4-argon", {.model_id = "openai/gpt-6-sol", .saved = ""}},
+    };
+    const auto resolved = orcli::resolve("google/gemini-4-argon", test_catalog(), aliases);
+    REQUIRE(resolved.model.has_value());
+    CHECK(resolved.model->id == "google/gemini-4-argon");
+}
+
+TEST_CASE("forced refresh and interruption never silently use a cached catalog") {
+    const TempDir temp("refresh-errors");
+    int calls = 0;
+    REQUIRE(orcli::load_catalog(temp.state(), day, counting_fetch(calls), false).has_value());
+    const FetchText failure = []() -> Result<std::string> {
+        return orcli::fail(Exit::api, "offline");
+    };
+    CHECK_FALSE(orcli::load_catalog(temp.state(), day, failure, true).has_value());
+    const auto stale = orcli::load_catalog(temp.state(), std::chrono::hours{0}, failure, false);
+    REQUIRE(stale.has_value());
+    CHECK(stale->stale);
+    const FetchText interrupted = []() -> Result<std::string> {
+        return orcli::fail(Exit::interrupted, "interrupted");
+    };
+    const auto stopped =
+        orcli::load_catalog(temp.state(), std::chrono::hours{0}, interrupted, false);
+    REQUIRE_FALSE(stopped.has_value());
+    CHECK(stopped.error().code == Exit::interrupted);
+}
+
+TEST_CASE("model metadata preserves Unicode but cannot emit terminal controls") {
+    auto model = priced("0");
+    model.name = "Café\033[31m\nspoof";
+    const auto text = orcli::format_model(model, "today");
+    CHECK(text.find("Café") != std::string::npos);
+    CHECK(text.find('\033') == std::string::npos);
+    CHECK(text.find("\nspoof") == std::string::npos);
+}
+
 TEST_CASE("parse_catalog maps the fields of a complete entry") {
     const ModelInfo argon = model_named(test_catalog(), "google/gemini-4-argon");
     CHECK(argon.name == "Google: Gemini 4 Argon");
@@ -322,6 +360,7 @@ TEST_CASE("prices per million are converted exactly from the decimal strings") {
     CHECK(input_price("0.00000123456").contains("$1.2346/M"));
     CHECK(input_price("0.00000999995").contains("$10.00/M"));
     CHECK(input_price("-1").contains("variable"));
+    CHECK(input_price("0.000000000001").contains("<$0.0001/M"));
 }
 
 TEST_CASE("format_candidates prints one line per model with n/a for absent values") {

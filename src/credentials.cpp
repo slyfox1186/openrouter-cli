@@ -22,9 +22,6 @@ extern "C" {
 #include <expected>
 #include <filesystem>
 #include <format>
-#include <fstream>
-#include <ios>
-#include <iterator>
 #include <ranges>
 #include <span>
 #include <string>
@@ -420,15 +417,7 @@ Result<SecretString> run_tool(const CredsTool& tool, std::string_view action,
 }
 
 Result<std::string> read_ciphertext(const fs::path& file) {
-    std::ifstream input(file, std::ios::binary);
-    if (!input.is_open()) {
-        return fail(Exit::config, std::format("cannot open {}", file.string()));
-    }
-    std::string text{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    if (input.bad()) {
-        return fail(Exit::config, std::format("cannot read {}", file.string()));
-    }
-    return text;
+    return read_regular_file(file, max_output_bytes);
 }
 
 } // namespace
@@ -469,12 +458,6 @@ void cleanse(std::string& text) {
 }
 
 Result<CredsTool> find_creds_tool() {
-#ifdef ORCLI_TEST_HOOKS
-    const char* const test_tool = std::getenv("OPENROUTER_CLI_TEST_CREDS_TOOL");
-    if (test_tool != nullptr && *test_tool != '\0') {
-        return CredsTool{.program = fs::path{test_tool}};
-    }
-#endif
     const char* const search_path = std::getenv("PATH");
     if (search_path != nullptr) {
         for (const auto piece : std::string_view{search_path} | std::views::split(':')) {

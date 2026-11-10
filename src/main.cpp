@@ -19,7 +19,6 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -29,19 +28,14 @@
 #include <expected>
 #include <filesystem>
 #include <format>
-#include <fstream>
-#include <ios>
 #include <iterator>
-#include <memory>
 #include <numeric>
 #include <optional>
 #include <print>
 #include <span>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -57,13 +51,12 @@ using Clock = std::chrono::steady_clock;
 
 constexpr std::string_view version_text = "openrouter-cli 0.1.0";
 constexpr std::chrono::seconds heartbeat_interval{30};
-constexpr std::chrono::milliseconds heartbeat_slice{500};
 constexpr std::chrono::seconds generation_lookup_window{30};
 constexpr std::size_t max_display_chars = 400;
-constexpr std::size_t stdin_chunk_bytes = 65536;
 constexpr int internal_error_exit = 1;
 constexpr long http_unauthorized = 401;
 constexpr long http_not_found = 404;
+constexpr long http_unavailable = 503;
 constexpr int default_activity_days = 30;
 constexpr int max_activity_days = 30;
 constexpr int hours_per_day = 24;
@@ -72,6 +65,18 @@ constexpr int month_days = 30;
 
 int code_of(Exit exit) {
     return exit_code(exit);
+}
+
+// Diagnostics must not interrupt answer persistence or accounting after a paid request.
+template <typename... Args>
+bool diagnostic(std::format_string<Args...> format, Args&&... args) noexcept {
+    try {
+        const std::string text = display_metadata(std::format(format, std::forward<Args>(args)...));
+        return std::fwrite(text.data(), 1, text.size(), stderr) == text.size() &&
+               std::fputc('\n', stderr) != EOF && std::fflush(stderr) == 0;
+    } catch (...) {
+        return false;
+    }
 }
 
 struct AskArgs {
@@ -87,27 +92,6 @@ struct AskArgs {
     std::string session;
     std::string query;
 };
-
-Result<std::string> read_stdin(std::size_t max_bytes) {
-    std::string text;
-    std::string chunk(stdin_chunk_bytes, '\0');
-    while (true) {
-        const std::size_t got = std::fread(chunk.data(), 1, chunk.size(), stdin);
-        text.append(chunk, 0, got);
-        if (text.size() > max_bytes) {
-            return fail(Exit::refused, std::format("stdin is larger than {} bytes "
-                                                   "(OPENROUTER_CLI_MAX_INPUT_BYTES)",
-                                                   max_bytes));
-        }
-        if (got < chunk.size()) {
-            break;
-        }
-    }
-    if (std::ferror(stdin) != 0) {
-        return fail(Exit::usage, "could not read the query from stdin");
-    }
-    return text;
-}
 
 std::string join(const std::vector<std::string>& parts, std::string_view separator) {
     std::string joined;
@@ -131,8 +115,13 @@ FetchText catalog_fetcher(const Http& http) {
 }
 
 Result<Catalog> catalog_for(const Config& config, const Http& http, bool refresh) {
-    return load_catalog(config.state_dir, std::chrono::hours{config.catalog_ttl_hours},
-                        catalog_fetcher(http), refresh);
+    auto catalog = load_catalog(config.state_dir, std::chrono::hours{config.catalog_ttl_hours},
+                                catalog_fetcher(http), refresh);
+    if (catalog && catalog->stale) {
+        diagnostic("openrouter-cli: catalog refresh failed; using cached catalog from {}",
+                   display_metadata(catalog->fetched_at));
+    }
+    return catalog;
 }
 
 // ----- models subcommands -----------------------------------------------------------------
@@ -143,13 +132,6 @@ int cmd_models_find(const Config& config, const Http& http, const std::string& n
         return report(catalog.error());
     }
     auto matches = search(name, catalog->models);
-    if (matches.empty() && !refresh) {
-        catalog = catalog_for(config, http, true);
-        if (!catalog) {
-            return report(catalog.error());
-        }
-        matches = search(name, catalog->models);
-    }
     if (matches.empty()) {
         return report(
             Error{.code = Exit::model, .message = std::format("no model matches \"{}\"", name)});
@@ -159,24 +141,13 @@ int cmd_models_find(const Config& config, const Http& http, const std::string& n
 }
 
 // Resolves a name for display or saving; ambiguity and misses are reported with candidates.
-Result<ModelInfo> resolve_or_report(const Config& config, const Http& http,
+Result<ModelInfo> resolve_or_report(const Config& config, const Catalog& catalog,
                                     const std::string& name) {
-    auto catalog = catalog_for(config, http, false);
-    if (!catalog) {
-        return std::unexpected(catalog.error());
-    }
     auto aliases = load_aliases(config.state_dir);
     if (!aliases) {
         return std::unexpected(aliases.error());
     }
-    auto resolution = resolve(name, catalog->models, *aliases);
-    if (resolution.kind == Resolution::Kind::none) {
-        catalog = catalog_for(config, http, true);
-        if (!catalog) {
-            return std::unexpected(catalog.error());
-        }
-        resolution = resolve(name, catalog->models, *aliases);
-    }
+    auto resolution = resolve(name, catalog.models, *aliases);
     if (resolution.kind == Resolution::Kind::ambiguous) {
         std::print(stderr, "{}", format_candidates(resolution.candidates));
         return fail(Exit::model, std::format("\"{}\" matches {} models; pass one exact id from "
@@ -187,15 +158,6 @@ Result<ModelInfo> resolve_or_report(const Config& config, const Http& http,
         return fail(Exit::model, std::format("no model matches \"{}\"; try `openrouter-cli "
                                              "models find <words>`",
                                              name));
-    }
-    if (resolution.new_alias.has_value()) {
-        if (auto saved = save_alias(config.state_dir, *resolution.new_alias, resolution.model->id);
-            saved) {
-            std::println(stderr, "openrouter-cli: saved alias {} -> {}", *resolution.new_alias,
-                         resolution.model->id);
-        } else {
-            std::println(stderr, "openrouter-cli: could not save alias: {}", saved.error().message);
-        }
     }
     return std::move(*resolution.model);
 }
@@ -210,13 +172,13 @@ Result<std::vector<Endpoint>> endpoints_for(const Http& http, const std::string&
 }
 
 int cmd_models_show(const Config& config, const Http& http, const std::string& name) {
-    const auto model = resolve_or_report(config, http, name);
-    if (!model) {
-        return report(model.error());
-    }
     const auto catalog = catalog_for(config, http, false);
     if (!catalog) {
         return report(catalog.error());
+    }
+    const auto model = resolve_or_report(config, *catalog, name);
+    if (!model) {
+        return report(model.error());
     }
     std::print("{}", format_model(*model, catalog->fetched_at));
     const auto endpoints = endpoints_for(http, model->id);
@@ -254,7 +216,7 @@ int cmd_models_save(const Config& config, const Http& http, const AliasTarget& t
     if (auto saved = save_alias(config.state_dir, name, target.model_id); !saved) {
         return report(saved.error());
     }
-    std::println("saved alias {} -> {}", name, target.model_id);
+    std::println("saved alias {} -> {}", display_metadata(name), display_metadata(target.model_id));
     return code_of(Exit::ok);
 }
 
@@ -268,7 +230,8 @@ int cmd_models_list(const Config& config) {
         return code_of(Exit::ok);
     }
     for (const auto& [alias, entry] : *aliases) {
-        std::println("{} -> {} (saved {})", alias, entry.model_id, entry.saved);
+        std::println("{} -> {} (saved {})", display_metadata(alias),
+                     display_metadata(entry.model_id), display_metadata(entry.saved));
     }
     return code_of(Exit::ok);
 }
@@ -277,31 +240,7 @@ int cmd_models_list(const Config& config) {
 
 // The whole cost log, or an empty string when nothing has been logged yet.
 Result<std::string> read_cost_log(const Config& config) {
-    std::error_code error;
-    if (!fs::exists(config.cost_log, error)) {
-        return std::string();
-    }
-    if (auto checked = check_private_file(config.cost_log); !checked) {
-        return std::unexpected(checked.error());
-    }
-    std::ifstream file(config.cost_log, std::ios::binary);
-    if (!file.is_open()) {
-        return fail(Exit::config, "cannot read " + config.cost_log.string());
-    }
-    std::string contents;
-    std::string chunk(stdin_chunk_bytes, '\0');
-    for (;;) {
-        file.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
-        const auto got = static_cast<std::size_t>(file.gcount());
-        contents.append(chunk, 0, got);
-        if (got < chunk.size()) {
-            break;
-        }
-    }
-    if (file.bad() || !file.eof()) {
-        return fail(Exit::config, "error reading " + config.cost_log.string());
-    }
-    return contents;
+    return CostLog(config.cost_log, config.cost_log.parent_path() / "costs.lock").read_snapshot();
 }
 
 int cmd_spend(const Config& config, const std::string& since) {
@@ -357,19 +296,19 @@ Result<LookupOutcome> resolve_one(const Http& http, const CostLog& cost_log,
         if (response.error().code == Exit::interrupted) {
             return std::unexpected(response.error());
         }
-        std::println(stderr, "openrouter-cli: {}: {}", call.call_id, response.error().message);
+        diagnostic("openrouter-cli: {}: {}", call.call_id, response.error().message);
         return LookupOutcome::failed;
     }
     if (response->status == http_not_found) {
         return LookupOutcome::unknown;
     }
     if (!http_success(response->status)) {
-        std::println(stderr, "openrouter-cli: {}: HTTP {}", call.call_id, response->status);
+        diagnostic("openrouter-cli: {}: HTTP {}", call.call_id, response->status);
         return LookupOutcome::failed;
     }
     const auto stats = parse_generation(response->body);
     if (!stats) {
-        std::println(stderr, "openrouter-cli: {}: {}", call.call_id, stats.error().message);
+        diagnostic("openrouter-cli: {}: {}", call.call_id, stats.error().message);
         return LookupOutcome::failed;
     }
     if (!stats->total_cost.has_value()) {
@@ -378,7 +317,8 @@ Result<LookupOutcome> resolve_one(const Http& http, const CostLog& cost_log,
     if (auto logged = cost_log.append(resolved_record(call.call_id, *stats)); !logged) {
         return fail(Exit::persist, "cost log write failed: " + logged.error().message);
     }
-    std::println("{}  {}  ${:.6f}", call.call_id, call.model, *stats->total_cost);
+    std::println("{}  {}  ${:g}", display_metadata(call.call_id), display_metadata(call.model),
+                 *stats->total_cost);
     return LookupOutcome::resolved;
 }
 
@@ -389,6 +329,11 @@ int cmd_spend_resolve(const Config& config) {
     const auto contents = read_cost_log(config);
     if (!contents) {
         return report(contents.error());
+    }
+    const auto folded = fold_log({.contents = *contents, .since_iso = ""});
+    if (!folded.corrupt_lines.empty()) {
+        diagnostic("openrouter-cli: ignored {} corrupt cost-log records",
+                   folded.corrupt_lines.size());
     }
     const auto candidates = resolve_candidates(*contents);
     if (candidates.empty()) {
@@ -424,7 +369,8 @@ int cmd_spend_resolve(const Config& config) {
         }
     }
     if (!still_unknown.empty()) {
-        std::println("no charge yet at OpenRouter: {}", join(still_unknown, ", "));
+        std::println("no charge yet at OpenRouter: {}",
+                     display_metadata(join(still_unknown, ", ")));
     }
     std::println("resolved {}, still unknown {}, failed {}, of {} unresolved calls", resolved,
                  still_unknown.size(), failed, candidates.size());
@@ -449,7 +395,8 @@ Result<std::string> system_text(const AskArgs& args, const Config& config) {
     }
     std::string extra = args.system;
     if (extra.starts_with('@')) {
-        auto snapshot = read_snapshot(fs::path(extra.substr(1)), config.max_file_bytes);
+        auto snapshot = read_snapshot(fs::path(extra.substr(1)),
+                                      std::min(config.max_file_bytes, config.max_input_bytes));
         if (!snapshot) {
             return std::unexpected(snapshot.error());
         }
@@ -460,11 +407,13 @@ Result<std::string> system_text(const AskArgs& args, const Config& config) {
 
 Result<std::vector<FileSnapshot>> read_files(const AskArgs& args, const Config& config) {
     std::vector<FileSnapshot> files;
+    std::size_t remaining = config.max_input_bytes;
     for (const auto& path : args.files) {
-        auto snapshot = read_snapshot(fs::path(path), config.max_file_bytes);
+        auto snapshot = read_snapshot(fs::path(path), std::min(config.max_file_bytes, remaining));
         if (!snapshot) {
             return std::unexpected(snapshot.error());
         }
+        remaining -= snapshot->content.size();
         files.push_back(std::move(*snapshot));
     }
     return files;
@@ -482,10 +431,8 @@ Result<void> refuse_secrets(const std::vector<Message>& messages,
     std::ranges::move(scan_text({.text = prompt.query, .source = "query"}),
                       std::back_inserter(findings));
     for (const auto& message : messages) {
-        if (message.role != "system") {
-            std::ranges::move(scan_text({.text = message.content, .source = "session history"}),
-                              std::back_inserter(findings));
-        }
+        std::ranges::move(scan_text({.text = message.content, .source = "session history"}),
+                          std::back_inserter(findings));
     }
     for (const auto& file : files) {
         std::ranges::move(scan_text({.text = file.content, .source = file.display_path}),
@@ -495,8 +442,8 @@ Result<void> refuse_secrets(const std::vector<Message>& messages,
         return {};
     }
     for (const auto& finding : findings) {
-        std::println(stderr, "openrouter-cli: possible secret in {}:{} ({})", finding.source,
-                     finding.line, finding.pattern);
+        diagnostic("openrouter-cli: possible secret in {}:{} ({})", finding.source, finding.line,
+                   finding.pattern);
     }
     return fail(Exit::refused, "nothing was sent; remove or replace the values above and retry");
 }
@@ -514,7 +461,7 @@ Result<ModelInfo> session_model(const Config& config, const Http& http, const As
                                              data.model_id));
     }
     if (!args.model.empty()) {
-        auto requested = resolve_or_report(config, http, args.model);
+        auto requested = resolve_or_report(config, *catalog, args.model);
         if (!requested) {
             return std::unexpected(requested.error());
         }
@@ -559,7 +506,11 @@ Result<Conversation> prepare_conversation(Prepared& prepared, const AskArgs& arg
         if (args.model.empty()) {
             return fail(Exit::usage, "choose a model with -m (alias, id or plain name)");
         }
-        auto model = resolve_or_report(config, http, args.model);
+        const auto catalog = catalog_for(config, http, false);
+        if (!catalog) {
+            return std::unexpected(catalog.error());
+        }
+        auto model = resolve_or_report(config, *catalog, args.model);
         if (!model) {
             return std::unexpected(model.error());
         }
@@ -595,11 +546,28 @@ Result<Prepared> prepare(const AskArgs& args, const Config& config, const Http& 
     }
     const auto& [system, history] = *conversation;
 
+    std::size_t remaining = config.max_input_bytes;
+    const auto consume = [&](std::size_t bytes) {
+        if (bytes > remaining) {
+            return false;
+        }
+        remaining -= bytes;
+        return true;
+    };
+    if (!consume(system.size())) {
+        return fail(Exit::refused, "request text exceeds OPENROUTER_CLI_MAX_INPUT_BYTES");
+    }
+    for (const auto& message : history) {
+        if (!consume(message.content.size())) {
+            return fail(Exit::refused, "session history exceeds OPENROUTER_CLI_MAX_INPUT_BYTES");
+        }
+    }
     std::string query = args.query;
     if (query == "-") {
-        auto text = read_stdin(config.max_input_bytes);
+        auto text = read_input(remaining, false);
         if (!text) {
-            return std::unexpected(text.error());
+            return fail(text.error().code == Exit::usage ? Exit::refused : text.error().code,
+                        text.error().message);
         }
         query = std::move(*text);
     }
@@ -607,7 +575,12 @@ Result<Prepared> prepare(const AskArgs& args, const Config& config, const Http& 
         return fail(Exit::usage, "the query is empty");
     }
 
-    auto files = read_files(args, config);
+    if (!consume(query.size())) {
+        return fail(Exit::refused, "request text exceeds OPENROUTER_CLI_MAX_INPUT_BYTES");
+    }
+    Config input_config = config;
+    input_config.max_input_bytes = remaining;
+    auto files = read_files(args, input_config);
     if (!files) {
         return std::unexpected(files.error());
     }
@@ -615,8 +588,15 @@ Result<Prepared> prepare(const AskArgs& args, const Config& config, const Http& 
         return std::unexpected(clean.error());
     }
 
-    prepared.user_turn =
-        Message{.role = "user", .content = user_message(query, pack_files(*files))};
+    constexpr std::size_t separator_bytes = 2;
+    if (!files->empty() && !consume(separator_bytes)) {
+        return fail(Exit::refused, "request formatting exceeds OPENROUTER_CLI_MAX_INPUT_BYTES");
+    }
+    const auto packed = pack_files(*files, remaining);
+    if (!packed) {
+        return std::unexpected(packed.error());
+    }
+    prepared.user_turn = Message{.role = "user", .content = user_message(query, *packed)};
     if (!system.empty()) {
         prepared.messages.push_back(Message{.role = "system", .content = system});
     }
@@ -680,7 +660,10 @@ public:
         ends_with_newline_ = text.ends_with('\n');
     }
 
-    void finish() {
+    void finish(const fs::path& path) {
+        if (file_ok_ && !sync_file(descriptor_, path)) {
+            file_ok_ = false;
+        }
         if (stdout_ok_ && wrote_any_ && !ends_with_newline_ && std::fputc('\n', stdout) == EOF) {
             stdout_ok_ = false;
         }
@@ -747,31 +730,16 @@ bool stream_ended(const StreamRun& run) {
            run.transfer.transport_error.empty() && !run.parse_error.has_value();
 }
 
-void report_wait(const std::atomic<std::size_t>& received, Clock::time_point started,
-                 const std::stop_token& stop) {
-    auto next = started + heartbeat_interval;
-    while (!stop.stop_requested()) {
-        std::this_thread::sleep_for(heartbeat_slice);
-        if (Clock::now() >= next && !stop.stop_requested()) {
-            const auto elapsed =
-                std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - started);
-            std::println(stderr, "openrouter-cli: waiting, {}s elapsed, {} bytes received",
-                         elapsed.count(), received.load());
-            next += heartbeat_interval;
-        }
-    }
-}
-
 StreamRun run_stream(const Http& http, const Prepared& prepared, AnswerSink& sink,
                      const CostLog& cost_log, const std::string& call_id) {
     StreamRun run;
     SseParser parser;
     ChatStream chat;
-    std::atomic<std::size_t> received{0};
+    std::size_t received = 0;
     bool generation_logged = false;
 
     const auto log_generation = [&](std::string_view generation_id) {
-        if (generation_logged || generation_id.empty()) {
+        if (generation_logged || !valid_generation_id(generation_id)) {
             return;
         }
         generation_logged = true;
@@ -781,15 +749,14 @@ StreamRun run_stream(const Http& http, const Prepared& prepared, AnswerSink& sin
             logged) {
             run.generation_saved = true;
         } else {
-            std::println(stderr, "openrouter-cli: cost log write failed: {}",
-                         logged.error().message);
+            diagnostic("openrouter-cli: cost log write failed: {}", logged.error().message);
         }
     };
 
     StreamHandlers handlers;
     handlers.on_generation_id = log_generation;
     handlers.on_body_bytes = [&](std::string_view bytes) {
-        received.fetch_add(bytes.size());
+        received += bytes.size();
         if (run.parse_error.has_value()) {
             return;
         }
@@ -812,16 +779,22 @@ StreamRun run_stream(const Http& http, const Prepared& prepared, AnswerSink& sin
     };
 
     const auto started = Clock::now();
-    std::jthread heartbeat([&received, started](const std::stop_token& stop) {
-        report_wait(received, started, stop);
-    });
+    auto next = started + heartbeat_interval;
+    handlers.should_continue = [&] { return !run.parse_error.has_value(); };
+    handlers.on_progress = [&] {
+        if (Clock::now() >= next) {
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - started);
+            diagnostic("openrouter-cli: waiting, {}s elapsed, {} bytes received", elapsed.count(),
+                       received);
+            next = Clock::now() + heartbeat_interval;
+        }
+    };
 
     // Replacement keeps a file with invalid UTF-8 from aborting the call; dump() throws otherwise.
     const std::string body =
         prepared.request.body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
     run.transfer = http.post_stream("/chat/completions", body, handlers);
-    heartbeat.request_stop();
-    heartbeat.join();
     run.latency_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
 
@@ -859,7 +832,7 @@ std::string incomplete_reason(const StreamOutcome& outcome, long long max_tokens
     if (!outcome.done) {
         return "the stream ended before the model finished";
     }
-    return std::format("the model stopped with finish reason \"{}\"", reason.value_or("unknown"));
+    return "the provider stopped the answer with an unsupported finish reason";
 }
 
 Verdict judge(const StreamRun& run, long long max_tokens) {
@@ -899,6 +872,9 @@ Verdict judge(const StreamRun& run, long long max_tokens) {
     if (outcome.error_code.has_value() || outcome.error_type.has_value() ||
         outcome.error_message.has_value() || !run.transfer.event_stream) {
         std::string text = std::format("OpenRouter error (HTTP {}", run.transfer.status);
+        if (outcome.error_code.has_value()) {
+            text += ", code " + *outcome.error_code;
+        }
         if (outcome.error_type.has_value()) {
             text += ", " + *outcome.error_type;
         }
@@ -908,7 +884,8 @@ Verdict judge(const StreamRun& run, long long max_tokens) {
         }
         if (run.transfer.status == http_unauthorized) {
             text += "; the stored API key was rejected: run `openrouter-cli auth login --replace`";
-        } else if (run.transfer.status == http_not_found) {
+        } else if (run.transfer.status == http_not_found ||
+                   run.transfer.status == http_unavailable) {
             text += "; check the -p tags with `openrouter-cli models show MODEL`, and under "
                     "--privacy zdr try --privacy no-training";
         }
@@ -994,7 +971,7 @@ struct Aftermath {
 
 void note_unsaved(Aftermath& after, const Result<void>& saved, std::string_view what) {
     if (!saved) {
-        std::println(stderr, "openrouter-cli: saving {} failed: {}", what, saved.error().message);
+        diagnostic("openrouter-cli: saving {} failed: {}", what, saved.error().message);
         after.unsaved.emplace_back(what);
     }
 }
@@ -1003,15 +980,28 @@ Aftermath record_outcome(const Http& http, const CostLog& cost_log, const std::s
                          const StreamRun& run, const Verdict& verdict) {
     Aftermath after;
     after.shown = result_for(call_id, verdict, run);
+    constexpr std::chrono::seconds cleanup_window{2};
+    LockDeadline cleanup_deadline;
+    const auto append = [&](const nlohmann::json& record) {
+        if (interrupt_requested() && !cleanup_deadline.has_value()) {
+            cleanup_deadline = Clock::now() + cleanup_window;
+        }
+        auto saved = cost_log.append(record, cleanup_deadline);
+        if (!saved && saved.error().code == Exit::interrupted && !cleanup_deadline.has_value()) {
+            cleanup_deadline = Clock::now() + cleanup_window;
+            saved = cost_log.append(record, cleanup_deadline);
+        }
+        return saved;
+    };
     // A first append that failed mid-stream is retried here; without the id `spend --resolve`
     // could never recover this call's charge.
     if (run.generation_id.has_value() && !run.generation_saved) {
-        note_unsaved(after,
-                     cost_log.append(generation_record(
-                         {.call_id = call_id, .generation_id = *run.generation_id})),
-                     "the generation id");
+        note_unsaved(
+            after,
+            append(generation_record({.call_id = call_id, .generation_id = *run.generation_id})),
+            "the generation id");
     }
-    note_unsaved(after, cost_log.append(result_record(after.shown)), "the cost record");
+    note_unsaved(after, append(result_record(after.shown)), "the cost record");
     if (after.shown.usage.cost.has_value() || !run.generation_id.has_value() ||
         !stream_ended(run)) {
         return after;
@@ -1022,8 +1012,7 @@ Aftermath record_outcome(const Http& http, const CostLog& cost_log, const std::s
         return after;
     }
     if (stats->has_value() && (*stats)->total_cost.has_value()) {
-        note_unsaved(after, cost_log.append(resolved_record(call_id, **stats)),
-                     "the looked-up cost");
+        note_unsaved(after, append(resolved_record(call_id, **stats)), "the looked-up cost");
         after.shown.usage.cost = (*stats)->total_cost;
         if (!after.shown.provider.has_value()) {
             after.shown.provider = (*stats)->provider;
@@ -1035,10 +1024,10 @@ Aftermath record_outcome(const Http& http, const CostLog& cost_log, const std::s
 // Precedence: Ctrl-C (also during the cost lookup), then API/incomplete outcomes, then a
 // failed save of a call that may have been billed.
 int final_exit(const Verdict& verdict, const Aftermath& after) {
-    if (verdict.exit == Exit::interrupted || after.lookup_interrupted) {
+    if (verdict.exit == Exit::interrupted || after.lookup_interrupted || interrupt_requested()) {
         if (after.lookup_interrupted) {
-            std::println(stderr, "openrouter-cli: interrupted while looking up the cost; run "
-                                 "`openrouter-cli spend --resolve` later");
+            diagnostic("openrouter-cli: interrupted while looking up the cost; run "
+                       "`openrouter-cli spend --resolve` later");
         }
         return code_of(Exit::interrupted);
     }
@@ -1046,10 +1035,9 @@ int final_exit(const Verdict& verdict, const Aftermath& after) {
         return code_of(verdict.exit);
     }
     if (!after.unsaved.empty()) {
-        std::println(stderr,
-                     "openrouter-cli: the answer arrived (the call may have been billed) but "
-                     "saving failed: {}; do not retry automatically",
-                     join(after.unsaved, ", "));
+        diagnostic("openrouter-cli: the answer arrived (the call may have been billed) but "
+                   "saving failed: {}; do not retry automatically",
+                   join(after.unsaved, ", "));
         return code_of(Exit::persist);
     }
     return code_of(Exit::ok);
@@ -1079,6 +1067,9 @@ int cmd_ask(const AskArgs& args, const Config& config, const Http& http) {
         // Nothing was sent, so the empty answer file would only mislead.
         std::error_code ignored;
         fs::remove(answer_path, ignored);
+        if (logged.error().code == Exit::interrupted) {
+            return report(logged.error());
+        }
         return report(Error{
             .code = Exit::refused,
             .message = "nothing was sent because the cost log could not be "
@@ -1086,14 +1077,16 @@ int cmd_ask(const AskArgs& args, const Config& config, const Http& http) {
                        logged.error().message,
         });
     }
-    std::println(stderr, "openrouter-cli: asking {} (effort {}, up to {} output tokens, {}{})",
-                 prepared->model.id, prepared->request.effort_sent.value_or("default"),
-                 prepared->request.max_tokens, pending.privacy,
-                 args.providers.empty() ? std::string()
-                                        : ", providers " + join(args.providers, ","));
+    diagnostic("openrouter-cli: asking {} (effort {}, up to {} output tokens, {}{})",
+               display_metadata(prepared->model.id),
+               display_metadata(prepared->request.effort_sent.value_or("default")),
+               prepared->request.max_tokens, pending.privacy,
+               args.providers.empty()
+                   ? std::string()
+                   : ", providers " + display_metadata(join(args.providers, ",")));
 
     const StreamRun run = run_stream(http, *prepared, *sink, cost_log, call_id);
-    sink->finish();
+    sink->finish(answer_path);
     const Verdict verdict = judge(run, prepared->request.max_tokens);
     Aftermath after = record_outcome(http, cost_log, call_id, run, verdict);
 
@@ -1105,15 +1098,15 @@ int cmd_ask(const AskArgs& args, const Config& config, const Http& http) {
             "the session");
     }
     if (!sink->file_ok()) {
-        std::println(stderr, "openrouter-cli: writing {} failed; the answer is incomplete on disk",
-                     answer_path.string());
+        diagnostic("openrouter-cli: writing {} failed; the answer is incomplete on disk",
+                   answer_path.string());
         after.unsaved.emplace_back("the answer file");
     }
     if (!verdict.message.empty()) {
-        std::println(stderr, "openrouter-cli: {}", verdict.message);
+        diagnostic("openrouter-cli: {}", verdict.message);
     }
-    std::println(stderr, "openrouter-cli: {}",
-                 format_cost_line(after.shown, prepared->model.id, answer_path.string()));
+    diagnostic("openrouter-cli: {}",
+               format_cost_line(after.shown, prepared->model.id, answer_path.string()));
     return final_exit(verdict, after);
 }
 
@@ -1426,8 +1419,10 @@ int run(std::span<char* const> argv) {
     }
     const char* home_env = std::getenv("HOME");
     const char* xdg_env = std::getenv("XDG_STATE_HOME");
-    const auto config = load_config(default_home(), home_env == nullptr ? "" : home_env,
-                                    xdg_env == nullptr ? "" : xdg_env);
+    const char* config_env = std::getenv("XDG_CONFIG_HOME");
+    const auto config =
+        load_config(default_home(), home_env == nullptr ? "" : home_env,
+                    xdg_env == nullptr ? "" : xdg_env, config_env == nullptr ? "" : config_env);
     if (!config) {
         return report(config.error());
     }

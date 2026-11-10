@@ -1,15 +1,14 @@
 #include "context.hpp"
 
 #include "common.hpp"
+#include "fsutil.hpp"
 #include "secrets.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <filesystem>
 #include <format>
-#include <fstream>
-#include <ios>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -22,31 +21,7 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr std::size_t kBinaryProbeBytes = 8192;
-constexpr std::size_t kReadChunkBytes = 65536;
 constexpr std::size_t kMinFenceLength = 3;
-
-// Reads in chunks and enforces the limit while reading, so a file that grows after the size
-// check still cannot exceed it. Messages omit the path; the caller adds it.
-Result<std::string> read_limited(const fs::path& resolved, std::size_t max_bytes) {
-    std::ifstream input(resolved, std::ios::binary);
-    if (!input.is_open()) {
-        return fail(Exit::usage, "cannot be opened");
-    }
-    std::string content;
-    std::array<char, kReadChunkBytes> buffer{};
-    while (input.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) ||
-           input.gcount() > 0) {
-        const auto count = static_cast<std::size_t>(input.gcount());
-        if (count > max_bytes - content.size()) {
-            return fail(Exit::refused, std::format("grew past the {}-byte limit", max_bytes));
-        }
-        content.append(buffer.data(), count);
-    }
-    if (input.bad()) {
-        return fail(Exit::usage, "could not be read");
-    }
-    return content;
-}
 
 std::size_t count_lines(std::string_view content) {
     const auto newlines = static_cast<std::size_t>(std::ranges::count(content, '\n'));
@@ -96,7 +71,7 @@ Result<FileSnapshot> read_snapshot(const std::filesystem::path& path, std::size_
         return fail(Exit::refused,
                     std::format("{} is {} bytes, over the {}-byte limit", shown, size, max_bytes));
     }
-    auto content = read_limited(resolved, max_bytes);
+    auto content = read_regular_file(resolved, max_bytes);
     if (!content.has_value()) {
         return fail(content.error().code, std::format("{} {}", shown, content.error().message));
     }
@@ -123,19 +98,44 @@ std::string fence_for(std::string_view content) {
     return fence;
 }
 
-std::string pack_files(const std::vector<FileSnapshot>& files) {
+Result<std::string> pack_files(const std::vector<FileSnapshot>& files, std::size_t max_bytes) {
     std::string out;
     for (const FileSnapshot& file : files) {
+        const std::string fence = fence_for(file.content);
+        const std::size_t lines = count_lines(file.content);
+        const std::size_t width = std::formatted_size("{}", lines);
+        std::size_t remaining = max_bytes - out.size();
+        const auto consume = [&remaining](std::size_t bytes) {
+            if (bytes > remaining) {
+                return false;
+            }
+            remaining -= bytes;
+            return true;
+        };
+        constexpr std::size_t heading_overhead = 9;
+        constexpr std::size_t line_prefix_overhead = 3;
+        const bool has_final_newline = file.content.ends_with('\n');
+        if (!consume(out.empty() ? 0 : 1) || !consume(heading_overhead) ||
+            !consume(file.display_path.size()) || !consume(fence.size()) ||
+            !consume(fence.size()) || !consume(file.content.size()) ||
+            (!file.content.empty() && !has_final_newline && !consume(1)) ||
+            (lines > 0 && (width + line_prefix_overhead > remaining / lines ||
+                           !consume(lines * (width + line_prefix_overhead))))) {
+            return fail(Exit::refused, "packed file context exceeds the aggregate input limit");
+        }
         if (!out.empty()) {
             out += '\n';
         }
-        const std::string fence = fence_for(file.content);
         out += std::format("File: {}\n{}\n", file.display_path, fence);
         append_numbered_lines(out, file.content);
         out += fence;
         out += '\n';
     }
     return out;
+}
+
+std::string pack_files(const std::vector<FileSnapshot>& files) {
+    return pack_files(files, std::numeric_limits<std::size_t>::max()).value();
 }
 
 } // namespace orcli

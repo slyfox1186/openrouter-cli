@@ -12,9 +12,6 @@
 #include <expected>
 #include <filesystem>
 #include <format>
-#include <fstream>
-#include <ios>
-#include <iterator>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -32,6 +29,7 @@ constexpr std::size_t max_session_name_length = 64;
 constexpr std::size_t uuid_bytes = 16;
 constexpr long long session_format_version = 1;
 constexpr int json_indent = 2;
+constexpr std::size_t max_session_bytes = 128 * 1024 * 1024;
 
 bool session_name_char(char letter) {
     return (letter >= 'a' && letter <= 'z') || (letter >= 'A' && letter <= 'Z') ||
@@ -55,7 +53,7 @@ std::unexpected<Error> corrupt(const fs::path& file) {
 
 std::optional<std::vector<Message>> parse_history(const nlohmann::json& root) {
     const auto found = root.find("history");
-    if (found == root.end() || !found->is_array()) {
+    if (found == root.end() || !found->is_array() || found->size() % 2 != 0) {
         return std::nullopt;
     }
     std::vector<Message> history;
@@ -63,7 +61,7 @@ std::optional<std::vector<Message>> parse_history(const nlohmann::json& root) {
     for (const nlohmann::json& entry : *found) {
         auto role = string_at(entry, "role");
         auto content = string_at(entry, "content");
-        if (!role || !content) {
+        if (!role || !content || *role != (history.size() % 2 == 0 ? "user" : "assistant")) {
             return std::nullopt;
         }
         history.push_back(Message{.role = std::move(*role), .content = std::move(*content)});
@@ -78,14 +76,21 @@ Result<SessionData> parse_session(std::string_view text, const fs::path& file) {
     }
     const auto version = root.find("v");
     if (version == root.end() || !version->is_number_integer() ||
-        version->get<long long>() != session_format_version) {
+        *version != session_format_version) {
         return corrupt(file);
     }
     auto model_id = string_at(root, "model_id");
     auto system_prompt = string_at(root, "system_prompt");
     auto session_uuid = string_at(root, "session_uuid");
     auto history = parse_history(root);
-    if (!model_id || !system_prompt || !session_uuid || !history) {
+    if (!model_id || model_id->empty() || !system_prompt || !session_uuid ||
+        session_uuid->size() != uuid_bytes * 2 ||
+        !std::ranges::all_of(*session_uuid,
+                             [](char letter) {
+                                 return (letter >= '0' && letter <= '9') ||
+                                        (letter >= 'a' && letter <= 'f');
+                             }) ||
+        !history) {
         return corrupt(file);
     }
     return SessionData{
@@ -115,25 +120,14 @@ std::string serialize(const SessionData& data) {
     return root.dump(json_indent, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
 }
 
-Result<std::string> read_text(const fs::path& file) {
-    std::ifstream input(file, std::ios::binary);
-    if (!input.is_open()) {
-        return fail(Exit::config, std::format("cannot read session file {}", file.string()));
-    }
-    std::string text{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    if (input.bad()) {
-        return fail(Exit::config, std::format("cannot read session file {}", file.string()));
-    }
-    return text;
-}
-
 Result<SessionData> load_session(const fs::path& file) {
     const auto checked = check_private_file(file);
     if (!checked) {
         return std::unexpected(checked.error());
     }
-    return read_text(file).and_then(
-        [&](const std::string& text) { return parse_session(text, file); });
+    return read_regular_file(file, max_session_bytes).and_then([&](const std::string& text) {
+        return parse_session(text, file);
+    });
 }
 
 } // namespace
@@ -190,6 +184,9 @@ Result<void> Session::create(const std::string& model_id, const std::string& sys
         return fail(Exit::usage, "the session already exists; its model and system prompt are "
                                  "fixed at creation");
     }
+    if (model_id.empty()) {
+        return fail(Exit::usage, "the session model must not be empty");
+    }
     data_ = SessionData{
         .model_id = model_id,
         .system_prompt = system_prompt,
@@ -203,10 +200,20 @@ Result<void> Session::commit(const Message& user, const Message& assistant) {
     if (data_.session_uuid.empty()) {
         return fail(Exit::usage, "internal error: a new session was committed before create");
     }
+    if (user.role != "user" || assistant.role != "assistant") {
+        return fail(Exit::usage,
+                    "a session exchange must contain one user and one assistant message");
+    }
     SessionData updated = data_;
     updated.history.push_back(user);
     updated.history.push_back(assistant);
-    const auto written = atomic_write(file_, serialize(updated));
+    const std::string serialized = serialize(updated);
+    if (serialized.size() > max_session_bytes) {
+        return fail(
+            Exit::config,
+            "session exceeds the 128 MiB serialized limit; the previous session is unchanged");
+    }
+    const auto written = atomic_write(file_, serialized);
     if (!written) {
         return std::unexpected(written.error());
     }

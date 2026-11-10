@@ -21,8 +21,9 @@ struct PlaintextKey {
 };
 
 struct Config {
-    std::filesystem::path home;      // project directory holding .env and state/
-    std::filesystem::path state_dir; // home / "state"
+    std::filesystem::path home; // legacy override, empty for XDG storage
+    std::filesystem::path env_file;
+    std::filesystem::path state_dir;
     std::filesystem::path
         cost_log; // $XDG_STATE_HOME or ~/.local/state, then openrouter-cli/costs.jsonl
     std::string base_url;
@@ -50,18 +51,19 @@ Result<std::map<std::string, std::string>> parse_env(std::string_view text);
 // the last of duplicate keys, which would hide a plaintext key followed by an empty duplicate.
 std::vector<PlaintextKey> find_plaintext_keys(std::string_view env_text);
 
-// Project directory: OPENROUTER_CLI_HOME if set, else the directory compiled in at build time.
+// Legacy override from OPENROUTER_CLI_HOME, or empty for XDG defaults.
 std::filesystem::path default_home();
 
-// Loads the non-secret settings from home/.env. A missing .env means every setting takes its
-// default. An existing .env must be a regular file owned by the user with no group or other
-// permission bits, and every setting must be valid (Exit::config with the path otherwise).
+// Loads XDG config.env, or home/.env for a nonempty absolute legacy override. Missing settings
+// use defaults without creating directories. Existing settings require ownership and no group or
+// other permission bits, and every setting must be valid (Exit::config with the path otherwise).
 // Plaintext key assignments are reported in Config::plaintext_keys, not rejected here; the
-// caller decides (every command except `auth set` and `auth login` refuses).
-// user_home is $HOME; xdg_state_home is $XDG_STATE_HOME or empty.
+// caller decides which credential-recovery commands may proceed.
+// user_home is HOME; relative or empty XDG paths use the corresponding HOME fallback.
 Result<Config> load_config(const std::filesystem::path& home,
                            const std::filesystem::path& user_home,
-                           const std::filesystem::path& xdg_state_home);
+                           const std::filesystem::path& xdg_state_home,
+                           const std::filesystem::path& xdg_config_home = {});
 
 } // namespace orcli
 

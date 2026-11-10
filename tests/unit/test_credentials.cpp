@@ -83,14 +83,27 @@ orcli::CredsTool fake_tool() {
     return orcli::CredsTool{.program = ORCLI_FAKE_CREDS_TOOL, .timeout = short_timeout};
 }
 
+std::string shell_quote(std::string_view value) {
+    std::string quoted = "'";
+    for (const char letter : value) {
+        if (letter == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += letter;
+        }
+    }
+    quoted += '\'';
+    return quoted;
+}
+
 // A wrapper that turns on one FAKE_CREDS_* switch for the fake tool only, so tests never change
 // this process's environment.
 orcli::CredsTool fake_tool_with(const TempDir& temp, std::string_view setting) {
     const fs::path wrapper = temp.path() / std::format("fake-{}.sh", setting);
     {
         std::ofstream script(wrapper, std::ios::binary);
-        script << std::format("#!/bin/sh\n{}=1\nexport {}\nexec '{}' \"$@\"\n", setting, setting,
-                              ORCLI_FAKE_CREDS_TOOL);
+        script << std::format("#!/bin/sh\n{}=1\nexport {}\nexec {} \"$@\"\n", setting, setting,
+                              shell_quote(ORCLI_FAKE_CREDS_TOOL));
     }
     fs::permissions(wrapper, fs::perms::owner_all);
     return orcli::CredsTool{.program = wrapper, .timeout = short_timeout};
@@ -442,4 +455,17 @@ TEST_CASE("SecretString moves leave the source empty and clone copies") {
 TEST_CASE("credential names differ per kind") {
     CHECK(orcli::credential_name(KeyKind::inference) == "openrouter-cli-api-key");
     CHECK(orcli::credential_name(KeyKind::management) == "openrouter-cli-management-key");
+}
+
+TEST_CASE("stored ciphertext is bounded before invoking the credential tool") {
+    const TempDir temp;
+    const auto directory = temp.state() / "credentials";
+    REQUIRE(orcli::ensure_private_dir(directory).has_value());
+    const auto path = directory / "api-key.cred";
+    REQUIRE(orcli::atomic_write(path, "ciphertext").has_value());
+    constexpr std::uintmax_t max_ciphertext_bytes = 64 * 1024;
+    fs::resize_file(path, max_ciphertext_bytes + 1);
+    const auto loaded = orcli::load_key(fake_tool(), temp.state(), KeyKind::inference);
+    REQUIRE_FALSE(loaded.has_value());
+    CHECK(loaded.error().message.contains("byte limit"));
 }

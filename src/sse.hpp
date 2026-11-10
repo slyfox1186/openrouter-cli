@@ -40,7 +40,7 @@ struct StreamOutcome {
     std::optional<std::string> provider;
     std::optional<std::string> error_code;
     std::optional<std::string> error_type;
-    std::optional<std::string> error_message; // raw provider text; callers sanitize before display
+    std::optional<std::string> error_message; // local guidance; never provider prose
     Usage usage;
     bool done = false;
 };

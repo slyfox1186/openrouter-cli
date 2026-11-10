@@ -9,18 +9,88 @@ include(CheckPIESupported)
 check_pie_supported()
 
 option(ORCLI_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
-option(ORCLI_NATIVE "Optimize release builds for the CPU of the building machine" ON)
+option(ORCLI_NATIVE "Optimize release builds for the CPU of the building machine" OFF)
 include(CTest)
 include(FetchContent)
 
-# ---------------------------------------------------------------------------------------------
-# Third-party code: release archives pinned by SHA-256 so a moved tag or tampered download fails
-# the build. Everything that ends up in the binary is linked statically; only glibc stays shared,
-# because a statically linked glibc cannot resolve host names reliably on other systems.
-# ---------------------------------------------------------------------------------------------
+# Check the supported platform and actual facilities before downloading dependencies.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    message(FATAL_ERROR "openrouter-cli supports Linux x86-64 with glibc")
+endif()
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    message(FATAL_ERROR "openrouter-cli requires Clang for C and C++")
+endif()
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles([[
+    #include <features.h>
+    #ifndef __GLIBC__
+    #error "glibc is required"
+    #endif
+    #include <chrono>
+    #include <expected>
+    #include <flat_map>
+    #include <format>
+    #include <functional>
+    #include <numeric>
+    #include <print>
+    #include <ranges>
+    #include <span>
+    #include <sstream>
+    #include <string>
+    #include <thread>
+    #include <vector>
+    struct Noncopyable { Noncopyable(const Noncopyable&) = delete("not copyable"); };
+    int main() {
+        std::expected<int, int> value{1};
+        auto mapped = value.transform([](int n) { return n + 1; });
+        std::flat_map<int, int> table;
+        table[1] = *mapped;
+        const std::vector<int> values{1, 2};
+        auto copy = values | std::ranges::to<std::vector<int>>();
+        for (const auto [index, element] : copy | std::views::enumerate) {
+            table[static_cast<int>(index)] = element;
+        }
+        for (const auto [left, right] : std::views::zip(values, copy)) {
+            table[left] = right;
+        }
+        const std::vector<std::string> words{"one", "two"};
+        auto joined = words | std::views::join_with(' ') | std::ranges::to<std::string>();
+        std::chrono::sys_seconds timestamp{};
+        std::istringstream input{"2026-01-01T00:00:00Z"};
+        input >> std::chrono::parse("%FT%TZ", timestamp);
+        std::println("{} {:%FT%TZ}", joined, timestamp);
+        std::move_only_function<int()> function = [] { return 1; };
+        std::jthread worker([] {});
+        const std::span<const int> view{values};
+        std::println("{}", std::format("{}", std::add_sat(function(), view.front())));
+        return std::mul_sat(0, table[1]);
+    }
+]] ORCLI_HAS_REQUIRED_CXX26)
+if(NOT ORCLI_HAS_REQUIRED_CXX26)
+    message(FATAL_ERROR "The selected compiler/standard library lacks required C++26 facilities; see CMakeFiles/CMakeConfigureLog.yaml")
+endif()
 
+set(CMAKE_SKIP_RPATH TRUE)
+set(OPENSSL_USE_STATIC_LIBS FALSE)
+find_package(OpenSSL 3 REQUIRED COMPONENTS SSL Crypto)
+foreach(_library IN ITEMS OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
+    if(NOT "${${_library}}" MATCHES "\\.so(\\.[0-9]+)*$")
+        message(FATAL_ERROR "Shared system OpenSSL is required; discard static-library caches with scripts/build.sh --fresh")
+    endif()
+endforeach()
+find_package(Threads REQUIRED)
+file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/openssl-libraries.txt"
+    CONTENT "$<TARGET_FILE:OpenSSL::SSL>\n$<TARGET_FILE:OpenSSL::Crypto>\n")
+
+set(ORCLI_DOWNLOAD_USER_AGENT "Mozilla/5.0 (X11; Linux x86_64; rv:159.0) Gecko/20100101 Firefox/159.0")
+set(CMAKE_TLS_VERIFY TRUE)
+
+# HTTP_HEADER is a list. Keep the reference literal until the generated download script
+# expands it inside one quoted argument; CMP0168 NEW preserves this variable's scope.
 FetchContent_Declare(nlohmann_json
     URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+    TLS_VERIFY TRUE
+    HTTP_HEADER [=[User-Agent: ${ORCLI_DOWNLOAD_USER_AGENT}]=]
     URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
     EXCLUDE_FROM_ALL SYSTEM)
 
@@ -30,48 +100,23 @@ set(CLI11_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(CLI11_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(cli11
     URL https://github.com/CLIUtils/CLI11/archive/refs/tags/v2.7.2.tar.gz
+    TLS_VERIFY TRUE
+    HTTP_HEADER [=[User-Agent: ${ORCLI_DOWNLOAD_USER_AGENT}]=]
     URL_HASH SHA256=46eef3101da70852ec7af026e09d485ccee81813331c8c6052d39344443b83da
-    EXCLUDE_FROM_ALL SYSTEM)
-
-# Ubuntu's static libcrypto.a calls into jitterentropy, whose static library is not installed;
-# 3.6.3 matches the version Ubuntu's OpenSSL was built against. Its own CMake compiles it -O0,
-# which the library requires for entropy quality.
-set(STACK_PROTECTOR ON CACHE BOOL "" FORCE)
-set(INTERNAL_TIMER ON CACHE BOOL "" FORCE)
-FetchContent_Declare(jitterentropy
-    URL https://github.com/smuellerDD/jitterentropy-library/archive/refs/tags/v3.6.3.tar.gz
-    URL_HASH SHA256=9b3819e275e6473a94c70cfaae7cc2a87a11f60b862e694745daa5d232b0eea3
     EXCLUDE_FROM_ALL SYSTEM)
 
 FetchContent_Declare(curl
     URL https://github.com/curl/curl/releases/download/curl-8_23_0/curl-8.23.0.tar.xz
+    TLS_VERIFY TRUE
+    HTTP_HEADER [=[User-Agent: ${ORCLI_DOWNLOAD_USER_AGENT}]=]
     URL_HASH SHA256=8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5
     EXCLUDE_FROM_ALL SYSTEM)
 
-# Dependencies build static libraries. BUILD_TESTING is a normal variable here so curl's and
-# jitterentropy's own test suites stay off while ours keeps its cache value.
+# Keep dependency tests disabled without changing this project's cached BUILD_TESTING.
 set(_orcli_build_testing ${BUILD_TESTING})
 set(BUILD_TESTING OFF)
 set(BUILD_SHARED_LIBS OFF)
-
 FetchContent_MakeAvailable(nlohmann_json cli11)
-# jitterentropy 3.6.3 requests CMake 2.8.12 policies, which CMake 4 rejects. A 3.10 floor
-# also avoids the deprecation warning. Keep higher caller floors and restore the prior value.
-block(SCOPE_FOR VARIABLES)
-    if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM OR CMAKE_POLICY_VERSION_MINIMUM VERSION_LESS 3.10)
-        set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
-    endif()
-    FetchContent_MakeAvailable(jitterentropy)
-endblock()
-
-set(OPENSSL_USE_STATIC_LIBS TRUE)
-find_package(OpenSSL 3 REQUIRED)
-find_library(ORCLI_ZLIB_STATIC NAMES libz.a REQUIRED)
-find_library(ORCLI_ZSTD_STATIC NAMES libzstd.a REQUIRED)
-find_package(Threads REQUIRED)
-# What `pkg-config --static --libs libcrypto` lists on Ubuntu 26.04, with jitterentropy built above.
-set_property(TARGET OpenSSL::Crypto APPEND PROPERTY INTERFACE_LINK_LIBRARIES
-    jitterentropy ${ORCLI_ZLIB_STATIC} ${ORCLI_ZSTD_STATIC} ${CMAKE_DL_LIBS} Threads::Threads)
 
 # HTTP is needed by the offline mock server; HTTPS serves the API.
 # Disable other protocols and unused optional libraries.
@@ -85,6 +130,7 @@ set(CURL_ENABLE_EXPORT_TARGET OFF)
 set(CURL_DISABLE_INSTALL ON)
 set(PICKY_COMPILER OFF)
 set(CURL_USE_OPENSSL ON)
+set(ENABLE_THREADED_RESOLVER ON CACHE BOOL "Use asynchronous threaded DNS" FORCE)
 set(CURL_USE_LIBPSL OFF)
 set(CURL_USE_LIBSSH2 OFF)
 set(CURL_USE_LIBSSH OFF)
@@ -163,14 +209,6 @@ target_include_directories(orcli_core PUBLIC src)
 # credentials.cpp (OPENSSL_cleanse) call it, not only libcurl.
 target_link_libraries(orcli_core PUBLIC
     nlohmann_json::nlohmann_json CURL::libcurl OpenSSL::Crypto orcli_flags)
-# The project directory is compiled in so the binary finds .env and state/ from any directory.
-target_compile_definitions(orcli_core PRIVATE ORCLI_DEFAULT_HOME="${CMAKE_SOURCE_DIR}")
-# Test builds may swap systemd-creds for a fake (OPENROUTER_CLI_TEST_CREDS_TOOL); the release
-# preset turns BUILD_TESTING off, so the installed binary never honours that variable.
-if(BUILD_TESTING)
-    target_compile_definitions(orcli_core PRIVATE ORCLI_TEST_HOOKS)
-endif()
-
 # The help formatter is its own library so the unit tests can render pages without main.cpp.
 add_library(orcli_help STATIC src/help.cpp)
 target_include_directories(orcli_help PUBLIC src)
@@ -181,8 +219,14 @@ target_link_libraries(openrouter-cli PRIVATE orcli_core orcli_help CLI11::CLI11 
 target_link_options(openrouter-cli PRIVATE -static-libstdc++ -static-libgcc)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    set_property(TARGET orcli_core orcli_help openrouter-cli
-        PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT ORCLI_IPO_SUPPORTED OUTPUT ORCLI_IPO_ERROR LANGUAGES CXX)
+    if(ORCLI_IPO_SUPPORTED)
+        set_property(TARGET orcli_core orcli_help openrouter-cli
+            PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+    else()
+        message(STATUS "Link-time optimization unavailable; building without it: ${ORCLI_IPO_ERROR}")
+    endif()
 endif()
 
 if(BUILD_TESTING)
@@ -190,10 +234,14 @@ if(BUILD_TESTING)
     # projects (tests, examples, optional TLS and compression probes) are never configured.
     FetchContent_Declare(doctest
         URL https://github.com/doctest/doctest/archive/refs/tags/v2.5.3.tar.gz
+        TLS_VERIFY TRUE
+        HTTP_HEADER [=[User-Agent: ${ORCLI_DOWNLOAD_USER_AGENT}]=]
         URL_HASH SHA256=174ebc4e769928959614789c5b4e9c3d0a0f81a62bb608756b127bfebfb21331
         SOURCE_SUBDIR no-cmake)
     FetchContent_Declare(httplib
         URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.63.0.tar.gz
+        TLS_VERIFY TRUE
+        HTTP_HEADER [=[User-Agent: ${ORCLI_DOWNLOAD_USER_AGENT}]=]
         URL_HASH SHA256=44ab42e16926e95f7641d286bc90d739ab1c16886114d7cc5bc7a9f905c5edf8
         SOURCE_SUBDIR no-cmake)
     FetchContent_MakeAvailable(doctest httplib)

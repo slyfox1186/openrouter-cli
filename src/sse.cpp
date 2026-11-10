@@ -1,11 +1,11 @@
 #include "sse.hpp"
 
 #include "common.hpp"
-#include "secrets.hpp"
 
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -22,10 +22,6 @@ using nlohmann::json;
 constexpr std::string_view line_breaks{"\r\n"};
 constexpr std::string_view data_field{"data"};
 constexpr std::string_view done_marker{"[DONE]"};
-constexpr std::size_t max_error_type_length = 64;
-constexpr std::string_view error_type_characters{
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"};
-constexpr std::string_view unrecognized_error_type{"unrecognized"};
 
 // Value of a `data` field line, or nullopt for any other field. Comment lines have an empty
 // field name, so they are skipped like unknown fields.
@@ -80,16 +76,17 @@ std::optional<double> number_member(const json& object, std::string_view key) {
     if (!value.is_number()) {
         return std::nullopt;
     }
-    return value.get<double>();
+    const double number = value.get<double>();
+    return std::isfinite(number) && number >= 0 ? std::optional{number} : std::nullopt;
 }
 
-// Providers send the error code as a number (HTTP status) or a string (error name).
+// Only numeric codes are safe to repeat; string codes may contain echoed private input.
 std::optional<std::string> code_member(const json& object, std::string_view key) {
     const json& value = member(object, key);
-    if (value.is_number()) {
+    if (value.is_number_integer()) {
         return value.dump();
     }
-    return string_member(object, key);
+    return std::nullopt;
 }
 
 // Keeps the previous value when the chunk has none, because later chunks carry null finish
@@ -115,40 +112,39 @@ void record_provider(const json& body, StreamOutcome& outcome) {
     }
 }
 
-// The error type is provider-controlled text that reaches stderr and the cost log, so only a
-// short token of plain identifier characters survives; anything else could carry control
-// sequences or echoed input. A token that is itself a known key format is rejected as well.
-std::string classify_error_type(std::string_view value) {
-    if (value.empty() || value.size() > max_error_type_length ||
-        value.find_first_not_of(error_type_characters) != std::string_view::npos ||
-        !scan_text({.text = value, .source = "error type"}).empty()) {
-        return std::string{unrecognized_error_type};
-    }
-    return std::string{value};
-}
-
 void record_error(const json& error, StreamOutcome& outcome) {
     outcome.error_code = code_member(error, "code");
-    outcome.error_type =
-        string_member(member(error, "metadata"), "error_type").transform(classify_error_type);
-    // An error object must block completion even when the provider sent no message.
-    outcome.error_message = string_member(error, "message").value_or(std::string{});
+    outcome.error_type = "provider_error";
+    outcome.error_message = "provider reported an error";
+    if (outcome.error_code == "404" || outcome.error_code == "503") {
+        outcome.error_message =
+            "no available route; check the model, provider and privacy routing settings";
+    }
+}
+
+template <class T> void record_known(std::optional<T>& target, std::optional<T> value) {
+    if (value.has_value()) {
+        target = std::move(value);
+    }
 }
 
 void record_usage(const json& usage, Usage& totals) {
     const json& prompt_details = member(usage, "prompt_tokens_details");
     const json& completion_details = member(usage, "completion_tokens_details");
-    totals.prompt_tokens = count_member(usage, "prompt_tokens");
-    totals.cached_tokens = count_member(prompt_details, "cached_tokens");
-    totals.cache_write_tokens = count_member(prompt_details, "cache_write_tokens");
-    totals.completion_tokens = count_member(usage, "completion_tokens");
-    totals.reasoning_tokens = count_member(completion_details, "reasoning_tokens");
-    totals.cost = number_member(usage, "cost");
+    record_known(totals.prompt_tokens, count_member(usage, "prompt_tokens"));
+    record_known(totals.cached_tokens, count_member(prompt_details, "cached_tokens"));
+    record_known(totals.cache_write_tokens, count_member(prompt_details, "cache_write_tokens"));
+    record_known(totals.completion_tokens, count_member(usage, "completion_tokens"));
+    record_known(totals.reasoning_tokens, count_member(completion_details, "reasoning_tokens"));
+    record_known(totals.cost, number_member(usage, "cost"));
 }
 
 void record_chunk(const json& chunk, StreamOutcome& outcome) {
     if (!outcome.generation_id.has_value()) {
-        outcome.generation_id = string_member(chunk, "id");
+        auto id = string_member(chunk, "id");
+        if (id && valid_generation_id(*id)) {
+            outcome.generation_id = std::move(id);
+        }
     }
     record_string(outcome.served_model, chunk, "model");
     record_provider(chunk, outcome);
@@ -168,8 +164,12 @@ std::string record_choice(const json& chunk, StreamOutcome& outcome) {
     const json& choice = choices.front();
     record_string(outcome.finish_reason, choice, "finish_reason");
     record_string(outcome.native_finish_reason, choice, "native_finish_reason");
+    if (outcome.finish_reason == "error" && !outcome.error_type.has_value()) {
+        outcome.error_type = "provider_error";
+        outcome.error_message = "provider reported an error";
+    }
     const std::optional<std::string> content = string_member(member(choice, "delta"), "content");
-    if (!content.has_value()) {
+    if (!content.has_value() || outcome.error_type.has_value()) {
         return {};
     }
     outcome.text.append(*content);
@@ -181,6 +181,9 @@ std::string record_choice(const json& chunk, StreamOutcome& outcome) {
 SseParser::SseParser(std::size_t max_event_bytes) : max_event_bytes_(max_event_bytes) {}
 
 Result<std::vector<std::string>> SseParser::feed(std::string_view bytes) {
+    if (bytes.find('\0') != std::string_view::npos) {
+        return fail(Exit::api, "invalid control byte in server-sent event");
+    }
     std::vector<std::string> events;
     while (!bytes.empty()) {
         // A CR ending the previous piece and an LF starting this one form one CRLF line break.
@@ -232,8 +235,8 @@ Result<std::string> ChatStream::on_data(std::string_view payload) {
     }
     try {
         const json chunk = json::parse(payload, nullptr, false);
-        if (chunk.is_discarded()) {
-            return fail(Exit::api, "invalid JSON in stream");
+        if (chunk.is_discarded() || !chunk.is_object()) {
+            return fail(Exit::api, "invalid JSON object in stream");
         }
         record_chunk(chunk, outcome_);
         return record_choice(chunk, outcome_);

@@ -18,7 +18,7 @@ Checks: >
   readability-*
 WarningsAsErrors: '*'
 CheckOptions:
-  # The binary links glibc only, so thread safety is judged by glibc's own MT-Safe annotations
+  # Thread safety on the supported glibc platform follows its own MT-Safe annotations
   # (getenv is "MT-Safe env" there) rather than the stricter generic POSIX list.
   concurrency-mt-unsafe.FunctionSet: glibc
 HeaderFilterRegex: '.*/(src|tests)/.*'

@@ -1,6 +1,9 @@
 #include "config.hpp"
 
 #include "common.hpp"
+#include "fsutil.hpp"
+
+#include <curl/curl.h>
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -15,9 +18,7 @@
 #include <expected>
 #include <filesystem>
 #include <format>
-#include <fstream>
-#include <ios>
-#include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <ranges>
@@ -26,10 +27,6 @@
 #include <system_error>
 #include <utility>
 #include <vector>
-
-#ifndef ORCLI_DEFAULT_HOME
-#error "ORCLI_DEFAULT_HOME must be defined by the build (see target orcli_core in CMakeLists.txt)"
-#endif
 
 namespace orcli {
 namespace {
@@ -41,9 +38,6 @@ constexpr std::size_t quote_pair_length = 2;
 
 constexpr auto plaintext_key_names =
     std::to_array<std::string_view>({"OPENROUTER_API_KEY", "OPENROUTER_MANAGEMENT_KEY"});
-constexpr std::string_view https_scheme = "https://";
-constexpr auto loopback_origins =
-    std::to_array<std::string_view>({"http://127.0.0.1", "http://localhost"});
 
 struct TextSetting {
     std::string_view key;
@@ -199,28 +193,60 @@ Result<void> read_numbers(const EnvMap& env, Config& config) {
             [&] { return read_positive(env, max_input_bytes_setting, config.max_input_bytes); });
 }
 
-// Plain http is allowed only to loopback, where the integration tests run their mock server.
-bool is_allowed_base_url(std::string_view url) {
-    if (url.starts_with(https_scheme)) {
-        return url.size() > https_scheme.size();
-    }
-    return std::ranges::any_of(loopback_origins, [url](std::string_view origin) {
-        if (!url.starts_with(origin)) {
-            return false;
-        }
-        const std::string_view rest = url.substr(origin.size());
-        return rest.empty() || rest.starts_with(':') || rest.starts_with('/');
+bool has_control(std::string_view text) {
+    return std::ranges::any_of(text, [](unsigned char byte) {
+        constexpr unsigned char first_printable = 32;
+        constexpr unsigned char delete_character = 127;
+        return byte < first_printable || byte == delete_character;
     });
 }
 
+std::string url_part(CURLU* url, CURLUPart part) {
+    char* value = nullptr;
+    if (curl_url_get(url, part, &value, CURLU_GET_EMPTY) != CURLUE_OK) {
+        return {};
+    }
+    const std::unique_ptr<char, decltype(&curl_free)> owned(value, &curl_free);
+    return std::string(owned.get());
+}
+
+// Plain HTTP is allowed only for the exact loopback hosts used by offline tests.
 Result<std::string> parse_base_url(std::string url) {
+    const std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> parsed(curl_url(), &curl_url_cleanup);
+    const auto invalid = [] {
+        return fail(Exit::config,
+                    "OPENROUTER_CLI_BASE_URL requires an HTTPS URL (or exact "
+                    "HTTP localhost/127.0.0.1), without user information, query or fragment");
+    };
+    const std::size_t authority_start = url.find("://");
+    if (authority_start == std::string::npos || authority_start + 3 >= url.size() ||
+        url.at(authority_start + 3) == '/') {
+        return invalid();
+    }
+    if (!parsed || has_control(url) || url.find_first_of("?#") != std::string::npos ||
+        curl_url_set(parsed.get(), CURLUPART_URL, url.c_str(), CURLU_DISALLOW_USER) != CURLUE_OK) {
+        return invalid();
+    }
+    const std::string scheme = url_part(parsed.get(), CURLUPART_SCHEME);
+    const std::string host = url_part(parsed.get(), CURLUPART_HOST);
+    if (host.empty() || (scheme != "https" && scheme != "http")) {
+        return invalid();
+    }
+    if (scheme == "http") {
+        // curl normalizes numeric host aliases; only the documented literal origins qualify.
+        const std::size_t start = url.find("://");
+        const std::string_view authority = std::string_view(url).substr(start + 3);
+        const std::string_view literal_host = authority.substr(0, authority.find_first_of(":/"));
+        if ((host != "localhost" && host != "127.0.0.1") || literal_host != host) {
+            return invalid();
+        }
+    }
+    url = url_part(parsed.get(), CURLUPART_URL);
+    if (url.empty()) {
+        return invalid();
+    }
     while (url.ends_with('/')) {
         url.pop_back();
-    }
-    if (!is_allowed_base_url(url)) {
-        return fail(Exit::config, std::format("{} must start with https:// (or http://127.0.0.1 or "
-                                              "http://localhost for local testing)",
-                                              base_url_setting.key));
     }
     return url;
 }
@@ -251,6 +277,10 @@ Result<Config> config_from_env(const EnvMap& env) {
     config.app_referer = text_setting(env, app_referer_setting);
     config.app_title = text_setting(env, app_title_setting);
     config.app_categories = text_setting(env, app_categories_setting);
+    if (has_control(config.app_referer) || has_control(config.app_title) ||
+        has_control(config.app_categories)) {
+        return fail(Exit::config, "configured HTTP headers must not contain control characters");
+    }
     config.default_effort = text_setting(env, default_effort_setting);
     const Result<void> numbers = read_numbers(env, config);
     if (!numbers.has_value()) {
@@ -266,6 +296,10 @@ Result<std::string> read_private_file(const std::filesystem::path& path) {
     const std::string shown = path.string();
     std::error_code status_error;
     const std::filesystem::file_status status = std::filesystem::symlink_status(path, status_error);
+    if (status_error && status_error != std::errc::no_such_file_or_directory) {
+        return fail(Exit::config,
+                    std::format("cannot inspect {}: {}", shown, status_error.message()));
+    }
     if (status.type() == std::filesystem::file_type::not_found) {
         return std::string{};
     }
@@ -300,15 +334,7 @@ Result<std::string> read_private_file(const std::filesystem::path& path) {
                                 "with mode 600",
                                 shown));
     }
-    std::ifstream input(path, std::ios::binary);
-    if (!input.is_open()) {
-        return fail(Exit::config, std::format("cannot open {}", shown));
-    }
-    std::string text{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    if (input.bad()) {
-        return fail(Exit::config, std::format("cannot read {}", shown));
-    }
-    return text;
+    return read_regular_file(path, std::numeric_limits<std::size_t>::max());
 }
 
 } // namespace
@@ -353,13 +379,26 @@ std::filesystem::path default_home() {
     if (variable != nullptr && *variable != '\0') {
         return std::filesystem::path{variable};
     }
-    return std::filesystem::path{ORCLI_DEFAULT_HOME};
+    return {};
 }
 
 Result<Config> load_config(const std::filesystem::path& home,
                            const std::filesystem::path& user_home,
-                           const std::filesystem::path& xdg_state_home) {
-    const std::filesystem::path env_path = home / ".env";
+                           const std::filesystem::path& xdg_state_home,
+                           const std::filesystem::path& xdg_config_home) {
+    if (!home.empty() && !home.is_absolute()) {
+        return fail(Exit::config, "OPENROUTER_CLI_HOME must be an absolute path");
+    }
+    const std::filesystem::path state_root =
+        xdg_state_home.is_absolute() ? xdg_state_home : user_home / ".local" / "state";
+    const std::filesystem::path config_root =
+        xdg_config_home.is_absolute() ? xdg_config_home : user_home / ".config";
+    if (!state_root.is_absolute() || (home.empty() && !config_root.is_absolute())) {
+        return fail(Exit::config,
+                    "HOME must be an absolute path when XDG storage needs a fallback");
+    }
+    const std::filesystem::path env_path =
+        home.empty() ? config_root / "openrouter-cli" / "config.env" : home / ".env";
     const Result<std::string> text = read_private_file(env_path);
     if (!text.has_value()) {
         return std::unexpected(text.error());
@@ -374,14 +413,9 @@ Result<Config> load_config(const std::filesystem::path& home,
     if (!config.has_value()) {
         return config;
     }
-    // XDG Base Directory: a relative XDG_STATE_HOME is invalid and must be ignored.
-    const std::filesystem::path state_root =
-        xdg_state_home.is_absolute() ? xdg_state_home : user_home / ".local" / "state";
-    if (!state_root.is_absolute()) {
-        return fail(Exit::config, "HOME must be an absolute path to locate the cost log");
-    }
     config->home = home;
-    config->state_dir = home / "state";
+    config->env_file = env_path;
+    config->state_dir = home.empty() ? state_root / "openrouter-cli" : home / "state";
     config->cost_log = state_root / "openrouter-cli" / "costs.jsonl";
     config->plaintext_keys = find_plaintext_keys(*text);
     return config;

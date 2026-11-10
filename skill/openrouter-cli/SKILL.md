@@ -35,8 +35,8 @@ the user what it says; when it shows no stored key or a rejected key, ask them t
 - `openrouter-cli models list` shows saved aliases. Check it first.
 - `openrouter-cli models find "gemini 4 argon"` lists matching ids. Quote multi-word names.
 - `-m` accepts a saved alias, an exact id (`google/gemini-4-argon`), a `~author/family-latest`
-  id, or plain words (`-m "gemini 4 argon"`). A plain name that matches exactly one model is used
-  and saved as an alias automatically (stderr says `saved alias ...`).
+  id, or plain words (`-m "gemini 4 argon"`). Exact IDs take precedence over aliases; a plain
+  name that matches exactly one model is used without saving an alias.
 - `openrouter-cli models save ALIAS MODEL_ID` saves an alias by hand.
 - Exit `4` means the name is unknown or matches several models; the candidates are printed. Pick
   the exact id the user meant, or ask them.
@@ -85,7 +85,7 @@ openrouter-cli -m google/gemini-4-argon -f src/http.cpp -f src/http.hpp \
 - `--role plain` sends no review instructions; use it for a plain question.
 - `-s TEXT` or `-s @FILE` adds system text.
 - `-e EFFORT` sets reasoning effort (`max`, `xhigh`, `high`, `medium`, `low`, `minimal`, `none`);
-  the default comes from the project settings. Models that cannot select effort ignore it.
+  the default comes from the user's `config.env` (or legacy `.env`). Models that cannot select effort ignore it.
 - `--max-output-tokens N` sets the output budget, reasoning included.
 
 ## Follow-up rounds
@@ -126,7 +126,7 @@ line, so read that file if stdout was lost.
 | `4` | Unknown or ambiguous model | Choose from the printed candidates or ask the user. |
 | `5` | API or network failure, rejected key, or no endpoint matching the model, providers and privacy | Report the message. For no endpoint, check tags with `models show`. A retry is another billed call; ask first. |
 | `6` | Incomplete answer (budget ran out, stream ended early, content filter) | The partial answer is in the answer file and the session is unchanged. Retry with a lower `--effort` or a higher `--max-output-tokens` only after telling the user it costs another call. |
-| `7` | Configuration problem: no stored key, key cannot be decrypted, plaintext key in `.env`, invalid `.env` | Follow Keys and sign-in above. Never read or print `.env`. |
+| `7` | Configuration problem: no stored key, key cannot be decrypted, plaintext key in settings, invalid settings | Follow Keys and sign-in above. Never read or print `config.env` or `.env`. |
 | `8` | Interrupted, during the answer or during the cost lookup after it | The partial answer was kept; report the cost line. |
 | `9` | The call finished and may have been billed, but saving failed (answer file, cost record or session) | Use the answer from stdout, report the message and cost line, and never retry automatically. |
 

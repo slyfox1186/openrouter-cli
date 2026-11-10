@@ -1,6 +1,7 @@
 #include "account.hpp"
 
 #include "common.hpp"
+#include "secrets.hpp"
 
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
@@ -197,6 +198,9 @@ std::string unsigned_money(double amount) {
             break;
         }
     }
+    if (text.find_first_of("123456789") == std::string::npos) {
+        return std::format("${:g}", amount);
+    }
     return text;
 }
 
@@ -232,7 +236,7 @@ std::string render_table(const Table& rows) {
         for (const auto& [cell, width] : std::views::zip(row, widths)) {
             // Padding by hand: a nested width ("{:<{}}") hits the same Clang bug as dollars().
             const std::size_t start = line.size();
-            line += cell;
+            line += display_metadata(cell);
             line.resize(start + std::max(cell.size(), width + column_gap), ' ');
         }
         while (line.ends_with(' ')) {
@@ -255,7 +259,7 @@ std::string render_fields(const std::vector<Field>& fields) {
         std::string label = std::format("{}:", field.label);
         label.resize(std::max(label.size(), label_width), ' ');
         text += label;
-        text += field.value;
+        text += display_metadata(field.value);
         text += '\n';
     }
     return text;
@@ -553,7 +557,8 @@ Result<std::vector<ActivityRow>> parse_activity(std::string_view json_text) {
     rows.reserve(data->size());
     for (const json& item : *data) {
         auto row = parse_activity_row(item);
-        if (!row.has_value()) {
+        if (!row.has_value() || row->date.size() != date_length ||
+            !parse_date(row->date).has_value()) {
             return malformed(activity_path);
         }
         rows.push_back(std::move(*row));

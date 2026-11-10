@@ -6,9 +6,11 @@
 #include <nlohmann/json.hpp>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <sys/file.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -28,6 +30,7 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -81,7 +84,6 @@ constexpr std::chrono::seconds output_wait{15};
 constexpr std::chrono::seconds child_time_limit{90};
 constexpr std::chrono::seconds idle_hold{5};
 constexpr std::chrono::seconds drip_hold{3};
-constexpr std::chrono::seconds interrupt_hold{60};
 
 constexpr std::string_view alpha = "test/alpha-1";
 
@@ -209,9 +211,14 @@ public:
     Child& operator=(const Child&) = delete;
     ~Child() {
         if (pid_ > 0) {
+            ::kill(-pid_, SIGKILL);
             ::kill(pid_, SIGKILL);
             int status = 0;
-            ::waitpid(pid_, &status, 0);
+            while (::waitpid(pid_, &status, 0) < 0) {
+                if (errno != EINTR) {
+                    break;
+                }
+            }
         }
     }
 
@@ -273,6 +280,9 @@ struct Launch {
     std::vector<std::string> args{};
     std::optional<std::string> stdin_text{};
     std::optional<fs::path> stdin_path{};
+    std::optional<int> stdin_descriptor{};
+    std::optional<int> stdout_descriptor{}; // borrowed; use spawn and capture in the parent
+    bool failed_stderr = false;
     bool closed_stdout = false; // stdout is a pipe whose read end is already closed
     bool creds_tool = true;     // false: no test credential tool and nothing on PATH
     std::optional<fs::path> home{};
@@ -303,6 +313,9 @@ struct ChildSetup {
 
 // Runs between fork and execve in a multithreaded parent, so only async-signal-safe calls.
 [[noreturn]] void exec_child(const ChildSetup& setup) noexcept {
+    if (::setpgid(0, 0) != 0) {
+        ::_exit(exit_exec_failed);
+    }
     if (::dup2(setup.in, STDIN_FILENO) < 0 || ::dup2(setup.out, STDOUT_FILENO) < 0 ||
         ::dup2(setup.err, STDERR_FILENO) < 0 || ::chdir(setup.workdir) != 0) {
         ::_exit(exit_exec_failed);
@@ -337,10 +350,13 @@ struct ChildSetup {
 // `auth set` with the fake credential tool, never through .env.
 class Sandbox {
 public:
-    explicit Sandbox(int port) : root_(make_root()), port_(port) {
-        for (const fs::path& dir : {home(), project(), work(), empty_bin()}) {
+    explicit Sandbox(int port, bool legacy = false)
+        : root_(make_root()), port_(port), legacy_(legacy) {
+        for (const fs::path& dir :
+             {home(), project(), work(), empty_bin(), tools_bin(), config_dir()}) {
             make_private_dir(dir);
         }
+        fs::create_symlink(creds_tool_path, tools_bin() / "systemd-creds");
         write_env("");
     }
     Sandbox(const Sandbox&) = delete;
@@ -357,7 +373,14 @@ public:
     [[nodiscard]] fs::path project() const { return root_ / "project"; }
     [[nodiscard]] fs::path work() const { return root_ / "work"; }
     [[nodiscard]] fs::path empty_bin() const { return root_ / "empty-bin"; }
-    [[nodiscard]] fs::path state_dir() const { return project() / "state"; }
+    [[nodiscard]] fs::path tools_bin() const { return root_ / "tools"; }
+    [[nodiscard]] fs::path config_dir() const { return home() / ".config" / "openrouter-cli"; }
+    [[nodiscard]] fs::path settings_file() const {
+        return legacy_ ? project() / ".env" : config_dir() / "config.env";
+    }
+    [[nodiscard]] fs::path state_dir() const {
+        return legacy_ ? project() / "state" : cost_log().parent_path();
+    }
     [[nodiscard]] fs::path api_credential() const {
         return state_dir() / "credentials" / "api-key.cred";
     }
@@ -370,7 +393,7 @@ public:
 
     // The settings every test needs, followed by extra_lines.
     void write_env(std::string_view extra_lines) const {
-        write_text(project() / ".env",
+        write_text(settings_file(),
                    std::format("OPENROUTER_CLI_BASE_URL=http://127.0.0.1:{}/api/v1\n"
                                "OPENROUTER_CLI_IDLE_TIMEOUT_SECONDS={}\n"
                                "OPENROUTER_CLI_TOTAL_TIMEOUT_SECONDS={}\n{}",
@@ -378,6 +401,7 @@ public:
     }
 
     Child spawn(const Launch& launch) {
+        REQUIRE_FALSE(launch.closed_stdout && launch.stdout_descriptor.has_value());
         ++runs_;
         const fs::path in_path = root_ / std::format("run-{}.in", runs_);
         const fs::path out_path = root_ / std::format("run-{}.out", runs_);
@@ -386,29 +410,36 @@ public:
         if (launch.stdin_text.has_value()) {
             write_text(in_path, *launch.stdin_text);
         }
-        const UniqueFd in = open_fd(
-            launch.stdin_text.has_value() ? in_path : launch.stdin_path.value_or("/dev/null"),
-            O_RDONLY);
+        UniqueFd in;
+        if (!launch.stdin_descriptor.has_value()) {
+            in = open_fd(launch.stdin_text.has_value() ? in_path
+                                                       : launch.stdin_path.value_or("/dev/null"),
+                         O_RDONLY);
+        }
         UniqueFd out;
         if (launch.closed_stdout) {
             std::array<int, 2> ends{-1, -1};
             REQUIRE(::pipe2(ends.data(), O_CLOEXEC) == 0);
             const UniqueFd read_end(ends[0]);
             out = UniqueFd(ends[1]);
-        } else {
+        } else if (!launch.stdout_descriptor.has_value()) {
             out = open_fd(out_path, O_WRONLY | O_CREAT | O_TRUNC);
         }
-        const UniqueFd err = open_fd(err_path, O_WRONLY | O_CREAT | O_TRUNC);
+        const UniqueFd err = launch.failed_stderr ? open_fd("/dev/full", O_WRONLY)
+                                                  : open_fd(err_path, O_WRONLY | O_CREAT | O_TRUNC);
 
         std::vector<std::string> arg_strings{binary_path};
         std::ranges::copy(launch.args, std::back_inserter(arg_strings));
         std::vector<std::string> env_strings{
             "HOME=" + launch.home.value_or(home()).string(),
-            "OPENROUTER_CLI_HOME=" + project().string(),
+            "XDG_CONFIG_HOME=" + (home() / ".config").string(),
+            "XDG_STATE_HOME=" + (home() / ".local/state").string(),
         };
+        if (legacy_) {
+            env_strings.push_back("OPENROUTER_CLI_HOME=" + project().string());
+        }
         if (launch.creds_tool) {
-            env_strings.emplace_back("PATH=/usr/bin:/bin");
-            env_strings.push_back(std::string("OPENROUTER_CLI_TEST_CREDS_TOOL=") + creds_tool_path);
+            env_strings.push_back("PATH=" + tools_bin().string() + ":/usr/bin:/bin");
         } else {
             env_strings.push_back("PATH=" + empty_bin().string());
         }
@@ -416,8 +447,8 @@ public:
         const std::vector<char*> argv = pointers_to(arg_strings);
         const std::vector<char*> envp = pointers_to(env_strings);
         const std::string workdir = work().string();
-        const ChildSetup setup{.in = in.get(),
-                               .out = out.get(),
+        const ChildSetup setup{.in = launch.stdin_descriptor.value_or(in.get()),
+                               .out = launch.stdout_descriptor.value_or(out.get()),
                                .err = err.get(),
                                .workdir = workdir.c_str(),
                                .argv = argv.data(),
@@ -434,6 +465,7 @@ public:
     }
 
     RunResult run_with(const Launch& launch) {
+        REQUIRE_FALSE(launch.stdout_descriptor.has_value());
         Child child = spawn(launch);
         const int code = child.wait();
         return {.code = code, .out = child.out(), .err = child.err()};
@@ -510,6 +542,7 @@ private:
 
     fs::path root_;
     int port_;
+    bool legacy_ = false;
     int runs_ = 0;
 };
 
@@ -655,22 +688,21 @@ TEST_CASE("an OpenRouter no-endpoints error exits 5 with a hint to inspect the m
     const RunResult result = sandbox.run({"-m", std::string(alpha), "-p", "nowhere", "question"});
 
     CHECK(result.code == exit_api);
-    CHECK(result.err.contains("No endpoints found"));
+    CHECK(result.err.contains("HTTP 404"));
+    CHECK_FALSE(result.err.contains("No endpoints found"));
     CHECK(result.err.contains("models show"));
     CHECK(server.post_count() == 1);
 }
 
-TEST_CASE("a plain model name is resolved once and saved as an alias") {
+TEST_CASE("a plain model name resolves without saving an alias") {
     MockServer server;
     Sandbox sandbox(server.port());
     sandbox.store_api_key();
 
     const RunResult first = sandbox.run({"-m", "alpha 1", "first question"});
     CHECK(first.code == exit_ok);
-    CHECK(first.err.contains("saved alias alpha-1 -> test/alpha-1"));
-    const std::string registry = read_text(sandbox.state_dir() / "models.json");
-    CHECK(registry.contains("alpha-1"));
-    CHECK(registry.contains("test/alpha-1"));
+    CHECK_FALSE(first.err.contains("saved alias"));
+    CHECK_FALSE(file_exists(sandbox.state_dir() / "models.json"));
     CHECK(text_at(server.last_post(), "model") == alpha);
 
     const RunResult second = sandbox.run({"-m", "alpha-1", "second question"});
@@ -740,9 +772,9 @@ TEST_CASE("an HTTP error status is reported by type without echoing secrets") {
 
     CHECK(result.code == exit_api);
     CHECK(result.err.contains("402"));
-    CHECK(result.err.contains("payment_required"));
+    CHECK(result.err.contains("provider_error"));
     CHECK_FALSE(result.err.contains(mock::fake_api_key()));
-    CHECK(result.err.contains("[redacted]"));
+    CHECK_FALSE(result.err.contains("[redacted]"));
     CHECK(result.out.empty());
     CHECK(server.post_count() == 1);
     CHECK(result_outcome(sandbox) == "error");
@@ -989,8 +1021,7 @@ TEST_CASE("keepalive comments keep a quiet call alive past the idle limit") {
 
 TEST_CASE("SIGTERM mid-stream keeps the partial answer, and the busy session is refused") {
     MockServer server;
-    server.set_scenario(Scenario::slow);
-    server.set_hold(interrupt_hold);
+    server.set_scenario(Scenario::gated);
     Sandbox sandbox(server.port());
     sandbox.store_api_key();
 
@@ -1139,18 +1170,77 @@ TEST_CASE("an answer file that cannot be written after a completed call exits 9"
     MockServer server;
     Sandbox sandbox(server.port());
     sandbox.store_api_key();
-    REQUIRE(sandbox.run(ask("fills the catalog cache")).code == exit_ok);
+    // Keep catalog publication outside the file-size fault being injected into response writes.
+    REQUIRE(sandbox.run({"models", "find", "alpha"}).code == exit_ok);
     server.set_scenario(Scenario::large);
-    // A fresh HOME keeps the cost log far below the file size limit that the answer exceeds.
-    const fs::path other_home = sandbox.root() / "home-limited";
-    make_private_dir(other_home);
 
-    const RunResult result = sandbox.run_with(
-        Launch{.args = ask("question"), .home = other_home, .file_size_limit = answer_file_limit});
+    // A pipe isolates stdout from RLIMIT_FSIZE; drain concurrently without assuming its capacity.
+    std::array<int, 2> ends{-1, -1};
+    REQUIRE(::pipe2(ends.data(), O_CLOEXEC) == 0);
+    UniqueFd reader(ends.front());
+    UniqueFd writer(ends.back());
+    constexpr std::size_t max_capture_bytes = mock::large_answer_bytes + 1;
+    std::string captured;
+    captured.reserve(max_capture_bytes);
+    bool capture_ok = true;
+    std::jthread collector([&, read_end = std::move(reader)](const std::stop_token& stop) {
+        constexpr int wait_milliseconds = 100;
+        constexpr std::size_t chunk_bytes = 4096;
+        std::array<char, chunk_bytes> buffer{};
+        while (!stop.stop_requested()) {
+            pollfd input{.fd = read_end.get(), .events = POLLIN, .revents = 0};
+            const int ready = ::poll(&input, 1, wait_milliseconds);
+            if (ready < 0 && errno == EINTR) {
+                continue;
+            }
+            if (ready < 0) {
+                capture_ok = false;
+                return;
+            }
+            if (ready == 0) {
+                continue;
+            }
+            const auto count = ::read(read_end.get(), buffer.data(), buffer.size());
+            if (count < 0 && errno == EINTR) {
+                continue;
+            }
+            if (count < 0) {
+                capture_ok = false;
+                return;
+            }
+            if (count == 0) {
+                return;
+            }
+            const auto size = static_cast<std::size_t>(count);
+            if (size > max_capture_bytes - captured.size()) {
+                capture_ok = false;
+                return;
+            }
+            captured.append(buffer.data(), size);
+        }
+    });
+    Child child = sandbox.spawn(Launch{.args = ask("question"),
+                                       .stdout_descriptor = writer.get(),
+                                       .file_size_limit = answer_file_limit});
+    writer.reset();
+    const int code = child.wait();
+    collector.join();
+    INFO(code);
+    INFO(child.err());
+    REQUIRE(capture_ok);
+    const RunResult result{.code = code, .out = std::move(captured), .err = child.err()};
 
     CHECK(result.code == exit_not_saved);
-    CHECK(result.err.contains("answer"));
-    CHECK(server.post_count() == 2);
+    CHECK(result.err.contains("the answer file"));
+    CHECK(result.out == std::string(mock::large_answer_bytes, 'x') + "\n");
+    const std::string retained(static_cast<std::size_t>(answer_file_limit), 'x');
+    CHECK(sandbox.only_answer() == retained);
+    const auto results = sandbox.records_of("result");
+    REQUIRE(results.size() == 1U);
+    CHECK(text_at(results.front(), "outcome") == "complete");
+    CHECK(results.front().at("cost").get<double>() == doctest::Approx(0.0042));
+    CHECK(server.generation_count() == 0);
+    CHECK(server.post_count() == 1);
 }
 
 TEST_CASE("a result record that cannot be written after a completed call exits 9") {
@@ -1509,6 +1599,7 @@ TEST_CASE("a plaintext key in .env stops every command except auth set, login an
 
 TEST_CASE("the management key never reaches an inference endpoint") {
     MockServer server;
+    server.set_scenario(Scenario::success_no_cost);
     Sandbox sandbox(server.port());
     sandbox.store_api_key();
     sandbox.store_management_key();
@@ -1534,6 +1625,7 @@ TEST_CASE("the management key never reaches an inference endpoint") {
         }
     }
     CHECK(server.post_count() == 1);
+    CHECK(server.generation_count() > 0);
 }
 
 // ----- auth logout -----------------------------------------------------------------------------
@@ -1964,4 +2056,198 @@ TEST_CASE("account activity sums endpoint rows and filters --days by completed U
     CHECK(sandbox.run({"account", "activity", "--days", "0"}).code == exit_usage);
     CHECK(sandbox.run({"account", "activity", "--days", "31"}).code == exit_usage);
     CHECK(server.requests_to("/activity").size() == 2U);
+}
+
+TEST_CASE("legacy override preserves state while costs remain global") {
+    MockServer server;
+    Sandbox sandbox(server.port(), true);
+    sandbox.store_api_key();
+    const auto result = sandbox.run(ask("legacy storage"));
+    REQUIRE(result.code == exit_ok);
+    CHECK(file_exists(sandbox.project() / "state/credentials/api-key.cred"));
+    CHECK(file_exists(sandbox.cost_log()));
+    CHECK_FALSE(file_exists(sandbox.project() / "state/costs.jsonl"));
+}
+
+TEST_CASE("models show uses one catalog snapshot and only save persists aliases") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    REQUIRE(sandbox.run({"models", "show", "alpha 1"}).code == exit_ok);
+    CHECK(server.requests_to("/models").size() == 1);
+    CHECK_FALSE(file_exists(sandbox.state_dir() / "models.json"));
+    REQUIRE(sandbox.run({"models", "save", "preferred", std::string(alpha)}).code == exit_ok);
+    CHECK(read_text(sandbox.state_dir() / "models.json").contains("preferred"));
+}
+
+TEST_CASE("a failed explicit model refresh reports the failure despite a cache") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    REQUIRE(sandbox.run({"models", "find", "alpha"}).code == exit_ok);
+    server.set_route("/models", [](const RecordedRequest&) {
+        return Reply{.status = http_ok, .body = "invalid-json"};
+    });
+    const auto result = sandbox.run({"models", "find", "alpha", "--refresh"});
+    CHECK(result.code == exit_api);
+    CHECK(result.err.contains("not valid JSON"));
+}
+
+TEST_CASE("interrupted idle login preserves the parent's stdin file-status flags") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    std::array<int, 2> ends{-1, -1};
+    REQUIRE(::pipe2(ends.data(), O_CLOEXEC) == 0);
+    const UniqueFd read_end(ends.front());
+    const UniqueFd write_end(ends.back());
+    const int flags = ::fcntl(read_end.get(), F_GETFL);
+    REQUIRE(flags >= 0);
+    Child child =
+        sandbox.spawn(Launch{.args = {"auth", "login"}, .stdin_descriptor = read_end.get()});
+    const auto deadline = Clock::now() + output_wait;
+    while (!child.err().contains("Paste the code here") && Clock::now() < deadline) {
+        std::this_thread::sleep_for(poll_interval);
+    }
+    REQUIRE(child.err().contains("Paste the code here"));
+    REQUIRE(::kill(child.pid(), SIGTERM) == 0);
+    CHECK(child.wait() == exit_interrupted);
+    CHECK(::fcntl(read_end.get(), F_GETFL) == flags);
+    CHECK(server.requests().empty());
+}
+
+TEST_CASE("failed diagnostic output does not lose a completed answer or its accounting") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    const auto result = sandbox.run_with(Launch{.args = ask("question"), .failed_stderr = true});
+    CHECK(result.code == exit_ok);
+    CHECK(result.out == "Hello world\n");
+    CHECK(sandbox.only_answer() == "Hello world");
+    CHECK(result_outcome(sandbox) == "complete");
+    CHECK(server.post_count() == 1);
+}
+
+TEST_CASE("interrupted accounting has a bounded lock wait and preserves exit 8") {
+    MockServer server;
+    server.set_scenario(Scenario::gated);
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    Child child = sandbox.spawn(Launch{.args = ask("question")});
+    REQUIRE(child.wait_for_output("Hello"));
+    const UniqueFd lock = open_fd(sandbox.cost_log().parent_path() / "costs.lock", O_RDWR);
+    REQUIRE(::flock(lock.get(), LOCK_EX | LOCK_NB) == 0);
+    const auto started = Clock::now();
+    REQUIRE(::kill(child.pid(), SIGTERM) == 0);
+    CHECK(child.wait() == exit_interrupted);
+    constexpr std::chrono::seconds maximum_cleanup{4};
+    CHECK(Clock::now() - started < maximum_cleanup);
+    CHECK(child.err().contains("saving the cost record failed"));
+    CHECK(sandbox.only_answer() == "Hello");
+    CHECK(server.post_count() == 1);
+}
+
+TEST_CASE("stdin input over the request budget refuses before a paid request") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.write_env("OPENROUTER_CLI_MAX_INPUT_BYTES=8\n");
+    const auto result =
+        sandbox.run_with(Launch{.args = {"-m", std::string(alpha), "--role", "plain", "-"},
+                                .stdin_text = "more than eight bytes"});
+    CHECK(result.code == exit_refused);
+    CHECK(server.post_count() == 0);
+}
+
+TEST_CASE("status neutralizes terminal controls in provider metadata") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    server.set_route("/key", [](const RecordedRequest&) {
+        auto data = mock::key_data();
+        data["label"] = "Café\033[31m\nspoof";
+        return data_reply(data);
+    });
+    const auto result = sandbox.run({"status"});
+    CHECK(result.code == exit_ok);
+    CHECK(result.out.contains("Café"));
+    CHECK_FALSE(result.out.contains('\033'));
+    CHECK_FALSE(result.out.contains("\nspoof"));
+}
+
+TEST_CASE("every stored user and assistant history message is scanned before resending") {
+    for (const std::size_t index : {std::size_t{0}, std::size_t{1}}) {
+        MockServer server;
+        Sandbox sandbox(server.port());
+        sandbox.store_api_key();
+        REQUIRE(
+            sandbox.run({"--session", "secret-history", "-m", std::string(alpha), "first"}).code ==
+            exit_ok);
+        const auto path = sandbox.state_dir() / "sessions/secret-history.json";
+        auto session = json::parse(read_text(path));
+        session["history"][index]["content"] = mock::fake_key('7');
+        write_text(path, session.dump());
+        const auto result = sandbox.run({"--session", "secret-history", "second"});
+        CHECK(result.code == exit_refused);
+        CHECK(result.err.contains("session history"));
+        CHECK_FALSE(result.all().contains(mock::fake_key('7')));
+        CHECK(server.post_count() == 1);
+    }
+}
+
+TEST_CASE("both spend modes report corrupt rows without rejecting valid charges") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    REQUIRE(sandbox.run(ask("question")).code == exit_ok);
+    const auto saved = read_text(sandbox.cost_log());
+    write_text(sandbox.cost_log(), "not-json\n" + saved);
+    const auto spend = sandbox.run({"spend"});
+    CHECK(spend.code == exit_ok);
+    CHECK(spend.out.contains("Corrupt log lines (not valid records, not counted): 1\n"));
+    CHECK(spend.out.contains("0.0042"));
+    const auto resolve = sandbox.run({"spend", "--resolve"});
+    CHECK(resolve.code == exit_ok);
+    CHECK(resolve.err.contains("ignored 1 corrupt cost-log records"));
+    CHECK(resolve.out.contains("no unresolved calls with a generation id"));
+    CHECK(read_text(sandbox.cost_log()) == "not-json\n" + saved);
+    CHECK(server.generation_count() == 0);
+    CHECK(server.post_count() == 1);
+}
+
+TEST_CASE("interrupting the pre-send ledger lock preserves exit 8 and sends no POST") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    const UniqueFd lock =
+        open_fd(sandbox.cost_log().parent_path() / "costs.lock", O_RDWR | O_CREAT);
+    REQUIRE(::flock(lock.get(), LOCK_EX | LOCK_NB) == 0);
+    Child child = sandbox.spawn(Launch{.args = ask("question")});
+    const auto deadline = Clock::now() + output_wait;
+    while (sandbox.answer_files().empty() && Clock::now() < deadline) {
+        std::this_thread::sleep_for(poll_interval);
+    }
+    REQUIRE_FALSE(sandbox.answer_files().empty());
+    REQUIRE(::kill(child.pid(), SIGTERM) == 0);
+    CHECK(child.wait() == exit_interrupted);
+    CHECK(sandbox.answer_files().empty());
+    CHECK(server.post_count() == 0);
+}
+
+TEST_CASE("known prompt overhead refuses before waiting for stdin beyond the aggregate budget") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.write_env("OPENROUTER_CLI_MAX_INPUT_BYTES=8\n");
+    std::array<int, 2> ends{-1, -1};
+    REQUIRE(::pipe2(ends.data(), O_CLOEXEC) == 0);
+    const UniqueFd read_end(ends.front());
+    const UniqueFd write_end(ends.back());
+    Child child = sandbox.spawn(Launch{
+        .args = {"-m", std::string(alpha), "--role", "plain", "-s", "larger than the limit", "-"},
+        .stdin_descriptor = read_end.get()});
+    const auto deadline = Clock::now() + output_wait;
+    while (!child.err().contains("OPENROUTER_CLI_MAX_INPUT_BYTES") && Clock::now() < deadline) {
+        std::this_thread::sleep_for(poll_interval);
+    }
+    REQUIRE(child.err().contains("OPENROUTER_CLI_MAX_INPUT_BYTES"));
+    CHECK(child.wait() == exit_refused);
+    CHECK(server.post_count() == 0);
 }

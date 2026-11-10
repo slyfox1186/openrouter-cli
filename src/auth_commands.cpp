@@ -4,6 +4,7 @@
 #include "common.hpp"
 #include "config.hpp"
 #include "credentials.hpp"
+#include "fsutil.hpp"
 #include "http.hpp"
 
 #include <cstddef>
@@ -11,7 +12,6 @@
 #include <cstdio>
 #include <expected>
 #include <format>
-#include <iostream>
 #include <print>
 #include <string>
 #include <string_view>
@@ -150,43 +150,25 @@ private:
     bool active_ = false;
 };
 
-Result<void> stdin_status() {
-    if (interrupt_requested()) {
-        return fail(Exit::interrupted, "interrupted");
-    }
-    if (std::cin.bad()) {
-        return fail(Exit::config, "cannot read standard input");
-    }
-    return {};
-}
-
 enum class ReadUntil : std::uint8_t {
     newline,
     end_of_input,
 };
 
-// The buffer is reserved once and never filled past that reservation, so it never reallocates
-// and no fragment of a key or code is left behind in freed memory.
 Result<void> read_bounded(std::string& text, ReadUntil until) {
-    text.reserve(max_key_input_bytes);
-    char letter = '\0';
-    while (std::cin.get(letter)) {
-        if (until == ReadUntil::newline && letter == '\n') {
-            break;
-        }
-        if (text.size() == max_key_input_bytes) {
-            return fail(Exit::usage, std::format("the input is longer than {} bytes; give only "
-                                                 "the key or code",
-                                                 max_key_input_bytes));
-        }
-        text.push_back(letter);
+    auto input = read_input(max_key_input_bytes, until == ReadUntil::newline);
+    if (!input) {
+        return std::unexpected(input.error());
     }
-    return stdin_status();
+    text.swap(*input);
+    cleanse(*input);
+    return {};
 }
 
 Result<void> read_hidden_line(KeyKind kind, std::string& text) {
     std::print(stderr, "Paste the OpenRouter {} (input is hidden): ",
                kind == KeyKind::management ? "Management" : "API");
+    std::fflush(stderr);
     const HiddenTerminal hidden(STDIN_FILENO);
     if (!hidden.active()) {
         std::print(stderr, "\n");

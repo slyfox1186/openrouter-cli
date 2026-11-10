@@ -248,8 +248,6 @@ TEST_CASE("fields of unexpected types are ignored") {
         R"({"id":5,"model":null,"error":"x","choices":{"delta":"x"},"usage":{"prompt_tokens":"1200","cost":"0.1","prompt_tokens_details":[1]},"openrouter_metadata":{"endpoints":{"available":{"provider":"x"}}}})",
         R"({"choices":[{"delta":{"content":5},"finish_reason":7}]})",
         R"({"choices":[{"delta":{"content":"a"}}],"usage":{"prompt_tokens":1.5,"completion_tokens":-1}})",
-        "[1, 2]",
-        "\"text\"",
     });
     CHECK(outcome.text == "a");
     CHECK_FALSE(outcome.generation_id.has_value());
@@ -280,7 +278,7 @@ TEST_CASE("error chunk then usage chunk then EOF records both and is not complet
     const StreamOutcome outcome = run_stream(stream, stream.size());
     CHECK(outcome.text == "partial");
     CHECK(outcome.error_code == "502");
-    CHECK(outcome.error_message == "Upstream failed");
+    CHECK(outcome.error_message == "provider reported an error");
     CHECK(outcome.error_type == "provider_error");
     CHECK(outcome.finish_reason == "error");
     CHECK(outcome.usage.prompt_tokens == prompt_tokens);
@@ -296,9 +294,9 @@ TEST_CASE("an error object blocks completion even with a string code and no mess
         R"({"error":{"code":"server_error"},"choices":[]})",
         "[DONE]",
     });
-    CHECK(outcome.error_code == "server_error");
-    CHECK(outcome.error_message == "");
-    CHECK_FALSE(outcome.error_type.has_value());
+    CHECK_FALSE(outcome.error_code.has_value());
+    CHECK(outcome.error_message == "provider reported an error");
+    CHECK(outcome.error_type == "provider_error");
     CHECK_FALSE(orcli::stream_complete(outcome));
 }
 
@@ -351,39 +349,39 @@ TEST_CASE("parse_error_body reads an error body") {
         R"({"error":{"code":429,"message":"Slow down","metadata":{"error_type":"rate_limit_exceeded"}},"openrouter_metadata":{"endpoints":{"available":[{"provider":"Example","selected":true}]}}})",
         outcome));
     CHECK(outcome.error_code == "429");
-    CHECK(outcome.error_message == "Slow down");
-    CHECK(outcome.error_type == "rate_limit_exceeded");
+    CHECK(outcome.error_message == "provider reported an error");
+    CHECK(outcome.error_type == "provider_error");
     CHECK(outcome.provider == "Example");
     CHECK_FALSE(orcli::stream_complete(outcome));
 }
 
-TEST_CASE("provider error types are kept only as short plain tokens") {
+TEST_CASE("provider error types are replaced with a local classification") {
     const std::string longest(max_error_type_length, 'a');
     const std::string too_long(max_error_type_length + 1, 'a');
-    CHECK(error_type_of("rate_limit_exceeded") == "rate_limit_exceeded");
-    CHECK(error_type_of("v1.provider-error_2") == "v1.provider-error_2");
-    CHECK(error_type_of(longest) == longest);
-    CHECK(error_type_of(too_long) == "unrecognized");
-    CHECK(error_type_of("") == "unrecognized");
-    CHECK(error_type_of("sk-or-v1-0123abcd leaked") == "unrecognized");
-    CHECK(error_type_of(R"(sk-or-v1-0123abcd\"leaked)") == "unrecognized");
-    CHECK(error_type_of(R"(\u001b[31mred\u001b[0m)") == "unrecognized");
-    CHECK(error_type_of(R"(line\nbreak)") == "unrecognized");
-    CHECK(error_type_of(R"(\u00e9t\u00e9)") == "unrecognized");
+    CHECK(error_type_of("rate_limit_exceeded") == "provider_error");
+    CHECK(error_type_of("v1.provider-error_2") == "provider_error");
+    CHECK(error_type_of(longest) == "provider_error");
+    CHECK(error_type_of(too_long) == "provider_error");
+    CHECK(error_type_of("") == "provider_error");
+    CHECK(error_type_of("sk-or-v1-0123abcd leaked") == "provider_error");
+    CHECK(error_type_of(R"(sk-or-v1-0123abcd\"leaked)") == "provider_error");
+    CHECK(error_type_of(R"(\u001b[31mred\u001b[0m)") == "provider_error");
+    CHECK(error_type_of(R"(line\nbreak)") == "provider_error");
+    CHECK(error_type_of(R"(\u00e9t\u00e9)") == "provider_error");
 }
 
 TEST_CASE("error types shaped like known keys are rejected") {
     const std::string openrouter_key = "sk-or-v1-" + std::string(max_error_type_length, 'a');
-    CHECK(error_type_of(openrouter_key) == "unrecognized");
-    CHECK(error_type_of("sk-ant-api03-0123456789abcdefghij") == "unrecognized");
-    CHECK(error_type_of("AKIA0123456789ABCDEF") == "unrecognized");
+    CHECK(error_type_of(openrouter_key) == "provider_error");
+    CHECK(error_type_of("sk-ant-api03-0123456789abcdefghij") == "provider_error");
+    CHECK(error_type_of("AKIA0123456789ABCDEF") == "provider_error");
 }
 
 TEST_CASE("a mid-stream error type is sanitized") {
     const StreamOutcome outcome = apply_all({
         R"({"error":{"code":500,"message":"x","metadata":{"error_type":"bad\u0007type"}},"choices":[]})",
     });
-    CHECK(outcome.error_type == "unrecognized");
+    CHECK(outcome.error_type == "provider_error");
 }
 
 TEST_CASE("parse_error_body rejects bodies that are not error JSON") {
@@ -403,4 +401,62 @@ TEST_CASE("an empty data event is ignored instead of failing the stream") {
     CHECK(result->empty());
     CHECK(stream.outcome().text.empty());
     CHECK_FALSE(stream.outcome().error_message.has_value());
+}
+
+TEST_CASE("later partial usage preserves known accounting") {
+    const StreamOutcome outcome = apply_all({
+        R"({"usage":{"prompt_tokens":12,"cost":0.002}})",
+        R"({"usage":{"completion_tokens":3,"cost":null}})",
+        R"({"usage":{"prompt_tokens":18446744073709551615}})",
+    });
+    CHECK(outcome.usage.prompt_tokens == 12);
+    CHECK(outcome.usage.completion_tokens == 3);
+    CHECK(outcome.usage.cost == doctest::Approx(0.002));
+}
+
+TEST_CASE("an invalid chunk identifier cannot hide a later recovery identifier") {
+    const StreamOutcome outcome = apply_all({
+        R"({"id":"bad id","choices":[]})",
+        R"({"id":"gen-valid_123","choices":[]})",
+        R"({"id":"gen-other","choices":[]})",
+    });
+    CHECK(outcome.generation_id == "gen-valid_123");
+}
+
+TEST_CASE("provider errors stop content but retain trailing accounting") {
+    const StreamOutcome outcome = apply_all({
+        R"({"choices":[{"delta":{"content":"before"}}]})",
+        R"({"error":{"code":503,"message":"private prompt","metadata":{"error_type":"private_identifier"}},"choices":[{"delta":{"content":"discard"}}]})",
+        R"({"choices":[{"delta":{"content":"also discard"}}],"usage":{"cost":0.01}})",
+    });
+    CHECK(outcome.text == "before");
+    CHECK(outcome.usage.cost == doctest::Approx(0.01));
+    CHECK(outcome.error_type == "provider_error");
+    REQUIRE(outcome.error_message.has_value());
+    CHECK(outcome.error_message->find("private") == std::string::npos);
+    CHECK(outcome.error_message->find("routing") != std::string::npos);
+}
+
+TEST_CASE("framing rejects control bytes before an event is complete") {
+    SseParser parser;
+    const auto result = parser.feed(std::string_view{"data: abc\0def", 13});
+    CHECK_FALSE(result.has_value());
+}
+
+TEST_CASE("valid JSON that is not an object is not a chat event") {
+    ChatStream chat;
+    CHECK_FALSE(chat.on_data("[]").has_value());
+    CHECK_FALSE(chat.on_data("42").has_value());
+}
+
+TEST_CASE("an error finish is terminal for answer content even without an error object") {
+    const StreamOutcome outcome = apply_all({
+        R"({"choices":[{"delta":{"content":"before"}}]})",
+        R"({"choices":[{"delta":{},"finish_reason":"error"}]})",
+        R"({"choices":[{"delta":{"content":"discard"},"finish_reason":"stop"}],"usage":{"cost":0}})",
+        "[DONE]",
+    });
+    CHECK(outcome.text == "before");
+    CHECK(outcome.usage.cost == 0);
+    CHECK_FALSE(orcli::stream_complete(outcome));
 }

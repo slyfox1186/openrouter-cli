@@ -4,6 +4,7 @@
 #include "fsutil.hpp"
 
 #include <doctest/doctest.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -189,4 +190,87 @@ TEST_CASE("a session holding invalid UTF-8 is saved and reopened") {
     REQUIRE(reopened->data().history.size() == 2);
     CHECK(reopened->data().history.at(1).content == "reply");
     CHECK(reopened->data().system_prompt.starts_with("prompt "));
+}
+
+TEST_CASE("session validation rejects incomplete histories and invalid identity") {
+    const TempDir temp;
+    REQUIRE(orcli::ensure_private_dir(temp.state() / "sessions").has_value());
+    const auto path = temp.state() / "sessions" / "bad.json";
+    const nlohmann::json valid = {{"v", 1},
+                                  {"model_id", "vendor/model"},
+                                  {"system_prompt", ""},
+                                  {"session_uuid", std::string(uuid_length, 'a')},
+                                  {"history",
+                                   {{{"role", "user"}, {"content", "question"}},
+                                    {{"role", "assistant"}, {"content", "answer"}}}}};
+    auto invalid = valid;
+    SUBCASE("unknown version") {
+        invalid["v"] = 2;
+    }
+    SUBCASE("empty model") {
+        invalid["model_id"] = "";
+    }
+    SUBCASE("invalid uuid") {
+        invalid["session_uuid"] = "invalid";
+    }
+    SUBCASE("incomplete exchange") {
+        invalid["history"].erase(1);
+    }
+    SUBCASE("wrong role order") {
+        invalid["history"][0]["role"] = "assistant";
+    }
+    REQUIRE(orcli::atomic_write(path, invalid.dump()).has_value());
+    CHECK_FALSE(Session::open(temp.state(), "bad").has_value());
+}
+
+TEST_CASE("commit refuses a nonalternating exchange without changing history") {
+    const TempDir temp;
+    auto session = Session::open(temp.state(), "roles");
+    REQUIRE(session.has_value());
+    REQUIRE(session->create("vendor/model", "").has_value());
+    CHECK_FALSE(session
+                    ->commit({.role = "assistant", .content = "wrong"},
+                             {.role = "user", .content = "wrong"})
+                    .has_value());
+    CHECK(session->data().history.empty());
+    CHECK_FALSE(session->exists());
+}
+
+TEST_CASE("oversized serialized session files are refused before parsing") {
+    const TempDir temp;
+    REQUIRE(orcli::ensure_private_dir(temp.state() / "sessions").has_value());
+    const auto path = temp.state() / "sessions" / "large.json";
+    REQUIRE(orcli::atomic_write(path, "{}").has_value());
+    constexpr std::uintmax_t max_session_bytes = 128 * 1024 * 1024;
+    fs::resize_file(path, max_session_bytes + 1);
+    const auto session = Session::open(temp.state(), "large");
+    REQUIRE_FALSE(session.has_value());
+    CHECK(session.error().message.contains("byte limit"));
+}
+
+TEST_CASE("serialized session write limit preserves the previous exchange") {
+    const TempDir temp;
+    auto session = Session::open(temp.state(), "size");
+    REQUIRE(session.has_value());
+    REQUIRE(session->create("vendor/model", "").has_value());
+    REQUIRE(session
+                ->commit({.role = "user", .content = "original"},
+                         {.role = "assistant", .content = "retained"})
+                .has_value());
+    const auto path = temp.state() / "sessions" / "size.json";
+    constexpr std::size_t max_session_bytes = 128 * 1024 * 1024;
+    constexpr std::size_t escaped_control_bytes = 6;
+    const auto before = orcli::read_regular_file(path, max_session_bytes);
+    REQUIRE(before.has_value());
+    const Message large{.role = "user",
+                        .content =
+                            std::string(max_session_bytes / escaped_control_bytes + 1, '\1')};
+    const auto saved = session->commit(large, {.role = "assistant", .content = "new answer"});
+    REQUIRE_FALSE(saved.has_value());
+    CHECK(saved.error().code == Exit::config);
+    CHECK(saved.error().message.contains("previous session is unchanged"));
+    CHECK(session->data().history.size() == 2);
+    const auto after = orcli::read_regular_file(path, max_session_bytes);
+    REQUIRE(after.has_value());
+    CHECK(*after == *before);
 }

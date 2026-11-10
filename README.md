@@ -1,524 +1,536 @@
+<div align="center">
+
 # openrouter-cli
 
-`openrouter-cli` sends a question and optional source files to any model on
-[OpenRouter](https://openrouter.ai), optionally pinned to specific providers, and streams the
-answer to standard output. It was written so coding agents such as Claude Code and Codex can ask
-another model to review a plan or a change, but it works the same from a shell. Each call prints
-the charge OpenRouter reports for it, and every call is recorded in a local cost log. API keys
-are stored encrypted with `systemd-creds`, never in plain text.
+**Ask any AI model on [OpenRouter](https://openrouter.ai) to check your plan or your code, right from your terminal.**
 
-## Requirements
+[![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-1f6feb?style=flat-square)](#update-or-uninstall)
+[![License MIT](https://img.shields.io/badge/license-MIT-1a7f37?style=flat-square)](LICENSE)
+[![C++26](https://img.shields.io/badge/C%2B%2B-26-9a6700?style=flat-square)](#reference)
+[![Linux x86-64](https://img.shields.io/badge/platform-Linux%20x86--64-57606a?style=flat-square)](#before-you-start)
 
-- Linux on x86_64.
-- CMake 4.0 or later and Ninja.
-- Clang 19 or later (`clang` and `clang++`). lld is used when that Clang finds `ld.lld`;
-  otherwise the default linker is used.
-- GCC 15's libstdc++, the C++ standard library Clang uses on Linux, for C++26 library support.
-- Static libraries for OpenSSL 3, zlib and zstd (`libssl.a`, `libcrypto.a`, `libz.a`,
-  `libzstd.a`). On Ubuntu they come with `libssl-dev`, `zlib1g-dev` and `libzstd-dev`.
-- `clang-format`, `clang-tidy` and `cppcheck` for the checks (a `clang-format-N` or
-  `clang-tidy-N` matching the Clang major version is preferred when present).
-- Network access to github.com during the first configure, which downloads nlohmann/json,
-  CLI11, jitterentropy and curl (plus doctest and cpp-httplib for tests) from release archives
-  pinned by SHA-256.
-- At run time: systemd with `systemd-creds --user` (tested with systemd 259), network access to
-  openrouter.ai, and an OpenRouter account.
+[What it does](#what-it-does) ·
+[Install](#install) ·
+[Sign in](#sign-in) ·
+[First question](#ask-your-first-question) ·
+[Costs](#what-costs-money) ·
+[Privacy](#privacy-and-safety) ·
+[Problems](#when-something-goes-wrong) ·
+[Reference](#reference)
 
-## Build and install
+</div>
+
+## What it does
+
+[OpenRouter](https://openrouter.ai) is a service that gives you **one account for hundreds of AI models** from many different companies. `openrouter-cli` is a small program that sends your question, along with any files you choose, to one of those models. The answer appears in your terminal as the model writes it.
+
+Out of the box, the model plays the part of a **careful reviewer**. It reads your plan or code and replies with a verdict, then a list of problems ordered from most to least serious. Each problem says *where* it is, *why* it matters and *how* to fix it. You can also switch the reviewer off and ask ordinary questions.
+
+It was made for people who work with AI coding assistants such as Claude Code and Codex, so the assistant can ask a *different* model to double-check its work. It is just as handy when you type the commands yourself.
+
+```mermaid
+flowchart LR
+    A["You, or your AI assistant"] -->|"question and files"| B["openrouter-cli"]
+    B -->|"HTTPS"| C["OpenRouter"]
+    C --> D["The model you picked"]
+    D -->|"answer"| B
+    B --> E["Your terminal, plus a saved copy"]
+```
+
+Here is what you can expect from it:
+
+- You pick a model by its exact ID, by a few words of its name, or by a short nickname you save.
+- You can see a model's prices **before you spend a cent**. Searching for models and checking prices is ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square).
+- Your OpenRouter key is stored ***encrypted***. The program has no way to save it as plain text.
+- Every answer is saved to a file on your computer, and every charge goes into a local cost log.
+- Before anything leaves your computer, the program looks for passwords and keys in what you are sending and refuses to send them.
+- Follow-up questions can continue the same conversation.
+- Private routing is on by default. How long a request may be kept depends on your OpenRouter privacy settings and the provider's policy ([details](#privacy-and-safety)).
+
+## Before you start
+
+You will need:
+
+- [ ] A **Linux** computer with a 64-bit Intel or AMD processor (*x86-64*) and the standard GNU C library (*glibc*). Ubuntu, Debian, Fedora and Arch all use glibc.
+- [ ] **systemd 256 or newer**, which is what encrypts your key. Type `systemctl --version` to see yours.
+- [ ] An **OpenRouter account** from [openrouter.ai](https://openrouter.ai). Paid questions need credits on that account.
+- [ ] These build tools: **git**, **Clang** with C++26 support, **CMake 4.0 or newer**, **Ninja**, the **OpenSSL 3** development files, the static C++ runtime library and **binutils**.
+- [ ] An internet connection the first time you build. The build downloads a few libraries from GitHub, pinned to exact versions and checked against known fingerprints (SHA-256).
+
+On **Ubuntu 26.04**, this command installs the build tools:
 
 ```bash
+sudo apt install git clang cmake ninja-build libssl-dev libstdc++-15-dev binutils
+```
+
+On other distributions, install the matching packages with your package manager.
+
+*Not sure your compiler is new enough?* Just try the build. It checks the compiler before it does anything else and stops with a plain message if something is missing.
+
+## Install
+
+Copy and paste these three lines into a terminal:
+
+```bash
+git clone https://github.com/slyfox1186/openrouter-cli.git
+cd openrouter-cli
 scripts/build.sh
 ```
 
-The script always builds with the newest `clang` and `clang++` pair on `PATH` (named `clang`
-or `clang-N`); it stops if none is found or the newest is older than Clang 19. A default run
-performs these steps, reporting each as ok or FAILED:
+The build script does all of this for you:
 
-1. Format check with clang-format.
-2. Debug build with AddressSanitizer and UndefinedBehaviorSanitizer, then the tests.
-3. clang-tidy and cppcheck on `src/`.
-4. Release build (`-O2 -march=native`, link-time optimization, hardening flags, static
-   libstdc++ and libgcc).
-5. Static-link check: the binary may need only glibc (`libc`, `libm`, the dynamic loader and
-   the vDSO), then `--version`.
-6. Install, only if every earlier step passed.
+1. Finds the newest Clang on your computer.
+2. Builds the program.
+3. Runs its self-tests. They run *offline* against a pretend server, so they never use a real key and **never cost money**. Some tests wait for timeouts on purpose, so give them a few minutes.
+4. Installs the program as `~/.local/bin/openrouter-cli`, but only if every step passed.
 
-Later steps still run after a failure, so one log shows everything. The log is saved to
-`build/logs/build-<UTC time>.log`, with `build/logs/latest.log` pointing to the newest one, and
-ends with a summary of failed steps. The script exits 0 only if every step it ran passed.
-
-Each integration case's result is shown as it finishes, including its name and elapsed time.
-The suite deliberately exercises timeouts and retries, including a 30-second wait for a missing
-generation record, so pauses between completed cases are expected. A recorded local integration
-run took about 80 seconds. Let the suite finish to see its result; failures still block installation.
-Clang-tidy also prints each source file's result and elapsed time before moving to the next file.
-
-| Option | Effect |
-| --- | --- |
-| `--force` | Overwrite an existing, different `openrouter-cli` in the bin directory, and re-point skill links that point elsewhere. |
-| `--bin-dir DIR` | Install the binary to `DIR` (default `~/.local/bin`). |
-| `--no-skill` | Install, or with `--uninstall` remove, only the binary and not the skill links. |
-| `--no-install` | Run the checks and build; install nothing. |
-| `--uninstall` | Remove the installed binary and skill links, then exit without building (see [What gets installed](#what-gets-installed)). Combines only with `--bin-dir` and `--no-skill`. |
-| `--quick` | Skip the format check, debug build, tests, clang-tidy and cppcheck: release build, static-link check and install only. |
-| `--fresh` | Reconfigure every build directory from scratch. |
-| `--jobs N` | Parallel build jobs (default: `nproc`). |
-| `--list-compilers` | Show every Clang found and mark the one that would be used, then exit. |
-| `-h`, `--help` | Show the options, in color on a terminal (see [Usage](#usage) for the rules). |
-
-Each Clang version gets its own build directories, `build/debug-clang-<version>` and
-`build/release-clang-<version>`; clang-tidy and cppcheck read the debug tree's compile database.
-Invalid options exit with code 2.
-
-### What gets installed
-
-| Path | What |
-| --- | --- |
-| `~/.local/bin/openrouter-cli` | A copy of the release binary, mode 755. |
-| `~/.agents/skills/openrouter-cli` | Link to `skill/openrouter-cli` (Codex user skills). |
-| `~/.claude/skills/openrouter-cli` | Link to `../../.agents/skills/openrouter-cli` (Claude Code). |
-
-The binary is copied atomically. An identical binary already in place is left as is; a link into
-this project from an older install is replaced; any other file is refused unless `--force` is
-given; a directory is always refused. The same goes for the skill links, except that a real file
-or directory there is always refused. `~/.local/bin` must be on your `PATH`.
-
-The installed binary is a standalone copy, so you can move it. It keeps the project directory
-compiled in and reads `.env` and `state/` from there; set `OPENROUTER_CLI_HOME` to use another
-project directory.
-
-To remove the install:
+Now check that it worked:
 
 ```bash
-scripts/build.sh --uninstall
+openrouter-cli --version
 ```
 
-It deletes the binary (a file or link) in the bin directory and both skill links, wherever they
-point; removing a link leaves its target, so `skill/` is untouched. It refuses to delete a
-directory at the binary path or a real file or directory at a skill path, and exits 1 if
-anything was refused or a path could not be checked. Pass the same `--bin-dir` you
-installed with. Any other `openrouter-cli` still on `PATH` is listed but not removed. Nothing is
-built, and the run is not logged.
+You should see `openrouter-cli 0.1.0`.
 
-Stored keys stay in `state/credentials/`; run `openrouter-cli auth logout` first to delete them.
+<details>
+<summary><b>It says "command not found"</b></summary>
 
-The skill in `skill/openrouter-cli/SKILL.md` tells an agent when to use the tool, to get your
-approval with the model's published prices before each billed call, and how to send context and
-read the result.
+<br>
 
-## Signing in
+Your shell does not look in `~/.local/bin` yet. Add it to your search path, then open a new terminal:
+
+```bash
+echo 'PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+echo 'export PATH' >> ~/.bashrc
+```
+
+Using Zsh? Put the same two lines in `~/.zshrc` instead. Using Fish? Run `fish_add_path ~/.local/bin` once.
+
+</details>
+
+## Sign in
+
+Run this once:
 
 ```bash
 openrouter-cli auth login
 ```
 
-`auth login` uses OpenRouter's OAuth sign-in. It prints a URL; open it in any browser, sign in
-with your OpenRouter email and password on openrouter.ai, and approve access. Copy the code shown
-on the page, return to the terminal, and paste it at `Paste the code here, then press Enter:`
-below the URL. Press Enter to submit it. The terminal shows `Completing sign-in with OpenRouter...`
-while the CLI exchanges the code and stores your key. The code is valid for 10 minutes and works once.
-OpenRouter then creates an
-API key labelled `openrouter-cli on HOST` in your account, which the CLI checks and stores
-encrypted. The CLI never asks for or sees your password. Because only a URL and a code change
-hands, this works over SSH: open the URL on any computer.
+The program walks you through four steps:
 
-To store a key you already have instead:
+1. It prints a link. Open it in a web browser. *Using SSH?* The browser can be on any computer.
+2. Sign in to OpenRouter and approve access.
+3. Copy the code that the browser shows you.
+4. Paste the code back into the terminal and press <kbd>Enter</kbd>.
 
-```bash
-openrouter-cli auth set
-```
-
-`auth set` reads the key from the terminal with echo off, or from standard input when it is
-piped. The key must start with `sk-or-`. Before storing it, the CLI checks it with OpenRouter;
-an inference key that turns out to be a Management key is refused.
-
-If a key is already stored, both commands refuse unless `--replace` is given. A key that fails
-the check is not stored and leaves any existing one in place. If `auth login` created a key but
-could not store it, the message names the key's label so you can revoke it at
-<https://openrouter.ai/settings/keys>.
-
-### Management key
-
-OpenRouter only lets a Management key read the account's keys, credits and activity; a key from
-`auth login` cannot. Create one at <https://openrouter.ai/settings/management-keys> (an expiry
-date is a good idea), then store it:
-
-```bash
-openrouter-cli auth set --management
-```
-
-A Management key is used only for the `account keys`, `account credits` and `account activity`
-commands and for the identity lines of `status`. It is never sent with a question or to `/key`.
-
-### Status and logout
+That's it. OpenRouter creates a new key for this computer, and `openrouter-cli` stores it encrypted. To confirm you are signed in:
 
 ```bash
 openrouter-cli status
-openrouter-cli auth logout
-openrouter-cli auth logout --management
 ```
 
-`status` prints one `name: value` line per item and never prints key text:
+**Already have an OpenRouter key?** Run `openrouter-cli auth set` and paste it when asked. Nothing you type is shown on screen.
 
-- `credentials`: where keys are stored (`systemd-creds --user on HOST`).
-- `logged in`: `yes`, `no` (with a hint to run `auth login`), `key rejected` (with a hint to run
-  `auth login --replace`) or `unknown` when the lookup failed.
-- From the stored API key: `key creator` (your user id, or the member who created an
-  organization key), `owner` (`organization <id>` or `individual account`), `workspace`,
-  `key label` (OpenRouter's masked form, such as `sk-or-v1-0e6...1c96`), `key expires`,
-  `free tier`, `usage today`, `usage this week`, `usage this month`, `usage total`, `limit`,
-  `limit remaining` and `limit reset`.
-- `management key`: `stored`, `not stored` (with a hint to add one), or `stored but rejected`
-  (with a hint to run `auth set --management --replace`).
-- With a Management key: `credits remaining (Management key's account)`, then the key
-  creator's `email`, `name` and `role`, each marked "as seen by the Management key's
-  organization". The two keys are stored separately and need not belong to the same account.
+**Never put your key on a command line, in a settings file or in an environment variable.** Those places can leak it, and the program refuses a key it finds in its settings file.
 
-Values OpenRouter leaves empty show as `n/a`; `email` says `not available` when OpenRouter has no
-match or no access, and `lookup failed` when the search could not finish. `status` exits 5 when a
-stored key is rejected or a lookup fails, and 7 when a stored key cannot be decrypted.
+## Ask your first question
 
-`auth logout` deletes every stored key; `--management` deletes only the Management key. It works
-without `systemd-creds` and with damaged credential files, and logging out twice is not an
-error. Logout only removes the local copy: the key stays valid at OpenRouter until you revoke it
-at <https://openrouter.ai/settings/keys>.
-
-## Key storage
-
-Keys are encrypted with `systemd-creds --user` and stored in
-`state/credentials/api-key.cred` and `state/credentials/management-key.cred` (directory mode 700,
-files mode 600). systemd chooses the encryption key: its host secret, plus the TPM2 chip when one
-is available. A `--user` credential is also bound to your user id, user name and machine id, and
-each file carries its own name, so the two files cannot be swapped. The first use makes systemd
-create its host secret, `/var/lib/systemd/credential.secret`, owned by root.
-
-Credentials are bound to the machine. Each computer signs in on its own with `auth login` or
-`auth set`; copying `.cred` files to another machine does not work.
-
-What this protects against: disclosure of a credential file on its own, for example when it is
-copied, backed up, committed to git or read by another account. What it does not protect
-against: code running as your user or as root, which can decrypt the key the same way the CLI
-does, or someone holding the whole disk including the host secret. The CLI keeps no plaintext
-key in files, command-line arguments, environment variables or logs; it clears its own copies of
-a key from memory after use and disables core dumps so a crash cannot write a key to disk. It
-makes no claim about swap or about copies inside the libraries it uses.
-
-There is no plaintext fallback. If `systemd-creds` is missing or fails, every command that needs
-a key exits with code 7 and says why.
-
-### Moving a key out of `.env`
-
-Older versions read `OPENROUTER_API_KEY` from `.env`. A non-empty `OPENROUTER_API_KEY` or
-`OPENROUTER_MANAGEMENT_KEY` line in `.env` now makes every command exit with code 7, except
-`auth set`, `auth login` and `auth logout`. Move the key once, without printing it, then delete
-the line from `.env`:
+**Step 1.** Search for a model. This is ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) and needs no key.
 
 ```bash
-grep -m1 '^OPENROUTER_API_KEY=' .env | cut -d= -f2- | openrouter-cli auth set
+openrouter-cli models find "gemini"
 ```
 
-## Configuration
-
-The optional project `.env` holds settings only, never keys. Without it every setting takes the
-default below. To change one:
+**Step 2.** Look at its prices and limits. Also ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square).
+Replace `AUTHOR/MODEL` with an exact ID from the search results.
 
 ```bash
-cp .env.example .env
-chmod 600 .env
+openrouter-cli models show AUTHOR/MODEL
 ```
 
-The project `.env` is the only configuration source; exported shell variables do not override it.
-If `.env` exists, it must be a regular file owned by you with no group or other permission bits,
-or commands exit with code 7.
+**Step 3.** Give it a short nickname so you never have to type the full ID again.
 
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `OPENROUTER_CLI_BASE_URL` | `https://openrouter.ai/api/v1` | API root. |
-| `OPENROUTER_CLI_APP_REFERER` | empty | `HTTP-Referer` header; empty sends none. |
-| `OPENROUTER_CLI_APP_TITLE` | `openrouter-cli` | App name sent in the `X-OpenRouter-Title` header. |
-| `OPENROUTER_CLI_APP_CATEGORIES` | `cli-agent` | Sent in the `X-OpenRouter-Categories` header. |
-| `OPENROUTER_CLI_DEFAULT_EFFORT` | `high` | Reasoning effort when `--effort` is not given. |
-| `OPENROUTER_CLI_MAX_OUTPUT_TOKENS` | `64000` | Output budget, reasoning included; clamped to each model's limit. |
-| `OPENROUTER_CLI_PRIVACY` | `zdr` | `zdr` or `no-training` (see below). |
-| `OPENROUTER_CLI_CATALOG_TTL_HOURS` | `24` | Age at which the cached model catalog is refetched. |
-| `OPENROUTER_CLI_IDLE_TIMEOUT_SECONDS` | `300` | Abort when no bytes arrive for this long; keepalives count. |
-| `OPENROUTER_CLI_TOTAL_TIMEOUT_SECONDS` | `3600` | Upper limit for one call. |
-| `OPENROUTER_CLI_MAX_FILE_BYTES` | `1048576` | Largest file accepted by `-f`. |
-| `OPENROUTER_CLI_MAX_INPUT_BYTES` | `4194304` | Largest total request text, history included. |
+```bash
+openrouter-cli models save reviewer AUTHOR/MODEL
+```
 
-### Privacy setting
+**Step 4.** Ask your question. This one is ![Usually paid](https://img.shields.io/badge/Usually%20paid-cf222e?style=flat-square) unless the price from step 2 was zero.
 
-With `zdr`, every request carries `provider.data_collection = "deny"` and `provider.zdr = true`,
-so OpenRouter routes it only to endpoints that do not train on prompts and are listed as zero
-data retention. `no-training` sends only `data_collection = "deny"`; use it for a model or
-provider that has no ZDR endpoint, accepting that the provider may keep the prompt.
+```bash
+openrouter-cli -m reviewer --role plain "Explain what a race condition is in three sentences."
+```
 
-`zdr = true` also admits Safety Retention endpoints when your account allows them. Under Safety
-Retention, OpenRouter or the provider may keep prompts and responses from any request, flagged or
-not. Self-serve accounts allow Safety Retention unless you change it; to exclude those endpoints,
-choose "ZDR only" in your OpenRouter privacy settings (Google models have a separate setting).
-Some models are then unavailable. See OpenRouter's
-[zero data retention guide](https://openrouter.ai/docs/guides/features/zdr).
+Here `-m` picks the model, and `--role plain` asks an ordinary question. Leave out `--role plain` and the model reviews whatever you send it, which is what the recipes below do with your own files.
 
-## Usage
+### What you will see
+
+The answer appears in your terminal as the model writes it. Models that "think" first can take **several minutes**, and that is normal. While you wait, a progress line appears every 30 seconds:
 
 ```text
-openrouter-cli [OPTIONS] [--] QUERY            QUERY "-" reads the prompt from stdin
-openrouter-cli models find [--refresh] [--] NAME
-openrouter-cli models show [--] MODEL
-openrouter-cli models save ALIAS MODEL_ID
-openrouter-cli models list
-openrouter-cli auth login [--replace]
-openrouter-cli auth set [--management] [--replace]
-openrouter-cli auth logout [--management]
-openrouter-cli status
-openrouter-cli account balance
-openrouter-cli account keys
-openrouter-cli account credits
-openrouter-cli account activity [--days N]
-openrouter-cli spend [--since today|7d|30d|all] [--resolve]
+openrouter-cli: waiting, 60s elapsed, 0 bytes received
 ```
 
-Options come first and the query comes last. Put `--` before a query that starts with `-` or is a
-subcommand name. Question options cannot be combined with a subcommand.
+When the answer is finished, one last line shows the price, which model and provider answered, how many tokens were used and where the answer was saved:
 
-Every command and subcommand takes `-h` or `--help`, for example `openrouter-cli --help` or
-`openrouter-cli models find -h`. The top-level page lists every command with its arguments and
-ends with examples. Help is in color when stdout is a terminal whose `TERM` is set and is not
-`dumb`. A non-empty `NO_COLOR` turns color off, and `CLICOLOR_FORCE=1` turns it on for a pager
-such as `less -R`. Text wraps to the terminal width, held between 40 and 100 columns; piped help
-uses `COLUMNS` when it is set, otherwise 80. `scripts/build.sh --help` follows the same color rules.
-
-| Option | Meaning |
-| --- | --- |
-| `-m, --model` | Saved alias, exact id, `~author/family-latest`, or plain words. |
-| `-p, --provider` | Use only this provider slug or endpoint tag; repeatable. |
-| `-f, --file` | File to include, line-numbered; repeatable. |
-| `--role` | `review` (default) or `plain`. |
-| `-s, --system` | Extra system text, or `@FILE` to read it from a file. |
-| `-e, --effort` | `max`, `xhigh`, `high`, `medium`, `low`, `minimal` or `none`. |
-| `--max-output-tokens` | Output budget for this call. |
-| `--privacy` | `zdr` (default) or `no-training`. |
-| `--session` | Keep history under this name for follow-up questions. |
-
-### Finding a model
-
-```bash
-openrouter-cli models find "gemini 4 argon"
-openrouter-cli models show google/gemini-4-argon
-openrouter-cli models save argon google/gemini-4-argon
-openrouter-cli models list
+```text
+cost ... | MODEL via PROVIDER | in ... (cached ...) | out ... (reasoning ...) | answer /path/to/answer.md
 ```
 
-`models find` and `models show` read OpenRouter's public model catalog, cached in
-`state/catalog.json`; `--refresh` refetches it. These commands need no key. `models show` prints
-the id, name, context length, maximum output, reasoning support, published prices per million
-tokens for input, cached input, cache writes, output and internal reasoning, any per-request
-price and any expiration date. A table of the model's endpoints follows, with the columns
-`TAG`, `PROVIDER`, `INPUT`, `OUTPUT`, `CONTEXT`, `MAX OUTPUT` and `NOTES` (service tier and
-endpoint status). Prices are catalog rates with the time they were fetched; the serving
-provider's rate can differ.
+## Everyday recipes
 
-When `-m` gets plain words that match exactly one model, that model is used and the name is saved
-as an alias. Several matches or none exit with code 4 and print the candidates.
+**Options always go first, and your question always goes last.** Swap the file names in these examples for your own files.
 
-### Choosing a provider
+**Review several files at once.** Repeat `-f` for each file. Lines are numbered, so the reviewer can point at exact lines.
 
 ```bash
-openrouter-cli -m google/gemini-4-argon -p google-vertex "..."
-openrouter-cli -m google/gemini-4-argon -p google-vertex/global/priority "..."
+openrouter-cli -m reviewer -f src/http.cpp -f src/http.hpp "Review the retry logic."
 ```
 
-Each `-p` value is sent unchanged in OpenRouter's `provider.only` list; the order is not a
-preference. Copy values from the `TAG` column of `models show`, or use a tag's provider prefix,
-such as `google-vertex`, for that provider's standard endpoints. OpenRouter applies its own
-routing rules:
-
-- A service-tier endpoint's slug is its standard endpoint's slug with the tier appended, such as
-  `google-vertex/global/priority`.
-- Flex, ultrafast and closed-weight tier endpoints are opt-in: a base slug never selects them,
-  so pass the full tag. Priority endpoints of open-weight models take part in default routing
-  and do match their base slug.
-- The `fast` and `priority` slug suffixes are interchangeable, so `openai/priority` matches the
-  same endpoint as `openai/fast`.
-- Your account's allowed-provider settings also apply.
-
-See OpenRouter's
-[provider selection guide](https://openrouter.ai/docs/guides/routing/provider-selection) and
-[service tiers guide](https://openrouter.ai/docs/guides/features/service-tiers).
-
-When no endpoint satisfies the providers, the privacy setting and your account settings,
-OpenRouter rejects the request and the CLI exits with code 5, suggesting
-`openrouter-cli models show MODEL`. Under the default `zdr` privacy, a provider without a ZDR
-endpoint is rejected this way; `--privacy no-training` allows it.
-
-### Asking for a review
+**Review your latest code changes.** A `-` in place of the question reads it from the pipe.
 
 ```bash
-openrouter-cli -m argon -f src/http.cpp -f src/http.hpp \
-  "Goal: retry free GET requests on 429 and 5xx. Review the retry logic."
+git diff | openrouter-cli -m reviewer -
 ```
 
-Files are read once and sent with their paths and line numbers, so the reply can cite
-`src/http.cpp:120`. The `review` role asks for assumptions, a verdict (`APPROVE`,
-`APPROVE WITH CHANGES` or `RETHINK`) and findings ordered by severity, each with a location,
-evidence and an exact fix. `--role plain` sends the question alone.
-
-A single command-line argument is limited to about 128 KiB, so send long prompts through stdin
-with a quoted heredoc:
+**Send a long question.** Type it between the two `EOF` lines.
 
 ```bash
-openrouter-cli -m argon -f docs/plan.md - <<'EOF'
-Goal and constraints...
-Questions for the reviewer...
+openrouter-cli -m reviewer -f plan.md - <<'EOF'
+What I am trying to do, what I changed,
+and what I want you to check...
 EOF
 ```
 
-### Follow-up rounds
+**Ask an ordinary question** with no review format:
 
 ```bash
-openrouter-cli -m argon --session retry -f src/http.cpp "Review the retry logic."
-openrouter-cli --session retry -f src/http.cpp "I fixed findings 1 and 3. Check the fixes."
+openrouter-cli -m reviewer --role plain "Explain this design."
 ```
 
-A session pins its model and system text when it is created; later rounds omit `-m`, `-s` and
-`--role`. Only complete answers are added to the history, and the whole history is sent each
-round. A session is locked while a call uses it; a second call on the same session exits with
-code 3.
-
-### Account information
+**Have a back-and-forth conversation.** Give it a name with `--session`. Later rounds use the same model automatically, so leave out `-m`.
 
 ```bash
-openrouter-cli account balance
+openrouter-cli -m reviewer --session review -f plan.md "Review this plan."
+openrouter-cli --session review -f plan.md "I fixed the second problem. Review the updated plan."
+```
+
+The session remembers the conversation, but **it does not reread your files**. Attach a changed file again with `-f`. *Each round resends the whole conversation*, so later rounds can cost more than earlier ones.
+
+**Choose a specific provider.** Copy a tag from the `TAG` column of `models show`:
+
+```bash
+openrouter-cli -m reviewer -p TAG "Review this plan."
+```
+
+**Ask a question that starts with a dash** or matches a command name. Put `--` in front of it:
+
+```bash
+openrouter-cli -m reviewer -- "--force: is this flag safe?"
+```
+
+## What costs money?
+
+| What you run | Cost |
+| --- | --- |
+| A question: `openrouter-cli -m MODEL "..."` | ![Usually paid](https://img.shields.io/badge/Usually%20paid-cf222e?style=flat-square) |
+| Each follow-up round in a `--session` | ![Usually paid](https://img.shields.io/badge/Usually%20paid-cf222e?style=flat-square) |
+| `models find`, `models show`, `models save`, `models list` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
+| `status`, `account balance`, `account keys`, `account credits`, `account activity` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
+| `spend`, `spend --resolve` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
+| `auth login`, `auth set`, `auth logout`, `--help`, `--version` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
+
+A question costs whatever the model's published price says, so it is free only when `models show` lists a price of zero.
+
+**A paid question is never retried automatically**, because a retry could charge you twice. If a question fails, the program tells you, and you decide whether to try again.
+
+### Keep an eye on spending
+
+```bash
+openrouter-cli spend              # everything so far
+openrouter-cli spend --since 7d   # the last 7 days (also: today, 30d, all)
+openrouter-cli spend --resolve    # look up charges that were not known yet
+openrouter-cli account balance    # usage and limit of your key
+```
+
+Sometimes OpenRouter reports a charge a little later. Until then the cost shows as *unknown*, which is different from zero. `spend --resolve` fetches it for free.
+
+<details>
+<summary><b>See your whole account (needs a Management key)</b></summary>
+
+<br>
+
+OpenRouter offers a separate *Management key* in its settings. With one, you can list every key on your account, see credits bought and used, and see usage by day, model and provider. The Management key is **only used for these account commands** and is never sent with a question.
+
+```bash
+openrouter-cli auth set --management
 openrouter-cli account keys
 openrouter-cli account credits
 openrouter-cli account activity --days 7
 ```
 
-All four only read from OpenRouter and are free.
+`--days` accepts 1 to 30 completed UTC days (default 30).
 
-- `account balance` uses the stored API key and shows its usage and limit.
-- `account keys` lists the API keys in the Management key's workspace (an organization-scoped
-  Management key lists its default workspace), disabled and expired keys included: label,
-  created and expiry dates, disabled flag, usage per day, week, month and total, limit and
-  remaining. Key secrets are never shown; OpenRouter does not return them.
-- `account credits` shows credits purchased, used and remaining.
-- `account activity` shows requests, prompt, completion and reasoning tokens and cost per UTC
-  date, model and provider for the last 30 completed UTC days. `--days N` (1 to 30) limits it
-  to the last N completed days.
+</details>
 
-`account keys`, `account credits` and `account activity` need a Management key.
+## Privacy and safety
 
-### Spend
+**Your key is encrypted.** It is stored with [systemd-creds](https://www.freedesktop.org/software/systemd/man/latest/systemd-creds.html), which locks it to *your user account on this computer*. A copy on another computer will not open, so sign in separately on each computer. If encryption is not available (some containers, for example), the program stops with an error rather than saving your key unprotected.
 
-```bash
-openrouter-cli spend --since 7d
-openrouter-cli spend --resolve
-```
+**It checks what you send.** Before sending anything, it scans your question, your extra instructions, the conversation history and every attached file for known kinds of passwords and keys. It also refuses files known to hold credentials. When it finds one, **nothing is sent and nothing is charged**. The scan can miss unusual formats and can sometimes flag harmless text, so *please still look at what you send*.
 
-`spend` totals the local cost log by UTC day and by model, and lists calls whose cost is still
-unknown. `spend --resolve` instead asks OpenRouter for the charge of every unknown-cost call that
-has a generation id, oldest first (it ignores `--since`). It prints each charge it records and a
-count of calls resolved, still unknown and failed; run `spend` afterwards for the totals. A
-resolved call is never looked up again. Ctrl-C stops between lookups, keeping every charge
-already recorded. `--resolve` exits 5 if any lookup failed and 9 if a charge could not be
-written to the cost log. Both forms are free.
+**Private routing is on by default.** The default setting, `--privacy zdr`, only uses providers that do not train on your data and are listed as *zero data retention* (ZDR). Your OpenRouter privacy settings may also allow *Safety Retention* providers, which may keep requests. What is kept in the end depends on those settings and on each provider's policy. Read [OpenRouter's privacy guide](https://openrouter.ai/docs/guides/features/zdr) before sending sensitive material. If a model has no zero-retention provider, `--privacy no-training` lets you use it, but that provider may keep your request.
 
-## Output
+**Your history stays on your computer** as plain text files. Key encryption does not cover your saved questions and answers.
 
-Standard output carries only the answer, streamed as it arrives. Standard error carries the
-resolved model, a progress line every 30 seconds, any error, and a final cost line:
+**It never prints your key** or the text of your requests, and it hides raw error messages from providers. Model names and other details it shows have hidden terminal control codes made harmless; the answer itself is shown unchanged.
 
-```text
-openrouter-cli: cost $0.0412 | google/gemini-4-argon via Google Vertex | in 18,204 (cached 0) | out 3,911 (reasoning 2,870) | answer /path/to/state/answers/<call_id>.md
-```
+## Using it with Claude Code or Codex
 
-The cost is the account charge OpenRouter returns for the call; the tool never computes it from
-prices. If the stream ended without it, the tool asks OpenRouter's generation endpoint for up to
-about 30 seconds. After an idle timeout, a network error or an interruption the generation may
-still be running, so the cost stays unknown and `spend --resolve` can fetch it later. Unknown
-values print as `unknown`, never as 0.
-
-The answer file is created before the request is sent and written as text arrives, so a partial
-answer survives an error or an interruption.
-
-## Exit codes
-
-| Code | Meaning |
-| --- | --- |
-| 0 | Success. |
-| 1 | Internal error. |
-| 2 | Usage error. |
-| 3 | Refused before sending: possible secret, credential file, input too large, session busy, cost log not writable, or a key already stored without `--replace`. Nothing was sent. |
-| 4 | Unknown or ambiguous model; candidates are printed. |
-| 5 | API or network failure, including a rejected key and no endpoint matching the request. |
-| 6 | Incomplete answer: output budget used up, stream ended early, content filter, or empty reply. |
-| 7 | Configuration error: invalid `.env`, plaintext key in `.env`, no stored key, or `systemd-creds` missing or failing. |
-| 8 | Interrupted by SIGINT, SIGTERM or SIGHUP; the partial answer is kept. Also used when the answer finished but Ctrl-C stopped the cost lookup; `spend --resolve` can fetch the cost later. |
-| 9 | The call finished and may have been billed, but saving failed: the answer file, a cost record, or the session. The message names what failed and says not to retry automatically; the answer still went to standard output and any known cost is printed. `spend --resolve` also exits 9 when it cannot write a found charge. |
-
-When several apply, 8, 5 and 6 take precedence over 9. The question request is never retried
-automatically, since a retry is billed again; after exit 9 in particular, do not repeat the call
-without checking the cost line and `spend`. Free requests (catalog, generation lookup, account
-reads) are retried up to 3 times on connection errors, 408, 429 and 5xx responses.
-
-## Where state lives
-
-Project state is in `state/` inside the project directory (ignored by git; directories mode 700,
-files mode 600):
-
-| Path | Contents |
-| --- | --- |
-| `state/catalog.json` | Cached model catalog. |
-| `state/models.json` | Saved aliases. |
-| `state/credentials/` | Encrypted API key and Management key. |
-| `state/answers/<call_id>.md` | One file per call with the answer text. |
-| `state/sessions/<name>.json` | Session history, model and system text. |
-| `state/locks/` | Lock files for sessions, credentials and the alias registry. |
-
-The cost log is global for the user: `~/.local/state/openrouter-cli/costs.jsonl`, or
-`$XDG_STATE_HOME/openrouter-cli/costs.jsonl` when that variable is set. Each call writes a
-`pending` record before the request (if that write fails, nothing is sent), a `generation`
-record once OpenRouter assigns an id, a `result` record at the end, and a `resolved` record if
-the cost had to be looked up afterwards. `spend` reports malformed lines instead of skipping
-them. A call killed before OpenRouter assigned its generation id stays unresolved in the log;
-its charge still appears in `account activity` and on OpenRouter's activity page.
-
-## Privacy and secret scanning
-
-Everything you send goes to OpenRouter and to the provider that serves the model. Retention
-depends on the privacy setting above and on the provider policies OpenRouter publishes; this tool
-cannot verify them.
-
-Before sending, the CLI scans the query, system text (including `-s @FILE`), session history and
-every attached file for common credential formats: vendor API keys, private-key blocks,
-credential assignments and URLs with embedded passwords. It also refuses credential files by
-their resolved path, such as `.env`, private keys and SSH or cloud credential files
-(`.env.example` and `.env.sample` are allowed). A match stops the call with exit code 3 and names
-the file, line and pattern, never the value. The scan catches only the formats it knows, so it
-can miss a secret and can flag harmless text. You remain responsible for what you send.
-
-The tool never prints or logs a key, request bodies, prompt text or provider error bodies.
-Provider errors are shown as a status, an error type and a shortened message with anything that
-looks like a secret removed. Prompts and answers are stored locally in `state/` as plain text.
-
-Requests turn off OpenRouter's web search and context compression plugins. Plugins you enable as
-account defaults on OpenRouter may still run, and their charges are included in the reported
-cost.
-
-## Linking and portability
-
-The release binary links libcurl, OpenSSL, zlib, zstd, libstdc++ and libgcc statically. Only
-glibc (`libc`, `libm` and the dynamic loader) is shared, because a statically linked glibc cannot
-resolve host names reliably on other systems. The build fails its static-link check if the
-binary needs any other shared library.
-
-Release builds use `-march=native`, so the binary runs only on CPUs with the same instruction
-set extensions as the build machine. `scripts/build.sh` has no option to change this; for a
-binary that runs on any x86-64 CPU, configure a separate release tree by hand:
+The project includes an optional *skill* that teaches AI coding assistants how to use the program. To install it, build with:
 
 ```bash
-cmake --preset release -B build/release-portable -DORCLI_NATIVE=OFF \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-cmake --build build/release-portable
+scripts/build.sh --with-skills
 ```
+
+This links the skill into `~/.agents/skills/openrouter-cli` and `~/.claude/skills/openrouter-cli`. You can then say something like *"ask Gemini to review this plan"* to your assistant.
+
+The skill tells the assistant to show you the model and its prices and to **wait for your approval before every paid question**. It also tells the assistant never to touch your keys.
+
+*Keep the cloned folder where it is*, because the skill links point into it.
+
+## When something goes wrong
+
+Every command explains itself with `-h` or `--help`, for example `openrouter-cli models --help`.
+
+When a command fails, it prints a short message and ends with an *exit code*. Your shell shows the code of the last command with `echo $?`.
+
+| Code | What happened | What to do |
+| :---: | --- | --- |
+| **0** | It worked. | Nothing. |
+| **1** | Something unexpected went wrong inside the program. | Read the message. Report it if it repeats. |
+| **2** | The command was typed wrong. | Check `openrouter-cli --help`. Remember: options first, question last. |
+| **3** | Stopped before sending. A key or password was found, the input was too big, the session was busy, or the cost log could not be written. ![Nothing was sent or charged](https://img.shields.io/badge/Nothing%20was%20sent%20or%20charged-1a7f37?style=flat-square) | Remove the flagged text, send less, or wait for the other question in that session to finish. |
+| **4** | The model name was not found, or it matched more than one model. | Pick one of the printed choices, or use the exact ID. |
+| **5** | OpenRouter or the network had a problem, the key was rejected, or no provider matched your model, provider and privacy choices. | Read the message. For "no provider", check the tags with `models show`. Trying again is another paid question. |
+| **6** | The answer was cut short, for example because it ran out of room. | Any partial answer is kept in the answer file named in the message, unless the message says saving failed. Try a lower `-e` or a higher `--max-output-tokens`. Trying again is another paid question. |
+| **7** | A setup problem, such as no key stored, a key that cannot be decrypted, a key found in the settings file, or a bad setting. | Run `openrouter-cli status` and follow what it says. |
+| **8** | You interrupted it (for example with <kbd>Ctrl</kbd>+<kbd>C</kbd>), while the answer was arriving or while the cost was being looked up. | Any partial answer is kept in the answer file named in the message, unless the message says saving failed. |
+| **9** | The answer arrived, but saving the answer, cost or session failed. ![You may have been charged](https://img.shields.io/badge/You%20may%20have%20been%20charged-9a6700?style=flat-square) | Use the answer shown on screen. **Do not just run it again.** |
+
+After any failed paid question, look at the saved answer and at `openrouter-cli spend` *before* deciding to ask again. If an interruption, a network failure or a cut-short answer also had a saving problem, the program reports code 8, 5 or 6 rather than 9. If an interruption cuts short the final cost bookkeeping, the program waits at most two seconds for its log locks and tells you about any record it could not save.
+
+## Update or uninstall
+
+**To update**, get the latest code and build again:
+
+```bash
+git pull
+scripts/build.sh
+```
+
+The new version replaces the old one in a single step.
+
+**To uninstall**, run this from the cloned folder:
+
+```bash
+scripts/build.sh --uninstall
+```
+
+If you installed with `--bin-dir`, pass the same `--bin-dir` again. Uninstalling removes the program and the skill links. It leaves your keys, settings, history and cost log where they are.
+
+To remove your stored keys as well, run `openrouter-cli auth logout` **before** uninstalling. Your key still works at OpenRouter until you delete it in your [OpenRouter key settings](https://openrouter.ai/settings/keys).
+
+## Reference
+
+Everything below is optional detail. Click a heading to open it.
+
+<details>
+<summary><b>All commands</b></summary>
+
+<br>
+
+| Command | What it does |
+| --- | --- |
+| `openrouter-cli [OPTIONS] QUERY` | Ask a question. `-` as the query reads it from standard input. |
+| `models find [--refresh] WORDS` | List models matching the words. `--refresh` downloads a fresh model list first. |
+| `models show MODEL` | Prices, context and output limits, reasoning efforts and provider tags. |
+| `models save ALIAS MODEL_ID` | Save a nickname for an exact model ID. |
+| `models list` | List saved nicknames. |
+| `spend [--since PERIOD] [--resolve]` | Totals from the cost log. PERIOD is `today`, `7d`, `30d` or `all`. |
+| `auth login [--replace]` | Sign in with your browser and store a new key. |
+| `auth set [--management] [--replace]` | Store an existing key, typed at a hidden prompt or piped in. |
+| `auth logout [--management]` | Delete stored keys from this computer. `--management` deletes only the Management key. |
+| `status` | Who is signed in, plus key usage and limits. |
+| `account balance` | Usage and limit of your key. |
+| `account keys` | Every key on your account (Management key). |
+| `account credits` | Credits bought and used (Management key). |
+| `account activity [--days N]` | Usage per day, model and provider (Management key). |
+
+`auth login` and `auth set` never overwrite a stored key unless you add `--replace`. Keys are checked with OpenRouter before they are stored. Deleting a key from this computer does not delete it at OpenRouter.
+
+**How model names are matched.** `-m` accepts an exact ID, a saved nickname, an `~author/family-latest` ID or plain words. An exact ID wins over a nickname, and a nickname wins over plain words. Plain words that match exactly one model are used without saving anything. Only `models save` creates a nickname. The model list is cached; if an automatic refresh fails, the old list is used with a dated warning, but a failed `--refresh` is reported as an error.
+
+</details>
+
+<details>
+<summary><b>All question options</b></summary>
+
+<br>
+
+| Option | What it does |
+| --- | --- |
+| `-m`, `--model MODEL` | The model: nickname, exact ID, `~author/family-latest` or plain words. |
+| `-f`, `--file FILE` | Attach a file, sent with line numbers. Repeat for more files. |
+| `--role ROLE` | `review` (default) asks for a structured review. `plain` sends no review instructions. |
+| `-s`, `--system TEXT` | Extra instructions for the model. `-s @FILE` reads them from a file. |
+| `-e`, `--effort LEVEL` | How hard the model thinks: `max`, `xhigh`, `high`, `medium`, `low`, `minimal` or `none`. Models that cannot choose ignore it. |
+| `--max-output-tokens N` | Most tokens the model may write, thinking included, up to the model's own limit. |
+| `-p`, `--provider TAG` | Use only this provider. Copy tags from `models show`. Repeat for more. |
+| `--privacy MODE` | `zdr` (default) or `no-training`. See [Privacy and safety](#privacy-and-safety). |
+| `--session NAME` | Keep the conversation under this name for follow-ups. |
+| `-h`, `--help` | Show help. |
+| `--version` | Show the version. |
+
+A session remembers its first model and instructions, and only complete answers are added to it. Answers go to standard output and are saved as `answers/<call_id>.md` in the state folder. Progress lines and the final cost line go to standard error. If writing those messages fails, the answer and the cost record are still saved.
+
+</details>
+
+<details>
+<summary><b>Build script options</b></summary>
+
+<br>
+
+| Option | What it does |
+| --- | --- |
+| `--check` | Also run formatting checks, debug tests with memory and undefined-behavior sanitizers, `clang-tidy` and `cppcheck`. Needs those tools installed; versioned Clang tools (such as `clang-tidy-23`) are preferred. |
+| `--no-install` | Build and test without installing. |
+| `--quick` | Build and check library linking only. No tests, no install. Cannot be combined with `--check`. |
+| `--with-skills` | Also link the optional assistant skill. |
+| `--bin-dir DIR` | Install the program into DIR instead of `~/.local/bin`. |
+| `--force` | Replace or remove a file the script cannot confirm it installed. Look at the file first. |
+| `--fresh` | Throw away earlier build settings. Needed once when upgrading from an older build that used static OpenSSL. |
+| `--jobs N` | Number of parallel build jobs (default: number of CPUs). |
+| `--list-compilers` | Show the Clang versions found and which one would be used. |
+| `--uninstall` | Remove the program and skill links without building. |
+| `--no-skill` | With `--uninstall`, leave the skill links in place. |
+| `-h`, `--help` | Show help. |
+
+Each build run writes a log to `build/logs/build-<UTC time>-<unique>.log`, and `build/logs/latest.log` always points to the newest one. Build folders are `build/release-clang-<version>` and `build/debug-clang-<version>`.
+
+Next to the program, the installer keeps a small receipt, `~/.local/bin/.openrouter-cli.sha256`, so later upgrades and uninstalls know which file is theirs. Unknown files and symlinks need `--force`. Folders and other special files are always refused. Skill files are never replaced. An install from before receipts existed may need `--force` after you have checked the file.
+
+</details>
+
+<details>
+<summary><b>Settings</b></summary>
+
+<br>
+
+Settings are optional. The settings file lives at `$XDG_CONFIG_HOME/openrouter-cli/config.env`, or `~/.config/openrouter-cli/config.env` when `XDG_CONFIG_HOME` is not set. To create it from the included template without overwriting an existing file, run this from the cloned folder:
+
+```bash
+config_base="${XDG_CONFIG_HOME:-}"
+case "$config_base" in /*) ;; *) config_base="$HOME/.config" ;; esac
+install -d -m 700 "$config_base/openrouter-cli"
+(umask 077; set -C; cat .env.example > "$config_base/openrouter-cli/config.env")
+```
+
+Then edit the file. Exported environment variables with the same names do **not** override it.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `OPENROUTER_CLI_BASE_URL` | `https://openrouter.ai/api/v1` | API address. Change only for an OpenRouter regional domain. |
+| `OPENROUTER_CLI_APP_REFERER` | empty | Optional app link sent to OpenRouter. Empty sends none. |
+| `OPENROUTER_CLI_APP_TITLE` | `openrouter-cli` | App name shown in your OpenRouter activity. |
+| `OPENROUTER_CLI_APP_CATEGORIES` | `cli-agent` | App category sent to OpenRouter. |
+| `OPENROUTER_CLI_DEFAULT_EFFORT` | `high` | Effort used when `-e` is not given. |
+| `OPENROUTER_CLI_MAX_OUTPUT_TOKENS` | `64000` | Output budget, thinking included, capped at each model's limit. |
+| `OPENROUTER_CLI_PRIVACY` | `zdr` | Default privacy mode. |
+| `OPENROUTER_CLI_CATALOG_TTL_HOURS` | `24` | Hours before the cached model list is refreshed. |
+| `OPENROUTER_CLI_IDLE_TIMEOUT_SECONDS` | `300` | Give up when nothing arrives for this long. |
+| `OPENROUTER_CLI_TOTAL_TIMEOUT_SECONDS` | `3600` | Longest a single question may take. |
+| `OPENROUTER_CLI_MAX_FILE_BYTES` | `1048576` | Largest single attached file (1 MiB). |
+| `OPENROUTER_CLI_MAX_INPUT_BYTES` | `4194304` | Largest total input per question (4 MiB). |
+
+The API address must use HTTPS; plain HTTP is allowed only for exact local loopback addresses used in testing. Addresses with user names, queries or fragments are refused, and so are header settings containing control characters. A key in the settings file is refused; store it with `auth login` or `auth set`, then delete the old line without displaying it.
+
+</details>
+
+<details>
+<summary><b>Where files are stored</b></summary>
+
+<br>
+
+| What | Where |
+| --- | --- |
+| Settings | `$XDG_CONFIG_HOME/openrouter-cli/config.env`, or `~/.config/openrouter-cli/config.env` |
+| Everything else | `$XDG_STATE_HOME/openrouter-cli/`, or `~/.local/state/openrouter-cli/` |
+| Cost log | `costs.jsonl` inside that state folder |
+
+The state folder holds `catalog.json` (cached model list), `models.json` (nicknames), `credentials/` (encrypted keys), `answers/`, `sessions/` and `locks/`.
+
+Relative `XDG_*` values are ignored, and `HOME` must be an absolute path when it is needed. Reading settings never creates folders. Folders are private to you (mode 700) and files the program creates are too (mode 600).
+
+A saved session can be up to 128 MiB, and stored encrypted key data up to 64 KiB. If saving a session fails before the old file is replaced, the old session is kept and the answer is still saved on its own. If the replacement succeeds but the final disk sync fails, the message says the save may not be durable.
+
+The cost log records each paid question *before* it is sent, then its generation ID, result and final cost. Damaged lines in the log are reported, and the valid records are still used. Records without a generation ID may stay unresolved; check `account activity` for those.
+
+</details>
+
+<details>
+<summary><b>Moving from an older checkout</b></summary>
+
+<br>
+
+Older versions kept their settings in a `.env` file and their data in a `state/` folder inside the checkout. To keep using them where they are, set an absolute path:
+
+```bash
+OPENROUTER_CLI_HOME=/absolute/path/to/old/checkout
+export OPENROUTER_CLI_HOME
+```
+
+A relative path is an error. The cost log stays in the normal state folder either way, and nothing is moved automatically.
+
+To move the files instead, on the same computer:
+
+1. Stop any running questions and make a private backup.
+2. Copy the old `.env` to the new `config.env` path, and the contents of the old `state/` to the new state folder. Never overwrite or merge a file that already exists there, especially the cost log, keys, sessions or nicknames. Keep ownership and private permissions.
+3. Unset `OPENROUTER_CLI_HOME`, then check `openrouter-cli status` and `openrouter-cli models list`.
+4. Keep the old files until you are sure everything works.
+
+Encrypted keys only open for the same user on the same computer. On a new computer, sign in again instead of copying them.
+
+</details>
+
+<details>
+<summary><b>Help colors</b></summary>
+
+<br>
+
+Help text uses your terminal's colors. Set `NO_COLOR` to any nonempty value to turn color off; it wins over everything else. Set `CLICOLOR_FORCE=1` to keep color on when output is piped. Piped help is wrapped to `COLUMNS` characters, or 80 when that is not set.
+
+</details>
+
+<details>
+<summary><b>How it is built</b></summary>
+
+<br>
+
+`openrouter-cli` is written in C++26 and builds with Clang only. Configuration checks that your compiler and standard library have the C++26 features the code uses (including `std::expected`, `std::print`, `std::format`, `std::flat_map`, `std::ranges::to`, `std::views::enumerate`, saturation arithmetic and `std::jthread`) before anything is downloaded. Building also needs Bash, GNU coreutils, `find`, `sort`, `readelf` and `ldd`.
+
+Release builds produce portable x86-64 code. For code tuned to your own processor, set the CMake option `ORCLI_NATIVE=ON`. Link-time optimization is used when the toolchain supports it. libcurl's threaded DNS resolver is kept on. libcurl and the C++ runtime are linked in statically, while OpenSSL 3 and glibc come from your system; static OpenSSL is not supported. The build refuses binaries with an embedded RPATH or RUNPATH and checks that the system's normal library loader finds the right OpenSSL.
+
+At run time, the commands that use a key also need `systemd-creds` on your `PATH` and a working systemd user credential service. A recent systemd version alone does not guarantee that, for example inside a container.
+
+Development used Clang 23.1.5 with GCC 15's libstdc++ on Ubuntu Linux and systemd 259. These are known working versions, not minimum requirements.
+
+**Current status:** clean-source acceptance has not yet passed.
+
+**For contributors.** `scripts/build.sh --check --no-install` runs every check without installing. `bash scripts/verify-clean.sh 2` (the number is the job count) is a full clean-room test. It copies the source into a temporary folder whose path contains spaces and an apostrophe, uses a separate home folder, runs the normal and `--check` builds, and installs and uninstalls only inside that scratch area. Logs are kept under `build/logs/clean-*`. The scratch folder is deleted on success and kept on failure so you can inspect it. It is a full build and test run, so expect it to take a while.
+
+</details>
+
+## License
+
+Released under the [MIT License](LICENSE). Copyright 2026 Jeff Hollis.
+The licenses of the libraries it uses are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -91,6 +91,7 @@ using FetchText = std::function<Result<std::string>()>;
 struct Catalog {
     std::vector<ModelInfo> models;
     std::string fetched_at; // ISO 8601 UTC
+    bool stale = false;
 };
 
 Result<Catalog> load_catalog(const std::filesystem::path& state_dir, std::chrono::hours ttl,

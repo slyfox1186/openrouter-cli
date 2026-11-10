@@ -3,18 +3,24 @@
 #include "account.hpp"
 #include "common.hpp"
 #include "fsutil.hpp"
+#include "secrets.hpp"
 
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <limits>
 #include <map>
 #include <optional>
 #include <ranges>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -46,7 +52,8 @@ std::optional<double> number_at(const json& object, std::string_view key) {
     if (found == object.end() || !found->is_number()) {
         return std::nullopt;
     }
-    return found->get<double>();
+    const double value = found->get<double>();
+    return std::isfinite(value) && value >= 0 ? std::optional<double>{value} : std::nullopt;
 }
 
 std::optional<long long> integer_at(const json& object, std::string_view key) {
@@ -54,7 +61,13 @@ std::optional<long long> integer_at(const json& object, std::string_view key) {
     if (found == object.end() || !found->is_number_integer()) {
         return std::nullopt;
     }
-    return found->get<long long>();
+    if (found->is_number_unsigned() &&
+        found->get<unsigned long long>() >
+            static_cast<unsigned long long>(std::numeric_limits<long long>::max())) {
+        return std::nullopt;
+    }
+    const auto value = found->get<long long>();
+    return value >= 0 ? std::optional<long long>{value} : std::nullopt;
 }
 
 template <class T> json nullable(const std::optional<T>& value) {
@@ -125,14 +138,65 @@ bool known_type(std::string_view type) {
     return type == "pending" || type == "generation" || type == "result" || type == "resolved";
 }
 
+bool nonempty_string(const json& record, std::string_view key) {
+    const auto value = string_at(record, key);
+    return value && !value->empty();
+}
+
+bool optional_string(const json& record, std::string_view key) {
+    const auto value = record.find(key);
+    return value == record.end() || value->is_null() || value->is_string();
+}
+
+bool optional_cost(const json& record, std::string_view key) {
+    const auto value = record.find(key);
+    return value == record.end() || value->is_null() || number_at(record, key).has_value();
+}
+
+bool valid_timestamp(const std::optional<std::string>& text) {
+    constexpr std::size_t timestamp_length = 20;
+    if (!text || text->size() != timestamp_length) {
+        return false;
+    }
+    std::istringstream input{*text};
+    std::chrono::sys_seconds timestamp{};
+    input >> std::chrono::parse("%FT%TZ", timestamp);
+    return !input.fail() && input.peek() == std::istringstream::traits_type::eof();
+}
+
+bool valid_record_fields(const json& record, std::string_view type) {
+    if (!valid_timestamp(string_at(record, "time"))) {
+        return false;
+    }
+    for (const auto key : {"served_model", "provider", "model"}) {
+        if (!optional_string(record, key)) {
+            return false;
+        }
+    }
+    if (type == "pending") {
+        return nonempty_string(record, "model_id");
+    }
+    if (type == "generation") {
+        const auto id = string_at(record, "generation_id");
+        return id && valid_generation_id(*id);
+    }
+    if (type == "resolved") {
+        return optional_cost(record, "total_cost");
+    }
+    const auto outcome = string_at(record, "outcome");
+    constexpr std::array<std::string_view, 4> outcomes{"complete", "incomplete", "error",
+                                                       "interrupted"};
+    return outcome && std::ranges::contains(outcomes, *outcome) && optional_cost(record, "cost");
+}
+
 std::optional<json> parse_record(std::string_view line) {
     auto record = json::parse(line, nullptr, false);
-    if (!record.is_object() || !integer_at(record, "v").has_value() ||
-        !string_at(record, "call_id").has_value()) {
+    if (!record.is_object() || integer_at(record, "v") != record_version ||
+        !nonempty_string(record, "call_id")) {
         return std::nullopt;
     }
     const auto type = string_at(record, "type");
-    if (!type.has_value() || !known_type(*type)) {
+    if (!type || !known_type(*type) || !valid_record_fields(record, *type)) {
         return std::nullopt;
     }
     return record;
@@ -299,15 +363,36 @@ Result<GenerationStats> parse_generation(std::string_view json_text) {
 CostLog::CostLog(fs::path file, fs::path lock_file)
     : file_(std::move(file)), lock_file_(std::move(lock_file)) {}
 
-Result<void> CostLog::append(const json& record) const {
+Result<void> CostLog::append(const json& record, LockDeadline deadline) const {
     const auto made = ensure_private_dir(file_.parent_path());
     if (!made) {
         return std::unexpected(made.error());
     }
     // Paths and model names may hold invalid UTF-8; replacing bad bytes keeps dump from throwing.
-    return append_record({.file = file_, .lock_file = lock_file_},
-                         record.dump(compact_dump, ' ', false, json::error_handler_t::replace) +
-                             "\n");
+    return append_record(
+        {.file = file_, .lock_file = lock_file_},
+        record.dump(compact_dump, ' ', false, json::error_handler_t::replace) + "\n", deadline);
+}
+
+Result<std::string> CostLog::read_snapshot() const {
+    std::error_code error;
+    const auto parent = file_.parent_path().empty() ? fs::path(".") : file_.parent_path();
+    const auto status = fs::symlink_status(parent, error);
+    if (error && error != std::errc::no_such_file_or_directory) {
+        return fail(Exit::config, "cannot inspect the cost log directory");
+    }
+    if (status.type() == fs::file_type::not_found) {
+        return std::string{};
+    }
+    const auto lock = FileLock::acquire(lock_file_, true);
+    if (!lock) {
+        return std::unexpected(lock.error());
+    }
+    const auto checked = check_private_file(file_);
+    if (!checked) {
+        return std::unexpected(checked.error());
+    }
+    return read_regular_file(file_, std::numeric_limits<std::size_t>::max(), true);
 }
 
 SpendReport fold_log(const SpendQuery& query) {
@@ -351,20 +436,21 @@ std::string format_spend(const SpendReport& report) {
     if (!report.cost_by_day.empty()) {
         text += "\nBy day:\n";
         for (const auto& [day, cost] : report.cost_by_day) {
-            text += std::format("  {}  {}\n", day, format_usd(cost));
+            text += std::format("  {}  {}\n", display_metadata(day), format_usd(cost));
         }
     }
     if (!report.cost_by_model.empty()) {
         text += "\nBy model:\n";
         for (const auto& [model, cost] : report.cost_by_model) {
-            text += std::format("  {}  {}\n", model, format_usd(cost));
+            text += std::format("  {}  {}\n", display_metadata(model), format_usd(cost));
         }
     }
     if (!report.unresolved.empty()) {
         text += "\nUnresolved calls (no result yet, or cost unknown):\n";
         for (const CallSummary& call : report.unresolved) {
-            text +=
-                std::format("  {}  {}  {}  {}\n", call.call_id, call.time, call.model, call.state);
+            text += std::format("  {}  {}  {}  {}\n", display_metadata(call.call_id),
+                                display_metadata(call.time), display_metadata(call.model),
+                                display_metadata(call.state));
         }
     }
     if (!report.corrupt_lines.empty()) {
@@ -379,10 +465,12 @@ std::string format_cost_line(const ResultInfo& result, std::string_view model_id
     const Usage& usage = result.usage;
     return std::format(
         "cost {} | {} via {} | in {} (cached {}) | out {} (reasoning {}) | answer {}",
-        money_text(usage.cost), result.served_model.value_or(std::string(model_id)),
-        result.provider.value_or("unknown provider"), count_text(usage.prompt_tokens),
-        count_text(usage.cached_tokens), count_text(usage.completion_tokens),
-        count_text(usage.reasoning_tokens), answer_path);
+        money_text(usage.cost),
+        display_metadata(result.served_model.value_or(std::string(model_id))),
+        display_metadata(result.provider.value_or("unknown provider")),
+        count_text(usage.prompt_tokens), count_text(usage.cached_tokens),
+        count_text(usage.completion_tokens), count_text(usage.reasoning_tokens),
+        display_metadata(answer_path));
 }
 
 } // namespace orcli

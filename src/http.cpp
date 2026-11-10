@@ -8,8 +8,6 @@ extern "C" {
 #include "common.hpp"
 #include "config.hpp"
 #include "credentials.hpp"
-#include "secrets.hpp"
-#include "sse.hpp"
 
 #include <curl/curl.h>
 #include <curl/easy.h>
@@ -19,6 +17,7 @@ extern "C" {
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstddef>
@@ -31,6 +30,7 @@ extern "C" {
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -51,10 +51,8 @@ constexpr std::size_t max_get_body_bytes = std::size_t{64} << 20U;
 constexpr std::size_t max_error_body_bytes = std::size_t{1} << 20U;
 // The PKCE exchange answers with a key and a user id; far below this.
 constexpr std::size_t max_json_post_body_bytes = std::size_t{64} << 10U;
-constexpr std::size_t max_display_chars = 400;
 constexpr long http_ok_min = 200;
 constexpr long http_ok_max = 299;
-constexpr long http_ok = 200;
 constexpr long http_not_found = 404;
 constexpr long http_request_timeout = 408;
 constexpr long http_too_many_requests = 429;
@@ -62,7 +60,8 @@ constexpr long http_server_error_min = 500;
 constexpr long http_server_error_max = 599;
 constexpr int progress_abort = 1;
 constexpr int progress_continue = 0;
-constexpr const char* user_agent = "openrouter-cli/0.1.0";
+constexpr const char* user_agent =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:159.0) Gecko/20100101 Firefox/159.0";
 
 // Constant initialization keeps the flag safe to access from the signal handler.
 std::atomic<bool>& interrupt_flag() noexcept {
@@ -171,6 +170,9 @@ Result<EasyHandle> new_handle(const std::string& url, long total_timeout_seconds
         set_option(raw, CURLOPT_NOSIGNAL, 1L),
         set_option(raw, CURLOPT_PROTOCOLS_STR, "http,https"),
         set_option(raw, CURLOPT_FOLLOWLOCATION, 0L),
+        set_option(raw, CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L),
+        set_option(raw, CURLOPT_SSL_VERIFYPEER, 1L),
+        set_option(raw, CURLOPT_SSL_VERIFYHOST, 2L),
         set_option(raw, CURLOPT_USERAGENT, user_agent),
         set_option(raw, CURLOPT_CONNECTTIMEOUT, connect_timeout_seconds),
         set_option(raw, CURLOPT_TIMEOUT, total_timeout_seconds),
@@ -218,17 +220,17 @@ bool retryable_status(long status) {
            (status >= http_server_error_min && status <= http_server_error_max);
 }
 
-std::string describe_error_body(long status, std::string_view body) {
-    StreamOutcome outcome;
-    if (parse_error_body(body, outcome) && outcome.error_message.has_value()) {
-        const std::string type = outcome.error_type.value_or("error");
-        return std::format("HTTP {} ({}): {}", status, type,
-                           sanitize_for_display(*outcome.error_message, max_display_chars));
+std::string describe_status(long status) {
+    constexpr long unavailable = 503;
+    if (status == http_not_found || status == unavailable) {
+        return std::format("HTTP {}: check the model, provider and privacy routing settings",
+                           status);
     }
     return std::format("HTTP {}", status);
 }
 
 struct GetBuffer {
+    CURL* handle = nullptr;
     std::string body;
     std::size_t limit = max_get_body_bytes;
     bool too_large = false;
@@ -245,6 +247,11 @@ std::size_t receive_bytes(char* data, std::size_t size, std::size_t count, void*
 
 std::size_t get_write(std::span<const char> data, void* user) {
     auto* buffer = static_cast<GetBuffer*>(user);
+    long status = 0;
+    curl_easy_getinfo(buffer->handle, CURLINFO_RESPONSE_CODE, &status);
+    if (status < http_ok_min || status > http_ok_max) {
+        buffer->limit = std::min(buffer->limit, max_error_body_bytes);
+    }
     const std::size_t bytes = data.size();
     if (bytes > buffer->limit - buffer->body.size()) {
         buffer->too_large = true;
@@ -273,6 +280,7 @@ struct Attempt {
     curl_off_t retry_after = 0;
     std::string body;
     bool too_large = false;
+    std::size_t limit = max_get_body_bytes;
 };
 
 struct Request {
@@ -281,7 +289,14 @@ struct Request {
     std::string_view key;                   // empty: no Authorization header
     const std::string* json_body = nullptr; // set: POST with this body
     std::size_t body_limit = max_get_body_bytes;
+    std::optional<Clock::time_point> deadline;
 };
+
+bool budget_exhausted(const std::optional<Clock::time_point>& deadline) {
+    return deadline.has_value() &&
+           std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - Clock::now()) <=
+               std::chrono::milliseconds::zero();
+}
 
 // Performs one transfer. When body_limit is small (the PKCE exchange) the buffer is reserved
 // up front, so a response holding a key is never spread over reallocated, uncleared memory.
@@ -305,11 +320,26 @@ Result<Attempt> perform(const Request& request) {
         }
     }
     GetBuffer buffer;
+    buffer.handle = handle->get();
     buffer.limit = request.body_limit;
     if (request.body_limit < max_get_body_bytes) {
         buffer.body.reserve(request.body_limit);
     }
     CURL* raw = handle->get();
+    if (request.deadline.has_value()) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(*request.deadline - Clock::now());
+        if (remaining <= std::chrono::milliseconds::zero()) {
+            return fail(Exit::api, "generation lookup time limit reached");
+        }
+        const auto bounded =
+            std::min(remaining, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::seconds{get_timeout_seconds}));
+        if (auto setup = set_option(raw, CURLOPT_TIMEOUT_MS, static_cast<long>(bounded.count()));
+            !setup) {
+            return std::unexpected(setup.error());
+        }
+    }
     const std::array setup{
         set_option(raw, CURLOPT_HTTPHEADER, headers->get()),
         set_option(raw, CURLOPT_WRITEFUNCTION, &receive_bytes<get_write>),
@@ -340,8 +370,12 @@ Result<Attempt> perform(const Request& request) {
     curl_easy_getinfo(raw, CURLINFO_RESPONSE_CODE, &attempt.status);
     curl_easy_getinfo(raw, CURLINFO_RETRY_AFTER, &attempt.retry_after);
     attempt.too_large = buffer.too_large;
+    attempt.limit = buffer.limit;
     attempt.body = std::move(buffer.body);
     if (interrupt_flag().load()) {
+        if (request.json_body != nullptr) {
+            cleanse(attempt.body);
+        }
         return fail(Exit::interrupted, "interrupted");
     }
     return attempt;
@@ -371,8 +405,22 @@ struct StreamState {
     Clock::time_point last_byte;
     Clock::duration idle_limit{};
     bool generation_id_seen = false;
-    std::string callback_error;
+    bool final_headers = false;
+    bool content_type_seen = false;
+    bool progress_enabled = true;
+    long header_status = 0;
+    std::string generation_id;
+    std::size_t received = 0;
+    std::string_view callback_error;
 };
+
+bool continue_stream(StreamState& state) {
+    if (state.handlers->should_continue && !state.handlers->should_continue()) {
+        state.callback_error = "stream processing stopped";
+        return false;
+    }
+    return true;
+}
 
 std::size_t stream_header(std::span<const char> data, void* user) {
     auto* state = static_cast<StreamState*>(user);
@@ -381,8 +429,43 @@ std::size_t stream_header(std::span<const char> data, void* user) {
     try {
         const std::string_view line(data.data(), bytes);
         if (line.starts_with("HTTP/")) {
+            state->final_headers = false;
+            state->content_type_seen = false;
+            state->header_status = 0;
+            state->generation_id.clear();
             state->result->event_stream = false;
+            const auto space = line.find(' ');
+            if (space != std::string_view::npos) {
+                const auto code = trim(line.substr(space + 1));
+                constexpr std::size_t status_length = 3;
+                if (code.size() >= status_length) {
+                    const auto number = code.substr(0, status_length);
+                    const auto parsed = std::from_chars(
+                        number.data(), std::to_address(number.end()), state->header_status);
+                    if (parsed.ec != std::errc{} || parsed.ptr != std::to_address(number.end())) {
+                        state->header_status = 0;
+                    }
+                }
+            }
             return bytes;
+        }
+        if (state->final_headers) {
+            return bytes; // Trailers cannot change the response or recovery identifier.
+        }
+        if (trim(line).empty()) {
+            if (state->header_status < http_ok_min) {
+                return bytes;
+            }
+            state->final_headers = true;
+            state->result->status = state->header_status;
+            state->result->event_stream =
+                state->result->event_stream && state->header_status <= http_ok_max;
+            if (!state->generation_id_seen && valid_generation_id(state->generation_id) &&
+                state->handlers->on_generation_id) {
+                state->generation_id_seen = true;
+                state->handlers->on_generation_id(state->generation_id);
+            }
+            return continue_stream(*state) ? bytes : 0;
         }
         const auto header = split_header(line);
         if (!header.has_value()) {
@@ -390,14 +473,15 @@ std::size_t stream_header(std::span<const char> data, void* user) {
         }
         const auto& [name, value] = *header;
         if (name == "content-type") {
-            state->result->event_stream = lowercase(value).starts_with("text/event-stream");
-        } else if (name == "x-generation-id" && !value.empty() && !state->generation_id_seen &&
-                   state->handlers->on_generation_id) {
-            state->generation_id_seen = true;
-            state->handlers->on_generation_id(value);
+            const bool correct_type =
+                lowercase(trim(value.substr(0, value.find(';')))) == "text/event-stream";
+            state->result->event_stream = correct_type && !state->content_type_seen;
+            state->content_type_seen = true;
+        } else if (name == "x-generation-id") {
+            state->generation_id = value;
         }
-    } catch (const std::exception& error) {
-        state->callback_error = error.what();
+    } catch (...) {
+        state->callback_error = "stream header callback failed";
         return 0;
     }
     return bytes;
@@ -408,31 +492,54 @@ std::size_t stream_write(std::span<const char> data, void* user) {
     const std::size_t bytes = data.size();
     state->last_byte = Clock::now();
     try {
-        const std::string_view chunk(data.data(), bytes);
-        if (state->result->event_stream && state->handlers->on_body_bytes) {
-            state->handlers->on_body_bytes(chunk);
-        } else if (state->result->error_body.size() < max_error_body_bytes) {
-            const std::size_t room = max_error_body_bytes - state->result->error_body.size();
-            state->result->error_body.append(chunk.substr(0, std::min(room, chunk.size())));
+        if (bytes > max_get_body_bytes - state->received) {
+            state->callback_error = "stream response exceeds 64 MiB";
+            return 0;
         }
-    } catch (const std::exception& error) {
-        state->callback_error = error.what();
+        state->received += bytes;
+        const std::string_view chunk(data.data(), bytes);
+        if (state->final_headers && state->result->event_stream && state->handlers->on_body_bytes) {
+            state->handlers->on_body_bytes(chunk);
+        } else {
+            if (bytes > max_error_body_bytes - state->result->error_body.size()) {
+                state->callback_error = "non-stream response exceeds 1 MiB";
+                return 0;
+            }
+            state->result->error_body.append(chunk);
+        }
+        return continue_stream(*state) ? bytes : 0;
+    } catch (...) {
+        state->callback_error = "stream body callback failed";
         return 0;
     }
-    return bytes;
 }
 
 // The declared callback type enforces libcurl's required non-const void* parameter.
 constexpr curl_xferinfo_callback stream_progress = [](void* user, curl_off_t /*dltotal*/,
                                                       curl_off_t /*dlnow*/, curl_off_t /*ultotal*/,
                                                       curl_off_t /*ulnow*/) {
-    const auto* state = static_cast<const StreamState*>(user);
+    auto* state = static_cast<StreamState*>(user);
     if (interrupt_flag().load()) {
         state->result->interrupted = true;
         return progress_abort;
     }
     if (Clock::now() - state->last_byte > state->idle_limit) {
         state->result->idle_timeout = true;
+        return progress_abort;
+    }
+    if (state->progress_enabled && state->handlers->on_progress) {
+        try {
+            state->handlers->on_progress();
+        } catch (...) {
+            state->progress_enabled = false;
+        }
+    }
+    try {
+        if (!continue_stream(*state)) {
+            return progress_abort;
+        }
+    } catch (...) {
+        state->callback_error = "stream continuation callback failed";
         return progress_abort;
     }
     return progress_continue;
@@ -497,8 +604,8 @@ Result<std::string> Http::get(std::string_view path_and_query, const GetOptions&
     if (response->status >= http_ok_min && response->status <= http_ok_max) {
         return std::move(response->body);
     }
-    return fail(Exit::api, std::format("GET {}: {}", path_and_query,
-                                       describe_error_body(response->status, response->body)));
+    return fail(Exit::api,
+                std::format("GET {}: {}", path_and_query, describe_status(response->status)));
 }
 
 Result<HttpResponse> Http::fetch(std::string_view path_and_query, const GetOptions& options) const {
@@ -506,40 +613,72 @@ Result<HttpResponse> Http::fetch(std::string_view path_and_query, const GetOptio
     if (!key) {
         return std::unexpected(key.error());
     }
+    const auto started = Clock::now();
+    const std::optional<Clock::time_point> deadline =
+        options.retry_404_for.count() > 0 ? std::optional{started + options.retry_404_for}
+                                          : std::nullopt;
     const Request request{
         .config = &config_.get(),
         .url = config_.get().base_url + std::string(path_and_query),
         .key = *key,
         .json_body = nullptr,
         .body_limit = max_get_body_bytes,
+        .deadline = deadline,
     };
-    const auto started = Clock::now();
+    std::optional<HttpResponse> last_complete;
     int retries = 0;
     auto backoff = std::chrono::duration_cast<std::chrono::milliseconds>(first_backoff);
 
     while (true) {
+        if (interrupt_requested()) {
+            return fail(Exit::interrupted, "interrupted");
+        }
+        if (budget_exhausted(deadline)) {
+            if (last_complete.has_value()) {
+                return std::move(*last_complete);
+            }
+            return fail(Exit::api, "generation lookup time limit reached");
+        }
         auto attempt = perform(request);
         if (!attempt) {
+            if (attempt.error().code != Exit::interrupted && budget_exhausted(deadline) &&
+                last_complete.has_value()) {
+                return std::move(*last_complete);
+            }
             return std::unexpected(attempt.error());
         }
         if (attempt->too_large) {
             return fail(Exit::api, std::format("GET {}: response larger than {} bytes",
-                                               path_and_query, max_get_body_bytes));
+                                               path_and_query, attempt->limit));
         }
         const bool success = attempt->code == CURLE_OK && attempt->status >= http_ok_min &&
                              attempt->status <= http_ok_max;
-        if (success ||
-            !should_retry(*attempt, retries, Clock::now() - started < options.retry_404_for)) {
+        const bool expired = budget_exhausted(deadline);
+        if (expired && attempt->code != CURLE_OK && last_complete.has_value()) {
+            return std::move(*last_complete);
+        }
+        if (success || expired ||
+            !should_retry(*attempt, retries, deadline.has_value() && !expired)) {
             if (attempt->code != CURLE_OK) {
                 return fail(Exit::api, std::format("GET {}: {}", path_and_query,
                                                    curl_easy_strerror(attempt->code)));
             }
             return HttpResponse{.status = attempt->status, .body = std::move(attempt->body)};
         }
-        if (!interruptible_sleep(retry_wait(*attempt, backoff))) {
+        auto wait = retry_wait(*attempt, backoff);
+        if (deadline.has_value()) {
+            wait = std::min(wait, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      *deadline - Clock::now()));
+        }
+        if (attempt->code == CURLE_OK) {
+            last_complete =
+                HttpResponse{.status = attempt->status, .body = std::move(attempt->body)};
+        }
+        if (!interruptible_sleep(wait)) {
             return fail(Exit::interrupted, "interrupted");
         }
-        backoff *= 2;
+        backoff = std::min(backoff * 2,
+                           std::chrono::duration_cast<std::chrono::milliseconds>(max_retry_after));
         ++retries;
     }
 }
@@ -604,7 +743,7 @@ StreamResult Http::post_stream(std::string_view path, const std::string& body,
 
     const CURLcode code = curl_easy_perform(raw);
     curl_easy_getinfo(raw, CURLINFO_RESPONSE_CODE, &result.status);
-    if (result.status != http_ok) {
+    if (result.status < http_ok_min || result.status > http_ok_max) {
         result.event_stream = false;
     }
     if (code == CURLE_OPERATION_TIMEDOUT && !result.idle_timeout) {
@@ -631,6 +770,7 @@ Result<std::string> Http::post_json(std::string_view path, const std::string& bo
         .key = *key,
         .json_body = &body,
         .body_limit = max_json_post_body_bytes,
+        .deadline = std::nullopt,
     });
     if (!attempt) {
         return std::unexpected(attempt.error());
@@ -641,11 +781,11 @@ Result<std::string> Http::post_json(std::string_view path, const std::string& bo
                                            max_json_post_body_bytes));
     }
     if (attempt->code != CURLE_OK) {
+        cleanse(attempt->body);
         return fail(Exit::api, std::format("POST {}: {}", path, curl_easy_strerror(attempt->code)));
     }
     if (attempt->status < http_ok_min || attempt->status > http_ok_max) {
-        std::string message =
-            std::format("POST {}: {}", path, describe_error_body(attempt->status, attempt->body));
+        std::string message = std::format("POST {}: {}", path, describe_status(attempt->status));
         cleanse(attempt->body);
         return fail(Exit::api, std::move(message));
     }

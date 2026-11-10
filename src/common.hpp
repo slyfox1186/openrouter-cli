@@ -1,13 +1,24 @@
 #ifndef ORCLI_COMMON_HPP
 #define ORCLI_COMMON_HPP
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace orcli {
+
+// The same recovery identifier is accepted from headers, stream chunks and stored records.
+inline bool valid_generation_id(std::string_view value) {
+    constexpr std::size_t max_id_length = 256;
+    constexpr std::string_view characters =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+    return !value.empty() && value.size() <= max_id_length &&
+           value.find_first_not_of(characters) == std::string_view::npos;
+}
 
 // Process exit codes; documented in README.md and the skill, so values are a public contract.
 enum class Exit : std::uint8_t {

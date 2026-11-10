@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 namespace {
 
@@ -175,4 +176,14 @@ TEST_CASE("read_snapshot refuses credential files by resolved path") {
     CHECK(direct.error().code == orcli::Exit::refused);
     write_file(dir.path() / ".env.example", "OPENROUTER_API_KEY=\n");
     CHECK(orcli::read_snapshot(dir.path() / ".env.example", kLimit).has_value());
+}
+
+TEST_CASE("bounded packing counts framing and line number overhead") {
+    const std::vector<orcli::FileSnapshot> files{snapshot("a.txt", "one\ntwo")};
+    const auto expected = orcli::pack_files(files);
+    const auto exact = orcli::pack_files(files, expected.size());
+    REQUIRE(exact.has_value());
+    CHECK(*exact == expected);
+    CHECK_FALSE(orcli::pack_files(files, expected.size() - 1).has_value());
+    CHECK_FALSE(orcli::pack_files(files, files.front().content.size()).has_value());
 }

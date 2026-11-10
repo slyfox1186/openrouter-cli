@@ -51,8 +51,8 @@ struct HttpKeys {
 
 struct GetOptions {
     Auth auth = Auth::inference;
-    // When positive, a 404 is retried with backoff until this much time has passed (used only
-    // for the generation lookup, whose record can appear a few seconds after completion).
+    // Positive values bound the whole lookup, including its first attempt, retries and waits.
+    // Within this window 404 is retryable; the last complete response survives timeout.
     std::chrono::seconds retry_404_for{0};
 };
 
@@ -66,12 +66,14 @@ struct HttpResponse {
 struct StreamHandlers {
     std::function<void(std::string_view)> on_generation_id; // from X-Generation-Id
     std::function<void(std::string_view)> on_body_bytes;    // raw SSE bytes, any split
+    std::function<bool()> should_continue; // false after a parsing or persistence failure
+    std::function<void()> on_progress;     // diagnostics only; exceptions do not abort the response
 };
 
 struct StreamResult {
     long status = 0;
     bool event_stream = false; // Content-Type was text/event-stream
-    std::string error_body;    // body (bounded) when status != 200 or not an event stream
+    std::string error_body;    // body (bounded) when status is not 2xx or not an event stream
     bool interrupted = false;
     bool idle_timeout = false;
     bool total_timeout = false;

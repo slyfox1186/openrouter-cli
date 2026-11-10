@@ -2,6 +2,7 @@
 #define ORCLI_COSTLOG_HPP
 
 #include "common.hpp"
+#include "fsutil.hpp"
 
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
@@ -73,7 +74,9 @@ Result<GenerationStats> parse_generation(std::string_view json_text);
 class CostLog {
 public:
     CostLog(std::filesystem::path file, std::filesystem::path lock_file);
-    [[nodiscard]] Result<void> append(const nlohmann::json& record) const;
+    [[nodiscard]] Result<void> append(const nlohmann::json& record,
+                                      LockDeadline deadline = {}) const;
+    [[nodiscard]] Result<std::string> read_snapshot() const;
     [[nodiscard]] const std::filesystem::path& file() const { return file_; }
 
 private:

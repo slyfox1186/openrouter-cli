@@ -3,6 +3,7 @@
 #include "common.hpp"
 #include "config.hpp"
 #include "credentials.hpp"
+#include "secrets.hpp"
 
 #include <array>
 #include <cstddef>
@@ -27,7 +28,7 @@ int exit_code(Exit exit) {
 }
 
 int report(const Error& error) {
-    std::println(stderr, "openrouter-cli: {}", error.message);
+    std::println(stderr, "openrouter-cli: {}", display_metadata(error.message));
     return exit_code(error.code);
 }
 
@@ -49,9 +50,9 @@ bool warn_plaintext_keys(const Config& config) {
     for (const auto& found : config.plaintext_keys) {
         const bool management = found.name == "OPENROUTER_MANAGEMENT_KEY";
         std::println(stderr,
-                     "openrouter-cli: {}/.env line {} still holds {} in plain text; store it with "
+                     "openrouter-cli: {} line {} still holds {} in plain text; store it with "
                      "`openrouter-cli auth set{}` and then delete that line",
-                     config.home.string(), found.line, found.name,
+                     config.env_file.string(), found.line, found.name,
                      management ? " --management" : "");
     }
     return !config.plaintext_keys.empty();

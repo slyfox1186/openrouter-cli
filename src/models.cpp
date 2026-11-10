@@ -2,6 +2,7 @@
 
 #include "common.hpp"
 #include "fsutil.hpp"
+#include "secrets.hpp"
 
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
@@ -14,9 +15,8 @@
 #include <expected>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <functional>
-#include <ios>
+#include <limits>
 #include <map>
 #include <optional>
 #include <ranges>
@@ -74,6 +74,9 @@ std::optional<std::string> string_member(const json& object, std::string_view ke
 std::optional<long long> integer_member(const json& object, std::string_view key) {
     const json* value = member(object, key);
     if (value == nullptr || !value->is_number_integer()) {
+        return std::nullopt;
+    }
+    if (value->is_number_unsigned() && !std::in_range<long long>(value->get<std::uint64_t>())) {
         return std::nullopt;
     }
     return value->get<long long>();
@@ -393,6 +396,10 @@ std::string price_text(const std::optional<std::string>& price, std::size_t shif
     if (!amount.has_value()) {
         return std::string(not_available);
     }
+    if (amount->find_first_of("123456789") == std::string::npos &&
+        price->find_first_of("123456789") != std::string::npos) {
+        return std::format("<$0.{}1{}", std::string(max_price_decimals - 1, '0'), unit);
+    }
     return std::format("${}{}", *amount, unit);
 }
 
@@ -412,7 +419,7 @@ std::string render_row(const std::array<std::string, Columns>& row,
         // Padding by hand: a nested width ("{:<{}}") is rejected by Clang with libstdc++ 15
         // (llvm/llvm-project#151371).
         const std::size_t start = line.size();
-        line += cell;
+        line += display_metadata(cell);
         line.resize(start + std::max(cell.size(), width + column_gap), ' ');
     }
     while (line.ends_with(' ')) {
@@ -519,7 +526,7 @@ std::string render_fields(const std::vector<Field>& fields) {
         std::string label = std::format("{}:", field.label);
         label.resize(std::max(label.size(), label_width), ' ');
         text += label;
-        text += field.value;
+        text += display_metadata(field.value);
         text += '\n';
     }
     return text;
@@ -547,6 +554,10 @@ std::optional<std::chrono::sys_seconds> parse_utc(std::string_view text) {
 Result<bool> file_present(const std::filesystem::path& file) {
     std::error_code error;
     const std::filesystem::file_status status = std::filesystem::symlink_status(file, error);
+    if (error && error != std::errc::no_such_file_or_directory) {
+        return fail(Exit::config,
+                    std::format("cannot inspect {}: {}", file.string(), error.message()));
+    }
     if (status.type() == std::filesystem::file_type::not_found) {
         return false;
     }
@@ -561,16 +572,7 @@ Result<std::string> read_private_file(const std::filesystem::path& file) {
     if (const auto checked = check_private_file(file); !checked) {
         return std::unexpected(checked.error());
     }
-    const std::ifstream input(file, std::ios::binary);
-    if (!input) {
-        return fail(Exit::config, std::format("cannot open {}", file.string()));
-    }
-    std::ostringstream buffer;
-    buffer << input.rdbuf();
-    if (input.bad() || buffer.bad()) {
-        return fail(Exit::config, std::format("cannot read {}", file.string()));
-    }
-    return std::move(buffer).str();
+    return read_regular_file(file, std::numeric_limits<std::size_t>::max());
 }
 
 struct CachedCatalog {
@@ -621,8 +623,10 @@ bool is_fresh(std::chrono::sys_seconds fetched, std::chrono::hours ttl) {
 }
 
 Result<Catalog> stale_or(const std::optional<CachedCatalog>& cached, const Error& error) {
-    if (cached.has_value()) {
-        return cached->catalog;
+    if (cached.has_value() && error.code != Exit::interrupted) {
+        Catalog result = cached->catalog;
+        result.stale = true;
+        return result;
     }
     return std::unexpected(error);
 }
@@ -734,6 +738,9 @@ std::vector<ModelInfo> search(std::string_view query, const std::vector<ModelInf
 
 Resolution resolve(std::string_view name, const std::vector<ModelInfo>& catalog,
                    const std::map<std::string, AliasEntry>& aliases) {
+    if (const ModelInfo* exact = find_by_id(catalog, name); exact != nullptr) {
+        return concrete_resolution(*exact, catalog);
+    }
     const std::string alias = normalize_alias(name);
     for (const std::string& key : {alias, std::string(name)}) {
         const auto entry = aliases.find(key);
@@ -745,9 +752,6 @@ Resolution resolve(std::string_view name, const std::vector<ModelInfo>& catalog,
             saved != nullptr) {
             return concrete_resolution(*saved, catalog);
         }
-    }
-    if (const ModelInfo* exact = find_by_id(catalog, name); exact != nullptr) {
-        return concrete_resolution(*exact, catalog);
     }
     std::vector<ModelInfo> matches = search(name, catalog);
     if (matches.size() == 1) {
@@ -832,11 +836,13 @@ Result<Catalog> load_catalog(const std::filesystem::path& state_dir, std::chrono
     }
     const auto text = fetch();
     if (!text) {
-        return stale_or(cached, text.error());
+        return force_refresh ? Result<Catalog>(std::unexpected(text.error()))
+                             : stale_or(cached, text.error());
     }
     auto models = parse_catalog(*text);
     if (!models) {
-        return stale_or(cached, models.error());
+        return force_refresh ? Result<Catalog>(std::unexpected(models.error()))
+                             : stale_or(cached, models.error());
     }
     return store_catalog(state_dir, *text, std::move(*models));
 }

@@ -6,6 +6,7 @@
 #include "costlog.hpp"
 #include "credentials.hpp"
 #include "http.hpp"
+#include "secrets.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -90,7 +91,7 @@ Result<std::vector<KeyEntry>> fetch_all_keys(const Http& http) {
 // ----- status ------------------------------------------------------------------------------
 
 std::string text_or(const std::optional<std::string>& text, std::string_view fallback) {
-    return text.has_value() ? *text : std::string(fallback);
+    return text.has_value() ? display_metadata(*text) : std::string(fallback);
 }
 
 std::string usd_or(const std::optional<double>& amount, std::string_view fallback) {
@@ -101,12 +102,12 @@ void print_key_lines(const KeyStatus& status) {
     std::println("logged in: yes");
     std::println("key creator: {}", text_or(status.creator_user_id, not_available));
     if (status.organization_id.has_value()) {
-        std::println("owner: organization {}", *status.organization_id);
+        std::println("owner: organization {}", display_metadata(*status.organization_id));
     } else {
         std::println("owner: individual account");
     }
     std::println("workspace: {}", text_or(status.workspace_id, not_available));
-    std::println("key label: {}", status.label);
+    std::println("key label: {}", display_metadata(status.label));
     std::println("key expires: {}", text_or(status.expires_at, "never"));
     std::println("free tier: {}", status.is_free_tier ? "yes" : "no");
     std::println("usage today: {}", usd_or(status.usage_daily, not_available));
@@ -189,9 +190,9 @@ std::string full_name(const MemberEntry& member) {
 }
 
 void print_member(const MemberEntry& member) {
-    std::println("email: {}{}", member.email, seen_by_organization);
-    std::println("name: {}{}", full_name(member), seen_by_organization);
-    std::println("role: {}{}", member.role, seen_by_organization);
+    std::println("email: {}{}", display_metadata(member.email), seen_by_organization);
+    std::println("name: {}{}", display_metadata(full_name(member)), seen_by_organization);
+    std::println("role: {}{}", display_metadata(member.role), seen_by_organization);
 }
 
 // Nullopt for any other non-2xx status or a body that does not parse.

@@ -97,6 +97,36 @@ bool is_key_at(const orcli::PlaintextKey& key, std::string_view name, std::size_
 
 } // namespace
 
+TEST_CASE("config: XDG defaults need no checkout and create no directories") {
+    const TempDir dir("xdg");
+    const auto config = orcli::load_config({}, {}, dir.path() / "state", dir.path() / "config");
+    REQUIRE(config.has_value());
+    CHECK(config->env_file == dir.path() / "config/openrouter-cli/config.env");
+    CHECK(config->state_dir == dir.path() / "state/openrouter-cli");
+    CHECK(config->cost_log == config->state_dir / "costs.jsonl");
+    CHECK_FALSE(fs::exists(dir.path() / "state"));
+    CHECK_FALSE(fs::exists(dir.path() / "config"));
+    CHECK_FALSE(orcli::load_config("relative", dir.path(), {}, {}).has_value());
+    const auto fallback = orcli::load_config({}, dir.path(), "relative", "relative");
+    REQUIRE(fallback.has_value());
+    CHECK(fallback->env_file == dir.path() / ".config/openrouter-cli/config.env");
+    CHECK(fallback->state_dir == dir.path() / ".local/state/openrouter-cli");
+}
+
+TEST_CASE("config: parsed URLs reject authority confusion and header controls") {
+    const TempDir dir("url-parser");
+    for (const std::string_view url :
+         {"https://", "https:///", "https://user@host/api", "http://localhost:80@evil.example/api",
+          "https://host/?", "https://host/#", "https://host:bad/api", "http://127.1/api",
+          "http://2130706433/api"}) {
+        CHECK_FALSE(load(dir, std::format("OPENROUTER_CLI_BASE_URL={}\n", url)).has_value());
+    }
+    CHECK_FALSE(load(dir, "OPENROUTER_CLI_APP_TITLE=bad\tvalue\n").has_value());
+    const auto valid = load(dir, "OPENROUTER_CLI_BASE_URL=https://example.com/api///\n");
+    REQUIRE(valid.has_value());
+    CHECK(valid->base_url == "https://example.com/api");
+}
+
 TEST_CASE("config: parse_env handles quotes, comments, blanks and whitespace") {
     const orcli::Result<std::map<std::string, std::string>> parsed =
         orcli::parse_env("# comment\n"
@@ -413,4 +443,13 @@ TEST_CASE("config: cost log follows XDG_STATE_HOME when it is absolute") {
         orcli::load_config(dir.path(), fs::path{"relative-home"}, fs::path{});
     REQUIRE_FALSE(relative_home.has_value());
     CHECK(relative_home.error().code == orcli::Exit::config);
+}
+
+TEST_CASE("config: a nondirectory XDG ancestor is an error rather than missing settings") {
+    const TempDir dir("not-a-directory");
+    const auto ancestor = dir.path() / "regular";
+    write_file(ancestor, "text", owner_read_write);
+    const auto config = orcli::load_config({}, dir.path(), {}, ancestor / "child");
+    REQUIRE_FALSE(config.has_value());
+    CHECK(config.error().code == orcli::Exit::config);
 }

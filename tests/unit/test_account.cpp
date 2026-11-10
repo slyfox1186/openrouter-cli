@@ -3,6 +3,7 @@
 #include "common.hpp"
 
 #include <doctest/doctest.h>
+#include <nlohmann/json.hpp>
 
 #include <string>
 #include <string_view>
@@ -12,6 +13,22 @@ namespace {
 
 using orcli::ActivityRow;
 using orcli::Exit;
+
+TEST_CASE("activity dates are validated before records enter summaries") {
+    for (const std::string_view date : {"2026-02-30", "2026-11-09junk", "bad"}) {
+        const nlohmann::json row{{"date", date},          {"model", "a/b"},
+                                 {"provider_name", "p"},  {"requests", 1},
+                                 {"prompt_tokens", 0},    {"completion_tokens", 0},
+                                 {"reasoning_tokens", 0}, {"usage", 0}};
+        CHECK_FALSE(orcli::parse_activity(nlohmann::json{{"data", {row}}}.dump()).has_value());
+    }
+}
+
+TEST_CASE("tiny nonzero charges never display as zero") {
+    constexpr double tiny = 1e-12;
+    CHECK(orcli::format_usd(tiny) != "$0.00000000");
+    CHECK(orcli::format_usd(tiny).find("1e-12") != std::string::npos);
+}
 
 // Shapes from the OpenRouter OpenAPI document (GET /key, /keys, /credits, /activity).
 constexpr std::string_view key_json = R"json({"data": {

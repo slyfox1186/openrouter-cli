@@ -49,8 +49,7 @@ struct CredsTool {
     std::chrono::seconds timeout{default_creds_timeout};
 };
 
-// Finds `systemd-creds` on PATH (absolute path). Builds compiled with ORCLI_TEST_HOOKS use
-// OPENROUTER_CLI_TEST_CREDS_TOOL instead when it is set; release builds ignore that variable.
+// Finds `systemd-creds` on PATH and returns its absolute path.
 // Exit::config when no usable program exists.
 Result<CredsTool> find_creds_tool();
 

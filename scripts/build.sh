@@ -1,31 +1,6 @@
 #!/usr/bin/env bash
-# Checks, builds and installs openrouter-cli in one run.
-#
-# Uses the newest Clang on PATH. A default run: format check, debug build (ASan+UBSan) and
-# tests, clang-tidy, cppcheck, release build, static-link check, then install:
-#   ~/.local/bin/openrouter-cli        a copy of the release binary (static except glibc)
-#   ~/.agents/skills/openrouter-cli    -> skill/openrouter-cli   (Codex user skills)
-#   ~/.claude/skills/openrouter-cli    -> ../../.agents/skills/openrouter-cli (Claude Code)
-# Every step runs even if an earlier one fails, so one log shows everything; nothing is
-# installed unless every earlier step passed. Output is saved to build/logs/build-<UTC>.log
-# and build/logs/latest.log. --uninstall removes those three paths instead and builds nothing.
-# Run scripts/build.sh --help for the options.
+# Release checks finish and their log is closed successfully before installation starts.
 
-# Parse the complete run before executing it, so edits cannot change unread commands mid-build.
-{
-set -Euo pipefail
-
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT" || exit 1
-
-# = delete("reason") and the C++26 library features the code uses need at least Clang 19.
-MIN_CLANG_MAJOR=19
-
-# Descriptions in the help start this many columns after the two-space indent.
-HELP_COLUMN=22
-
-# Same rules as openrouter-cli --help: a non-empty NO_COLOR turns color off, CLICOLOR_FORCE
-# other than empty or 0 turns it on, otherwise color needs a terminal whose TERM is not dumb.
 help_color() {
     if [[ -n "${NO_COLOR:-}" ]]; then
         return 1
@@ -69,122 +44,81 @@ usage() {
         reset=$'\e[0m'
     fi
     printf '%s\n' "${title}scripts/build.sh${reset}"
-    printf '%s\n\n' "Checks, builds and installs openrouter-cli with the newest Clang on PATH."
+    printf '%s\n\n' "Builds, tests and installs openrouter-cli with the newest Clang on PATH."
     printf '%s\n' "${header}USAGE${reset}"
     printf '  %s %s\n\n' "${literal}scripts/build.sh${reset}" "${placeholder}[OPTIONS]${reset}"
-    printf '%s\n' "With no options it runs the format check, a debug build with ASan+UBSan and" \
-        "all tests, clang-tidy, cppcheck, the release build and the static-link check," \
-        "then installs the binary and the agent skill links."
+    printf '%s\n' "With no options it builds release, runs offline tests and checks linkage," \
+        "then installs the binary. --check adds sanitizer and static checks."
     printf '\n%s\n' "${header}OPTIONS${reset}"
-    help_row "" --force "" "Overwrite an existing, different openrouter-cli in the" \
-        "bin dir, and re-point skill links that point elsewhere"
-    help_row "" --bin-dir DIR "Where the binary goes (default ~/.local/bin)"
-    help_row "" --no-skill "" "Install or remove only the binary, not the skill links"
-    help_row "" --no-install "" "Run the checks and build; install nothing"
-    help_row "" --uninstall "" "Remove the installed binary and skill links, then exit;" \
-        "builds nothing. Combines only with --bin-dir and" "--no-skill"
-    help_row "" --quick "" "Skip the format check, debug build, tests, clang-tidy" \
-        "and cppcheck; run only the release build, the" "static-link check and the install"
-    help_row "" --fresh "" "Reconfigure every build directory from scratch"
+    help_row "" --check "" "Add formatting, debug sanitizers and static analysis"
+    help_row "" --quick "" "Build and check linkage only; no tests or installation"
+    help_row "" --force "" "Replace or remove an unrecognized file or symlink"
+    help_row "" --bin-dir DIR "Binary directory (default ~/.local/bin)"
+    help_row "" --with-skills "" "Also install the optional agent skill links"
+    help_row "" --no-skill "" "With --uninstall, leave all skill links in place"
+    help_row "" --no-install "" "Run the selected checks and build; install nothing"
+    help_row "" --uninstall "" "Remove owned binary and skill links without building"
+    help_row "" --fresh "" "Discard configure caches, including old static OpenSSL"
     help_row "" --jobs N "Parallel build jobs (default: number of CPUs)"
-    help_row "" --list-compilers "" "Show every Clang found and the one used, then exit"
+    help_row "" --list-compilers "" "Show Clang pairs and the selected one, then exit"
     help_row -h --help "" "Show this help and exit"
     printf '\n%s\n' "${header}LOGS${reset}"
-    printf '  %s\n' "Each run: build/logs/build-<UTC time>.log" "Newest run: build/logs/latest.log"
+    printf '  %s\n' "Each run: build/logs/build-<UTC time>-<unique>.log" "Newest run: build/logs/latest.log"
 }
 
 usage_error() {
-    echo "build.sh: $1 (see --help)" >&2
-    exit 2
+    printf 'build.sh: %s (see --help)\n' "$1" >&2
+    return 2
 }
 
-FORCE=0
-BIN_DIR="$HOME/.local/bin"
-INSTALL_SKILL=1
-INSTALL=1
-QUICK=0
-FRESH=0
-JOBS=""
-LIST_ONLY=0
-UNINSTALL=0
-# The last option given that only matters to a build or install, for rejecting it with --uninstall.
-BUILD_OPTION=""
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-    --force)
-        FORCE=1
-        BUILD_OPTION="$1"
-        ;;
-    --bin-dir)
-        if [[ $# -lt 2 || -z "$2" ]]; then
-            usage_error "--bin-dir needs a directory"
-        fi
-        BIN_DIR="$2"
+parse_options() {
+    FORCE=0 BIN_DIR="${HOME:-}/.local/bin" INSTALL_SKILL=0 REMOVE_SKILL=1
+    INSTALL=1 QUICK=0 CHECK=0 FRESH=0 JOBS="" LIST_ONLY=0 UNINSTALL=0 HELP=0
+    local build_option="" no_skill=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        --force) FORCE=1 ;;
+        --bin-dir)
+            if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+                usage_error "--bin-dir needs a directory"; return 2
+            fi
+            BIN_DIR="$2"; shift ;;
+        --bin-dir=*)
+            BIN_DIR="${1#*=}"
+            [[ -n "$BIN_DIR" ]] || { usage_error "--bin-dir needs a directory"; return 2; } ;;
+        --with-skills) INSTALL_SKILL=1; build_option="$1" ;;
+        --no-skill) REMOVE_SKILL=0; no_skill=1 ;;
+        --no-install) INSTALL=0; build_option="$1" ;;
+        --uninstall) UNINSTALL=1 ;;
+        --quick) QUICK=1; build_option="$1" ;;
+        --check) CHECK=1; build_option="$1" ;;
+        --fresh) FRESH=1; build_option="$1" ;;
+        --jobs)
+            [[ $# -ge 2 ]] || { usage_error "--jobs needs a number"; return 2; }
+            JOBS="$2"; build_option="$1"; shift ;;
+        --jobs=*) JOBS="${1#*=}"; build_option="--jobs" ;;
+        --list-compilers) LIST_ONLY=1; build_option="$1" ;;
+        -h|--help) HELP=1 ;;
+        *) usage_error "unknown option: $1"; return 2 ;;
+        esac
         shift
-        ;;
-    --bin-dir=*)
-        BIN_DIR="${1#--bin-dir=}"
-        if [[ -z "$BIN_DIR" ]]; then
-            usage_error "--bin-dir needs a directory"
-        fi
-        ;;
-    --no-skill) INSTALL_SKILL=0 ;;
-    --no-install)
-        INSTALL=0
-        BUILD_OPTION="$1"
-        ;;
-    --uninstall) UNINSTALL=1 ;;
-    --quick)
-        QUICK=1
-        BUILD_OPTION="$1"
-        ;;
-    --fresh)
-        FRESH=1
-        BUILD_OPTION="$1"
-        ;;
-    --jobs)
-        if [[ $# -lt 2 ]]; then
-            usage_error "--jobs needs a number"
-        fi
-        JOBS="$2"
-        BUILD_OPTION="$1"
-        shift
-        ;;
-    --jobs=*)
-        JOBS="${1#--jobs=}"
-        BUILD_OPTION="--jobs"
-        ;;
-    --list-compilers)
-        LIST_ONLY=1
-        BUILD_OPTION="$1"
-        ;;
-    -h | --help)
-        usage
-        exit 0
-        ;;
-    *) usage_error "unknown option: $1" ;;
-    esac
-    shift
-done
+    done
+    if [[ "$UNINSTALL" == 1 && -n "$build_option" ]]; then
+        usage_error "--uninstall cannot be combined with $build_option"; return 2
+    fi
+    if [[ "$QUICK" == 1 && "$CHECK" == 1 ]]; then
+        usage_error "--quick cannot be combined with --check"; return 2
+    fi
+    if [[ "$no_skill" == 1 && "$UNINSTALL" == 0 ]]; then
+        usage_error "--no-skill applies only to --uninstall; skills are opt-in"; return 2
+    fi
+    if [[ -n "$JOBS" && ! "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
+        usage_error "--jobs must be a positive whole number"; return 2
+    fi
+    if [[ "$QUICK" == 1 ]]; then INSTALL=0; fi
+    if [[ "$BIN_DIR" != /* ]]; then BIN_DIR="$PWD/$BIN_DIR"; fi
+}
 
-if [[ "$UNINSTALL" == 1 && -n "$BUILD_OPTION" ]]; then
-    usage_error "--uninstall cannot be combined with $BUILD_OPTION"
-fi
-if [[ -z "$JOBS" ]]; then
-    JOBS="$(nproc)"
-fi
-if [[ ! "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
-    usage_error "--jobs must be a positive whole number"
-fi
-
-# Cleared only once the options are valid, so --help and usage errors stay on screen.
-clear
-
-# ----- uninstall ---------------------------------------------------------------------------
-
-# visible DIR: true when the nearest existing directory at or above DIR can be searched, so a
-# failed existence test below it means the path is missing, not hidden by permissions.
 visible() {
     local dir="$1"
     local -A followed=()
@@ -211,59 +145,96 @@ visible() {
     [[ -d "$dir" && -x "$dir" ]]
 }
 
-# remove_installed PATH KIND: removes PATH when it is a symbolic link, or also a regular file
-# when KIND is binary. A real file or directory at a skill path, or a directory at the binary
-# path, was not made by this script and stays. Removing a link leaves what it points to.
-remove_installed() {
-    local path="$1" kind="$2" target
+binary_digest() {
+    local line
+    line="$(sha256sum -- "$1")" || return 1
+    printf '%s\n' "${line%% *}"
+}
+
+owned_binary() {
+    local path="$1" receipt="$BIN_DIR/.openrouter-cli.sha256" recorded actual target
     if [[ -L "$path" ]]; then
-        target="$(readlink "$path")"
-        rm -f -- "$path" || return 1
-        echo "removed  $path (link to $target)"
-        return 0
+        target="$(readlink -m -- "$path")" || return 1
+        [[ "$target" == "$ROOT"/build/release-clang-*/openrouter-cli ]]
+        return
     fi
-    if [[ ! -e "$path" ]]; then
-        if visible "${path%/*}"; then
-            echo "absent   $path"
-            return 0
-        fi
-        echo "cannot check $path: a directory above it cannot be searched"
-        return 1
+    [[ -f "$path" ]] || return 1
+    if [[ -f "$receipt" && ! -L "$receipt" ]]; then
+        IFS= read -r recorded < "$receipt" || return 1
+        [[ "$recorded" =~ ^[0-9a-f]{64}$ ]] || return 1
+        actual="$(binary_digest "$path")" || return 1
+        [[ "$recorded" == "$actual" ]] && return 0
     fi
-    if [[ "$kind" == binary && -f "$path" ]]; then
-        rm -f -- "$path" || return 1
-        echo "removed  $path"
-        return 0
+    [[ -n "${BINARY:-}" && -f "$BINARY" ]] && cmp -s -- "$BINARY" "$path"
+}
+
+remove_installed() {
+    local path="$1" kind="$2" expected="${3:-}" owned=0
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+        visible "${path%/*}" || { echo "cannot inspect $path"; return 1; }
+        echo "absent   $path"; return 0
     fi
-    if [[ "$kind" == binary ]]; then
-        echo "refusing to remove $path: it is not a regular file or link"
+    if [[ "$kind" == skill ]]; then
+        [[ -L "$path" ]] || { echo "refusing to remove real skill file or directory: $path"; return 1; }
+        [[ "$(readlink -m -- "$path")" == "$(readlink -m -- "$expected")" ]] && owned=1
     else
-        echo "refusing to remove $path: it is a real file or directory, not a link"
+        [[ -L "$path" || -f "$path" ]] || { echo "refusing nonregular binary: $path"; return 1; }
+        owned_binary "$path" && owned=1
     fi
-    return 1
+    if [[ "$owned" == 0 && "$FORCE" != 1 ]]; then
+        echo "refusing unrecognized $path; pass --force"; return 1
+    fi
+    rm -- "$path" || return 1
+    echo "removed  $path"
 }
 
 uninstall() {
-    local status=0 other
-    remove_installed "$BIN_DIR/openrouter-cli" binary || status=1
-    if [[ "$INSTALL_SKILL" == 1 ]]; then
-        remove_installed "$HOME/.claude/skills/openrouter-cli" skill || status=1
-        remove_installed "$HOME/.agents/skills/openrouter-cli" skill || status=1
+    local status=0 receipt="$BIN_DIR/.openrouter-cli.sha256"
+    if remove_installed "$BIN_DIR/openrouter-cli" binary; then
+        if [[ -e "$receipt" || -L "$receipt" ]]; then
+            if [[ -f "$receipt" && ! -L "$receipt" ]]; then
+                rm -- "$receipt" || status=1
+            else
+                echo "refusing unsafe install receipt: $receipt"; status=1
+            fi
+        fi
+    else
+        status=1
     fi
-    while IFS= read -r other; do
-        echo "note: $other is still on PATH; it was not removed (see --bin-dir)"
-    done < <(type -aP openrouter-cli)
+    if [[ "$REMOVE_SKILL" == 1 ]]; then
+        remove_installed "$HOME/.claude/skills/openrouter-cli" skill "$HOME/.agents/skills/openrouter-cli" || status=1
+        remove_installed "$HOME/.agents/skills/openrouter-cli" skill "$ROOT/skill/openrouter-cli" || status=1
+    fi
     return "$status"
 }
 
-if [[ "$UNINSTALL" == 1 ]]; then
-    uninstall
-    exit
-fi
+install_binary() {
+    local dest="$BIN_DIR/openrouter-cli" receipt="$BIN_DIR/.openrouter-cli.sha256"
+    local temp receipt_temp digest
+    mkdir -p -- "$BIN_DIR" || return 1
+    if [[ -e "$dest" && ! -L "$dest" && ! -f "$dest" ]]; then
+        echo "refusing nonregular binary destination: $dest"; return 1
+    fi
+    if [[ -e "$receipt" || -L "$receipt" ]]; then
+        [[ -f "$receipt" && ! -L "$receipt" ]] || { echo "refusing unsafe install receipt: $receipt"; return 1; }
+    fi
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        if ! owned_binary "$dest" && [[ "$FORCE" != 1 ]]; then
+            echo "refusing unrecognized $dest; pass --force"; return 1
+        fi
+    fi
+    digest="$(binary_digest "$BINARY")" || return 1
+    temp="$(mktemp "$BIN_DIR/.openrouter-cli.XXXXXX")" || return 1
+    receipt_temp="$(mktemp "$BIN_DIR/.openrouter-cli-receipt.XXXXXX")" || { rm -- "$temp"; return 1; }
+    if ! cp -- "$BINARY" "$temp" || ! chmod 0755 "$temp" ||
+        ! printf '%s\n' "$digest" > "$receipt_temp" ||
+        ! mv -fT -- "$temp" "$dest" || ! mv -fT -- "$receipt_temp" "$receipt"; then
+        rm -f -- "$temp" "$receipt_temp"
+        echo "installing $dest or its ownership receipt failed"; return 1
+    fi
+    echo "installed $dest"
+}
 
-# ----- compiler discovery ------------------------------------------------------------------
-
-# clang_version PROGRAM: prints the full version (e.g. 23.1.5), or fails.
 clang_version() {
     local version banner
     banner="$("$1" --version 2>/dev/null)" || return 1
@@ -304,42 +275,6 @@ sorted_candidates() {
     clang_candidates | sort -t $'\t' -k1,1Vr -s
 }
 
-if [[ "$LIST_ONLY" == 1 ]]; then
-    FOUND=0
-    while IFS=$'\t' read -r version cc cxx; do
-        [[ -n "$version" ]] || continue
-        if [[ "$FOUND" == 0 ]]; then
-            printf '%-10s %s  %s   <- used\n' "$version" "$cc" "$cxx"
-        else
-            printf '%-10s %s  %s\n' "$version" "$cc" "$cxx"
-        fi
-        FOUND=1
-    done < <(sorted_candidates)
-    if [[ "$FOUND" == 0 ]]; then
-        echo "no clang/clang++ pair found on PATH"
-    fi
-    exit 0
-fi
-
-SELECTED="$(sorted_candidates | head -n 1)"
-if [[ -z "$SELECTED" ]]; then
-    echo "build.sh: no clang and clang++ pair found on PATH" >&2
-    exit 1
-fi
-IFS=$'\t' read -r CC_VERSION CC_PATH CXX_PATH <<<"$SELECTED"
-CLANG_MAJOR="${CC_VERSION%%.*}"
-if ((CLANG_MAJOR < MIN_CLANG_MAJOR)); then
-    echo "build.sh: clang $CC_VERSION is too old; openrouter-cli needs clang $MIN_CLANG_MAJOR or newer" >&2
-    exit 1
-fi
-
-# LLD when this Clang can find ld.lld (faster links with LTO), else the toolchain default.
-LLD_PATH="$("$CC_PATH" -print-prog-name=ld.lld 2>/dev/null || true)"
-LINKER_TYPE="DEFAULT"
-if [[ "$LLD_PATH" == /* && -x "$LLD_PATH" ]]; then
-    LINKER_TYPE="LLD"
-fi
-
 find_tool() {
     local tool
     for tool in "$@"; do
@@ -350,69 +285,6 @@ find_tool() {
     done
     return 1
 }
-
-CLANG_FORMAT="$(find_tool "clang-format-$CLANG_MAJOR" clang-format || true)"
-CLANG_TIDY="$(find_tool "clang-tidy-$CLANG_MAJOR" clang-tidy || true)"
-CPPCHECK="$(find_tool cppcheck || true)"
-
-# ----- logging and step bookkeeping --------------------------------------------------------
-
-LOG_DIR="$ROOT/build/logs"
-mkdir -p "$LOG_DIR"
-LOG="$LOG_DIR/build-$(date -u +%Y-%m-%dT%H%M%SZ).log"
-ln -sfn "$(basename "$LOG")" "$LOG_DIR/latest.log"
-exec > >(tee "$LOG") 2>&1
-
-FAILED=()
-
-begin() {
-    printf '\n==== %s ====\n' "$1"
-}
-
-# finish NAME STATUS: records the outcome of the step that begin NAME started.
-finish() {
-    if [[ "$2" == 0 ]]; then
-        printf -- '---- %s: ok\n' "$1"
-        return 0
-    fi
-    printf -- '---- %s: FAILED\n' "$1"
-    FAILED+=("$1")
-    return 1
-}
-
-step() {
-    local name="$1"
-    shift
-    begin "$name"
-    "$@"
-    finish "$name" "$?"
-}
-
-skipped() {
-    printf '\n==== %s: skipped (%s) ====\n' "$1" "$2"
-    FAILED+=("$1 (not run)")
-}
-
-# The preset supplies build type and options; the compiler and build directory come from here
-# (CMake 4.4: -B overrides a preset's binaryDir, -D its variables). One directory per Clang
-# version avoids CMake's "compiler changed" error after an upgrade.
-COMMON_ARGS=("-DCMAKE_C_COMPILER=$CC_PATH" "-DCMAKE_CXX_COMPILER=$CXX_PATH"
-    "-DCMAKE_LINKER_TYPE=$LINKER_TYPE")
-if [[ "$FRESH" == 1 ]]; then
-    COMMON_ARGS+=(--fresh)
-fi
-DEBUG_DIR="build/debug-clang-$CC_VERSION"
-RELEASE_DIR="build/release-clang-$CC_VERSION"
-
-printf 'openrouter-cli build on %s, %s\n' "$(hostname)" "$(date -u +%FT%TZ)"
-printf 'compiler: clang %s (%s, %s), linker %s\n' "$CC_VERSION" "$CC_PATH" "$CXX_PATH" \
-    "$LINKER_TYPE"
-printf 'jobs: %s\n' "$JOBS"
-
-mapfile -t FIRST_PARTY < <(find src tests -name '*.cpp' -o -name '*.hpp' | sort)
-mapfile -t SOURCES < <(find src -name '*.cpp' | sort)
-
-# ----- checks ------------------------------------------------------------------------------
 
 format_check() {
     if [[ -z "$CLANG_FORMAT" ]]; then
@@ -461,128 +333,6 @@ cppcheck_check() {
         --enable=warning,performance,portability --error-exitcode=1 --quiet -j "$JOBS"
 }
 
-if [[ "$QUICK" == 0 ]]; then
-    begin "format check"
-    format_check
-    finish "format check" "$?"
-
-    DEBUG_BUILT=0
-    if step "configure debug" cmake --preset debug -B "$DEBUG_DIR" "${COMMON_ARGS[@]}"; then
-        if step "build debug" cmake --build "$DEBUG_DIR" -j "$JOBS"; then
-            DEBUG_BUILT=1
-        fi
-    fi
-    if [[ "$DEBUG_BUILT" == 1 ]]; then
-        begin "tests (debug, ASan+UBSan)"
-        echo "Integration tests report each completed case and its duration."
-        echo "Some cases deliberately wait through timeouts and retries, including a 30-second lookup."
-        ctest --test-dir "$DEBUG_DIR" --verbose --no-tests=error
-        finish "tests (debug, ASan+UBSan)" "$?"
-    else
-        skipped "tests" "the debug build failed"
-    fi
-
-    # The compile database comes from configuring the debug tree, so these run even when the
-    # debug build itself failed.
-    begin "clang-tidy (src)"
-    tidy_check
-    finish "clang-tidy (src)" "$?"
-    begin "cppcheck (src)"
-    cppcheck_check
-    finish "cppcheck (src)" "$?"
-fi
-
-# ----- release build and static-link check -------------------------------------------------
-
-RELEASE_BUILT=0
-if step "configure release" cmake --preset release -B "$RELEASE_DIR" "${COMMON_ARGS[@]}"; then
-    if step "build release" cmake --build "$RELEASE_DIR" -j "$JOBS"; then
-        RELEASE_BUILT=1
-    fi
-fi
-BINARY="$RELEASE_DIR/openrouter-cli"
-
-# Only glibc may stay shared; libstdc++, libgcc, OpenSSL, curl and the rest are linked in.
-static_check() {
-    local deps line entry bad=0
-    echo "binary: $BINARY ($(stat -c %s "$BINARY") bytes)"
-    if ! deps="$(ldd "$BINARY" 2>&1)"; then
-        echo "ldd could not inspect the binary:"
-        echo "$deps"
-        return 1
-    fi
-    echo "shared libraries it needs:"
-    echo "$deps"
-    while IFS= read -r line; do
-        line="${line#"${line%%[![:space:]]*}"}"
-        [[ -n "$line" ]] || continue
-        entry="${line%%[[:space:]]*}"
-        case "${entry##*/}" in
-        linux-vdso.so.* | libc.so.* | libm.so.* | ld-linux*.so.*) ;;
-        *)
-            echo "unexpected shared library: $entry"
-            bad=1
-            ;;
-        esac
-    done <<<"$deps"
-    if [[ "$bad" != 0 ]]; then
-        return 1
-    fi
-    "$BINARY" --version
-}
-
-if [[ "$RELEASE_BUILT" == 1 ]]; then
-    begin "static link check"
-    static_check
-    finish "static link check" "$?"
-else
-    skipped "static link check" "the release build failed"
-fi
-
-# ----- install -----------------------------------------------------------------------------
-
-install_binary() {
-    local dest="$BIN_DIR/openrouter-cli"
-    local temp target
-    if ! mkdir -p "$BIN_DIR"; then
-        echo "cannot create $BIN_DIR"
-        return 1
-    fi
-    if [[ -d "$dest" && ! -L "$dest" ]]; then
-        echo "refusing to replace $dest: it is a directory"
-        return 1
-    fi
-    if [[ -L "$dest" ]]; then
-        target="$(readlink -f "$dest" || true)"
-        # The previous install.sh linked here into this project's build tree.
-        if [[ "$target" != "$ROOT"/* && "$FORCE" != 1 ]]; then
-            echo "refusing to replace $dest: it links to $(readlink "$dest"); pass --force"
-            return 1
-        fi
-    elif [[ -e "$dest" ]]; then
-        if cmp -s "$BINARY" "$dest"; then
-            echo "up to date: $dest"
-            return 0
-        fi
-        if [[ "$FORCE" != 1 ]]; then
-            echo "refusing to overwrite $dest: it is a different file; pass --force"
-            return 1
-        fi
-    fi
-    if ! temp="$(mktemp "$BIN_DIR/.openrouter-cli.XXXXXX")"; then
-        echo "cannot create a temporary file in $BIN_DIR"
-        return 1
-    fi
-    if ! cp "$BINARY" "$temp" || ! chmod 0755 "$temp" || ! mv -fT "$temp" "$dest"; then
-        rm -f "$temp"
-        echo "copying to $dest failed"
-        return 1
-    fi
-    echo "installed $dest"
-}
-
-# link TARGET LINK: creates or refreshes LINK -> TARGET; never replaces a real file or
-# directory, and re-points a link that points elsewhere only with --force.
 link() {
     local target="$1"
     local link_path="$2"
@@ -595,7 +345,7 @@ link() {
             echo "refusing to change $link_path: it points to $(readlink "$link_path"); pass --force"
             return 1
         fi
-        ln -sfn "$target" "$link_path" || return 1
+        ln -sfnT "$target" "$link_path" || return 1
         echo "updated  $link_path -> $target"
         return 0
     fi
@@ -609,41 +359,187 @@ link() {
 }
 
 install_skill() {
-    local status=0
     if [[ ! -f "$ROOT/skill/openrouter-cli/SKILL.md" ]]; then
         echo "missing $ROOT/skill/openrouter-cli/SKILL.md"
         return 1
     fi
-    link "$ROOT/skill/openrouter-cli" "$HOME/.agents/skills/openrouter-cli" || status=1
-    link "../../.agents/skills/openrouter-cli" "$HOME/.claude/skills/openrouter-cli" || status=1
-    return "$status"
+    link "$ROOT/skill/openrouter-cli" "$HOME/.agents/skills/openrouter-cli" || return 1
+    link "../../.agents/skills/openrouter-cli" "$HOME/.claude/skills/openrouter-cli"
 }
 
-if [[ "$INSTALL" == 1 ]]; then
-    if [[ ${#FAILED[@]} -eq 0 ]]; then
-        begin "install binary"
-        install_binary
-        # The skill describes this build, so it is linked only once this binary is in place.
-        if finish "install binary" "$?" && [[ "$INSTALL_SKILL" == 1 ]]; then
-            begin "install skill links"
-            install_skill
-            finish "install skill links" "$?"
-        fi
-        if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-            echo "note: $BIN_DIR is not on PATH in this shell"
-        fi
-    else
-        printf '\n==== install skipped: earlier steps failed; nothing was changed ====\n'
+begin() { printf '\n==== %s ====\n' "$1"; }
+finish() {
+    if [[ "$2" == 0 ]]; then
+        printf -- '---- %s: ok\n' "$1"
+        return 0
     fi
-fi
-
-printf '\n==== summary ====\n'
-if [[ ${#FAILED[@]} -eq 0 ]]; then
-    echo "all steps passed"
-    echo "log: $LOG"
-    exit 0
-fi
-printf 'failed: %s\n' "${FAILED[@]}"
-echo "log: $LOG"
-exit 1
+    printf -- '---- %s: FAILED\n' "$1"
+    FAILED+=("$1")
+    return 1
 }
+step() {
+    local name="$1" status
+    shift
+    begin "$name"
+    "$@"; status=$?
+    finish "$name" "$status"
+}
+skipped() {
+    printf '\n==== %s: skipped (%s) ====\n' "$1" "$2"
+    FAILED+=("$1 (not run)")
+}
+
+# Wait for tee explicitly. Process-substitution logging cannot report its exit status.
+run_logged() {
+    local -a statuses
+    "$@" 2>&1 | tee --output-error=exit -a "$LOG"
+    statuses=("${PIPESTATUS[@]}")
+    if [[ "${statuses[1]}" != 0 ]]; then
+        echo "build.sh: logging failed" >&2
+        return 1
+    fi
+    return "${statuses[0]}"
+}
+
+linkage_check() {
+    local deps dynamic line entry resolved expected needed ssl=0 crypto=0
+    local -a selected
+    dynamic="$(readelf -d -- "$BINARY")" || return 1
+    if [[ "$dynamic" == *'(RPATH)'* || "$dynamic" == *'(RUNPATH)'* ]]; then
+        echo "embedded RPATH/RUNPATH is not permitted"; return 1
+    fi
+    while IFS= read -r line; do
+        [[ "$line" == *'(NEEDED)'* ]] || continue
+        needed="${line#*[}"; needed="${needed%%]*}"
+        case "$needed" in
+        libssl.so.3|libcrypto.so.3|libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*|ld-linux*.so.*) ;;
+        *) echo "unexpected direct shared dependency: $needed"; return 1 ;;
+        esac
+    done <<< "$dynamic"
+    # Ignore session loader overrides: the binary must work with the normal system loader.
+    deps="$(env -u LD_LIBRARY_PATH -u LD_PRELOAD ldd "$BINARY" 2>&1)" || return 1
+    printf '%s\n' "$deps"
+    [[ "$deps" != *'not found'* ]] || return 1
+    mapfile -t selected < "$RELEASE_DIR/openssl-libraries.txt" || return 1
+    [[ ${#selected[@]} == 2 ]] || return 1
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -n "$line" ]] || continue
+        entry="${line%%[[:space:]]*}"
+        case "${entry##*/}" in
+        libssl.so.3) expected="${selected[0]}"; ssl=1 ;;
+        libcrypto.so.3) expected="${selected[1]}"; crypto=1 ;;
+        linux-vdso.so.*|libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*|ld-linux*.so.*) continue ;;
+        *)
+            # System OpenSSL may itself depend on distro-provided compression libraries.
+            # Direct dependencies above are constrained; all transitive entries must resolve.
+            resolved="${line#*=> }"; resolved="${resolved% (*}"
+            [[ "$resolved" == /* && -f "$resolved" ]] || { echo "unresolved $entry"; return 1; }
+            continue ;;
+        esac
+        resolved="${line#*=> }"; resolved="${resolved% (*}"
+        [[ "$resolved" == /* && -f "$resolved" ]] || { echo "unresolved $entry"; return 1; }
+        [[ "$(readlink -f -- "$resolved")" == "$(readlink -f -- "$expected")" ]] || {
+            echo "$entry does not resolve to the selected system library"; return 1;
+        }
+    done <<< "$deps"
+    [[ "$ssl" == 1 && "$crypto" == 1 ]] || { echo "shared OpenSSL 3 is missing"; return 1; }
+    "$BINARY" --version
+}
+
+run_checks() {
+    FAILED=()
+    local debug_built=0 release_built=0
+    if [[ "$CHECK" == 1 ]]; then
+        step "format check" format_check
+        if step "configure debug" cmake --preset debug -B "$DEBUG_DIR" "${COMMON_ARGS[@]}"; then
+            if step "build debug" cmake --build "$DEBUG_DIR" -j "$JOBS"; then debug_built=1; fi
+        fi
+        if [[ "$debug_built" == 1 ]]; then
+            step "tests (debug, ASan+UBSan)" ctest --test-dir "$DEBUG_DIR" --verbose --no-tests=error
+        else
+            skipped "debug tests" "debug build failed"
+        fi
+        step "clang-tidy (src)" tidy_check
+        step "cppcheck (src)" cppcheck_check
+    fi
+    if step "configure release" cmake --preset release -B "$RELEASE_DIR" "${COMMON_ARGS[@]}" "-DBUILD_TESTING=$([[ "$QUICK" == 1 ]] && echo OFF || echo ON)"; then
+        if step "build release" cmake --build "$RELEASE_DIR" -j "$JOBS"; then release_built=1; fi
+    fi
+    if [[ "$release_built" == 1 ]]; then
+        if [[ "$QUICK" == 0 ]]; then
+            step "tests (release)" ctest --test-dir "$RELEASE_DIR" --verbose --no-tests=error
+        fi
+        step "linkage check" linkage_check
+    else
+        skipped "release checks" "release build failed"
+    fi
+    if [[ ${#FAILED[@]} != 0 ]]; then
+        printf 'failed: %s\n' "${FAILED[@]}"; return 1
+    fi
+    echo "all selected build checks passed"
+}
+
+run_install() {
+    install_binary || return 1
+    if [[ "$INSTALL_SKILL" == 1 ]]; then install_skill || return 1; fi
+    if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then echo "note: $BIN_DIR is not on PATH"; fi
+}
+
+complete_run() {
+    if ! run_logged run_checks; then
+        echo "build.sh: checks or logging failed; nothing installed" >&2; return 1
+    fi
+    if [[ "$INSTALL" == 1 ]]; then run_logged run_install || return 1; fi
+}
+
+main() {
+    set -Euo pipefail
+    ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
+    HELP_COLUMN=22
+    parse_options "$@" || return $?
+    if [[ "$HELP" == 1 ]]; then usage; return; fi
+    if [[ "$UNINSTALL" == 1 ]]; then uninstall; return; fi
+    cd "$ROOT" || return 1
+    local candidates selected version cc cxx found=0
+    candidates="$(sorted_candidates)" || return 1
+    if [[ "$LIST_ONLY" == 1 ]]; then
+        while IFS=$'\t' read -r version cc cxx; do
+            [[ -n "$version" ]] || continue
+            printf '%-10s %s  %s' "$version" "$cc" "$cxx"
+            if [[ "$found" == 0 ]]; then printf '   <- used'; fi
+            printf '\n'; found=1
+        done <<< "$candidates"
+        [[ "$found" == 1 ]] || echo "no clang/clang++ pair found on PATH"
+        return 0
+    fi
+    selected="${candidates%%$'\n'*}"
+    [[ -n "$selected" ]] || { echo "no clang/clang++ pair found on PATH" >&2; return 1; }
+    IFS=$'\t' read -r CC_VERSION CC_PATH CXX_PATH <<< "$selected"
+    CLANG_MAJOR="${CC_VERSION%%.*}"
+    LLD_PATH="$("$CC_PATH" -print-prog-name=ld.lld 2>/dev/null || true)"
+    LINKER_TYPE=DEFAULT
+    if [[ "$LLD_PATH" == /* && -x "$LLD_PATH" ]]; then LINKER_TYPE=LLD; fi
+    CLANG_FORMAT="$(find_tool "clang-format-$CLANG_MAJOR" clang-format || true)"
+    CLANG_TIDY="$(find_tool "clang-tidy-$CLANG_MAJOR" clang-tidy || true)"
+    CPPCHECK="$(find_tool cppcheck || true)"
+    [[ -n "$JOBS" ]] || JOBS="$(nproc)"
+    COMMON_ARGS=("-DCMAKE_C_COMPILER=$CC_PATH" "-DCMAKE_CXX_COMPILER=$CXX_PATH" "-DCMAKE_LINKER_TYPE=$LINKER_TYPE")
+    if [[ "$FRESH" == 1 ]]; then COMMON_ARGS+=(--fresh); fi
+    DEBUG_DIR="build/debug-clang-$CC_VERSION"
+    RELEASE_DIR="build/release-clang-$CC_VERSION"
+    BINARY="$RELEASE_DIR/openrouter-cli"
+    mapfile -d '' -t FIRST_PARTY < <(find src tests -type f \( -name '*.cpp' -o -name '*.hpp' \) -print0 | sort -z)
+    mapfile -d '' -t SOURCES < <(find src -type f -name '*.cpp' -print0 | sort -z)
+    local log_dir="$ROOT/build/logs"
+    mkdir -p -- "$log_dir" || return 1
+    LOG="$(mktemp "$log_dir/build-$(date -u +%Y-%m-%dT%H%M%SZ)-XXXXXX.log")" || return 1
+    ln -sfnT -- "${LOG##*/}" "$log_dir/latest.log" || return 1
+    printf 'compiler: Clang %s; jobs: %s; log: %s\n' "$CC_VERSION" "$JOBS" "$LOG"
+    complete_run || return 1
+    echo "completed; log: $LOG"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

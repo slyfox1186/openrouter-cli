@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -424,4 +425,86 @@ TEST_CASE("a generation id does not change how a resolved charge is counted") {
     CHECK(report.calls.at(0).cost == half);
     CHECK(report.known_total == half);
     CHECK(report.unresolved.empty());
+}
+
+TEST_CASE("malformed records cannot suppress a later valid charge") {
+    const std::string id = "charge";
+    const std::string pending = pending_line(id, "2026-11-09T10:00:00Z", "vendor/model");
+    auto invalid = json::parse(result_line(id, quarter));
+    SUBCASE("wrong cost type") {
+        invalid["cost"] = "unknown";
+    }
+    SUBCASE("wrong outcome") {
+        invalid["outcome"] = "invented";
+    }
+    SUBCASE("wrong version") {
+        invalid["v"] = 2;
+    }
+    SUBCASE("malformed timestamp") {
+        invalid["time"] = "not-a-date";
+    }
+    SUBCASE("negative charge") {
+        invalid["cost"] = -quarter;
+    }
+    const std::string contents = pending + record_line(invalid) + result_line(id, quarter);
+    const auto report = orcli::fold_log({.contents = contents, .since_iso = ""});
+    REQUIRE(report.corrupt_lines.size() == 1);
+    CHECK(report.known_total == doctest::Approx(quarter));
+    REQUIRE(report.calls.size() == 1);
+    CHECK(report.calls.front().state == "complete");
+}
+
+TEST_CASE("ledger snapshots read appended data and distinguish absence from invalid files") {
+    const TempDir temp;
+    const auto file = temp.path() / "costs.jsonl";
+    const orcli::CostLog log(file, temp.path() / "costs.lock");
+    const auto absent = log.read_snapshot();
+    REQUIRE(absent.has_value());
+    CHECK(absent->empty());
+    const auto record = orcli::pending_record(pending_info("a", "2026-11-09T10:00:00Z", "m"));
+    REQUIRE(log.append(record).has_value());
+    const auto contents = log.read_snapshot();
+    REQUIRE(contents.has_value());
+    CHECK(*contents == record_line(record));
+}
+
+TEST_CASE("generation token counts never wrap unsigned input") {
+    const auto stats = orcli::parse_generation(
+        R"({"data":{"total_cost":0,"native_tokens_prompt":18446744073709551615}})");
+    REQUIRE(stats.has_value());
+    CHECK_FALSE(stats->usage.prompt_tokens.has_value());
+    CHECK(stats->total_cost == 0);
+}
+
+TEST_CASE("accounting records share one absolute cleanup deadline") {
+    const TempDir temp;
+    const auto file = temp.path() / "costs.jsonl";
+    const auto lock_path = temp.path() / "costs.lock";
+    const orcli::CostLog log(file, lock_path);
+    constexpr std::chrono::milliseconds budget{20};
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    {
+        const auto held = orcli::FileLock::acquire(lock_path, false);
+        REQUIRE(held.has_value());
+        const auto first =
+            log.append(orcli::generation_record({.call_id = "a", .generation_id = "g"}), deadline);
+        REQUIRE_FALSE(first.has_value());
+        CHECK(first.error().code == Exit::interrupted);
+    }
+    // The deadline is exhausted even though the second record could acquire the lock now.
+    orcli::ResultInfo result;
+    result.call_id = "a";
+    result.outcome = "interrupted";
+    const auto second = log.append(orcli::result_record(result), deadline);
+    REQUIRE_FALSE(second.has_value());
+    CHECK(second.error().code == Exit::interrupted);
+    CHECK_FALSE(fs::exists(file));
+}
+
+TEST_CASE("an invalid ledger generation identifier cannot suppress a later valid one") {
+    const auto contents = generation_line("a", "bad id") + generation_line("a", "gen-valid");
+    const auto report = orcli::fold_log({.contents = contents, .since_iso = ""});
+    REQUIRE(report.calls.size() == 1);
+    CHECK(report.calls.front().generation_id == "gen-valid");
+    CHECK(report.corrupt_lines.size() == 1);
 }

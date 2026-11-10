@@ -27,6 +27,7 @@ std::string fence_for(std::string_view content);
 // Each file as a heading with its path, then a fenced block whose lines are prefixed with
 // right-aligned line numbers and " | ", so reviewers can cite file:line.
 std::string pack_files(const std::vector<FileSnapshot>& files);
+Result<std::string> pack_files(const std::vector<FileSnapshot>& files, std::size_t max_bytes);
 
 } // namespace orcli
 
