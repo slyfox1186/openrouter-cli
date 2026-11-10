@@ -4,6 +4,7 @@
 #include "fsutil.hpp"
 
 #include <curl/curl.h>
+#include <curl/urlapi.h>
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -201,13 +202,13 @@ bool has_control(std::string_view text) {
     });
 }
 
-std::string url_part(CURLU* url, CURLUPart part) {
+std::string url_part(const CURLU* url, CURLUPart part) {
     char* value = nullptr;
     if (curl_url_get(url, part, &value, CURLU_GET_EMPTY) != CURLUE_OK) {
         return {};
     }
     const std::unique_ptr<char, decltype(&curl_free)> owned(value, &curl_free);
-    return std::string(owned.get());
+    return {owned.get()};
 }
 
 // Plain HTTP is allowed only for the exact loopback hosts used by offline tests.

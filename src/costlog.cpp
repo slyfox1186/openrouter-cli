@@ -23,6 +23,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -168,7 +169,7 @@ bool valid_record_fields(const json& record, std::string_view type) {
     if (!valid_timestamp(string_at(record, "time"))) {
         return false;
     }
-    for (const auto key : {"served_model", "provider", "model"}) {
+    for (const auto* const key : {"served_model", "provider", "model"}) {
         if (!optional_string(record, key)) {
             return false;
         }
@@ -177,15 +178,19 @@ bool valid_record_fields(const json& record, std::string_view type) {
         return nonempty_string(record, "model_id");
     }
     if (type == "generation") {
-        const auto id = string_at(record, "generation_id");
-        return id && valid_generation_id(*id);
+        const auto generation_id = string_at(record, "generation_id");
+        return generation_id && valid_generation_id(*generation_id);
     }
     if (type == "resolved") {
         return optional_cost(record, "total_cost");
     }
     const auto outcome = string_at(record, "outcome");
-    constexpr std::array<std::string_view, 4> outcomes{"complete", "incomplete", "error",
-                                                       "interrupted"};
+    constexpr std::array<std::string_view, 4> outcomes{
+        "complete",
+        "incomplete",
+        "error",
+        "interrupted",
+    };
     return outcome && std::ranges::contains(outcomes, *outcome) && optional_cost(record, "cost");
 }
 

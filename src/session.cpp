@@ -29,7 +29,7 @@ constexpr std::size_t max_session_name_length = 64;
 constexpr std::size_t uuid_bytes = 16;
 constexpr long long session_format_version = 1;
 constexpr int json_indent = 2;
-constexpr std::size_t max_session_bytes = 128 * 1024 * 1024;
+constexpr std::size_t max_session_bytes = std::size_t{128} * 1024 * 1024;
 
 bool session_name_char(char letter) {
     return (letter >= 'a' && letter <= 'z') || (letter >= 'A' && letter <= 'Z') ||

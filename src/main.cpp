@@ -29,6 +29,7 @@
 #include <filesystem>
 #include <format>
 #include <iterator>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <print>
@@ -119,7 +120,7 @@ int cmd_models_find(const Config& config, const Http& http, const std::string& n
     if (!catalog) {
         return report(catalog.error());
     }
-    auto matches = search(name, catalog->models);
+    const auto matches = search(name, catalog->models);
     if (matches.empty()) {
         return report(
             Error{.code = Exit::model, .message = std::format("no model matches \"{}\"", name)});

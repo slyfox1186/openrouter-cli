@@ -500,8 +500,9 @@ long status_of(std::string_view status_line) {
     }
     const auto number = code.substr(0, status_length);
     long status = 0;
-    const auto parsed = std::from_chars(number.data(), std::to_address(number.end()), status);
-    const bool whole = parsed.ec == std::errc{} && parsed.ptr == std::to_address(number.end());
+    const char* const number_end = std::to_address(number.end());
+    const auto parsed = std::from_chars(std::to_address(number.begin()), number_end, status);
+    const bool whole = parsed.ec == std::errc{} && parsed.ptr == number_end;
     return whole ? status : 0;
 }
 

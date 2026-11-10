@@ -23,8 +23,8 @@
 #include <utility>
 
 #include <fcntl.h>
-#include <poll.h>
 #include <sys/file.h>
+#include <sys/poll.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -470,7 +470,7 @@ Result<std::string> read_input(std::size_t max_bytes, bool stop_at_newline) {
         if (ready < 0 && errno == EINTR) {
             continue;
         }
-        if (ready < 0 || (input.revents & POLLNVAL) != 0) {
+        if (ready < 0) {
             cleanse(text);
             return fail(Exit::config, "cannot read standard input");
         }

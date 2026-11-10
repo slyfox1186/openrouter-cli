@@ -141,9 +141,9 @@ void record_usage(const json& usage, Usage& totals) {
 
 void record_chunk(const json& chunk, StreamOutcome& outcome) {
     if (!outcome.generation_id.has_value()) {
-        auto id = string_member(chunk, "id");
-        if (id && valid_generation_id(*id)) {
-            outcome.generation_id = std::move(id);
+        auto chunk_id = string_member(chunk, "id");
+        if (chunk_id && valid_generation_id(*chunk_id)) {
+            outcome.generation_id = std::move(chunk_id);
         }
     }
     record_string(outcome.served_model, chunk, "model");
@@ -181,7 +181,7 @@ std::string record_choice(const json& chunk, StreamOutcome& outcome) {
 SseParser::SseParser(std::size_t max_event_bytes) : max_event_bytes_(max_event_bytes) {}
 
 Result<std::vector<std::string>> SseParser::feed(std::string_view bytes) {
-    if (bytes.find('\0') != std::string_view::npos) {
+    if (bytes.contains('\0')) {
         return fail(Exit::api, "invalid control byte in server-sent event");
     }
     std::vector<std::string> events;
