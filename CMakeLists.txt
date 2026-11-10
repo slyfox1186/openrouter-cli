@@ -200,6 +200,7 @@ add_library(orcli_core STATIC
     src/fsutil.cpp
     src/http.cpp
     src/models.cpp
+    src/progress.cpp
     src/request.cpp
     src/secrets.cpp
     src/session.cpp

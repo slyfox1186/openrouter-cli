@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 // Header-only because the core library and the help library both color text and neither links
@@ -48,6 +49,21 @@ struct ColorInputs {
         .term = environment("TERM"),
         .terminal = ::isatty(descriptor) == 1,
     });
+}
+
+// True when text written to one descriptor lands among text written to the other: both are
+// open on the same pipe or file, or both are terminals. Two terminals count without comparing
+// them because one terminal has several names (/dev/tty, /dev/pts/N) with different inodes.
+[[nodiscard]] inline bool same_destination(int first, int second) noexcept {
+    if (::isatty(first) == 1 && ::isatty(second) == 1) {
+        return true;
+    }
+    struct stat first_info{};
+    struct stat second_info{};
+    if (::fstat(first, &first_info) != 0 || ::fstat(second, &second_info) != 0) {
+        return false;
+    }
+    return first_info.st_dev == second_info.st_dev && first_info.st_ino == second_info.st_ino;
 }
 
 // The text inside one SGR sequence (codes from the terminal's own 16-color palette, so they

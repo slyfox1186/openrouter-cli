@@ -84,6 +84,8 @@ constexpr std::chrono::seconds output_wait{15};
 constexpr std::chrono::seconds child_time_limit{90};
 constexpr std::chrono::seconds idle_hold{5};
 constexpr std::chrono::seconds drip_hold{3};
+// Just past the first heartbeat, which is due 10 seconds into a call.
+constexpr std::chrono::seconds heartbeat_hold{11};
 
 constexpr std::string_view alpha = "test/alpha-1";
 
@@ -284,6 +286,7 @@ struct Launch {
     std::optional<int> stdout_descriptor{}; // borrowed; use spawn and capture in the parent
     bool failed_stderr = false;
     bool closed_stdout = false; // stdout is a pipe whose read end is already closed
+    bool merged_output = false; // stderr shares stdout's open file, as `2>&1` does
     bool creds_tool = true;     // false: no test credential tool and nothing on PATH
     std::optional<fs::path> home{};
     std::optional<rlim_t> file_size_limit{}; // RLIMIT_FSIZE, with SIGXFSZ ignored
@@ -447,9 +450,10 @@ public:
         const std::vector<char*> argv = pointers_to(arg_strings);
         const std::vector<char*> envp = pointers_to(env_strings);
         const std::string workdir = work().string();
+        const int out_descriptor = launch.stdout_descriptor.value_or(out.get());
         const ChildSetup setup{.in = launch.stdin_descriptor.value_or(in.get()),
-                               .out = launch.stdout_descriptor.value_or(out.get()),
-                               .err = err.get(),
+                               .out = out_descriptor,
+                               .err = launch.merged_output ? out_descriptor : err.get(),
                                .workdir = workdir.c_str(),
                                .argv = argv.data(),
                                .envp = envp.data(),
@@ -623,6 +627,25 @@ TEST_CASE("a streamed answer is printed, saved and logged with its cost") {
     const std::string cost_line = line_starting(result.err, "openrouter-cli: cost $0.0042");
     CHECK_FALSE(cost_line.empty());
     CHECK(cost_line.contains("via MockProvider"));
+    const auto asking = result.err.find("openrouter-cli: asking test/alpha-1 (role plain, ");
+    const auto stream_started = result.err.find("openrouter-cli: response stream started after ");
+    const auto answer_started = result.err.find("openrouter-cli: answer started after ");
+    const auto cost = result.err.find("openrouter-cli: cost ");
+    REQUIRE(asking != std::string::npos);
+    REQUIRE(stream_started != std::string::npos);
+    REQUIRE(answer_started != std::string::npos);
+    REQUIRE(cost != std::string::npos);
+    CHECK(asking < stream_started);
+    CHECK(stream_started < answer_started);
+    CHECK(answer_started < cost);
+    // stdout and stderr are separate files here, so no blank lines are needed between them.
+    CHECK_FALSE(result.err.contains("\n\n"));
+    // This stream names its provider only after the answer, which is too late for a notice.
+    CHECK_FALSE(result.err.contains("provider reported"));
+    // Without --role the question goes out as written, with no system message in front of it.
+    const json sent = server.last_post().at("messages");
+    REQUIRE(sent.size() == 1U);
+    CHECK(text_at(sent.at(0), "role") == "user");
     CHECK(server.post_count() == 1);
     CHECK(server.generation_count() == 0);
     CHECK(server.last_authorization() == bearer(inference_key()));
@@ -773,6 +796,7 @@ TEST_CASE("an HTTP error status is reported by type without echoing secrets") {
     CHECK(result.code == exit_api);
     CHECK(result.err.contains("402"));
     CHECK(result.err.contains("provider_error"));
+    CHECK_FALSE(result.err.contains("response stream started"));
     CHECK_FALSE(result.err.contains(mock::fake_api_key()));
     CHECK_FALSE(result.err.contains("[redacted]"));
     CHECK(result.out.empty());
@@ -790,6 +814,7 @@ TEST_CASE("an error body served with status 200 is an API error") {
 
     CHECK(result.code == exit_api);
     CHECK(result.err.contains("provider_error"));
+    CHECK_FALSE(result.err.contains("response stream started"));
     CHECK(server.post_count() == 1);
     CHECK(result_outcome(sandbox) == "error");
 }
@@ -879,14 +904,17 @@ TEST_CASE("a session carries completed turns only and pins its model and system 
     Sandbox sandbox(server.port());
     sandbox.store_api_key();
 
-    const RunResult first = sandbox.run({"--session", "s1", "-m", std::string(alpha), "q1"});
+    const RunResult first =
+        sandbox.run({"--session", "s1", "-m", std::string(alpha), "--role", "review", "q1"});
     REQUIRE(first.code == exit_ok);
     const json first_body = server.last_post();
     REQUIRE(first_body.contains("session_id"));
     const std::string session_id = text_at(first_body, "session_id");
 
+    CHECK(first.err.contains("(role review, "));
     const RunResult second = sandbox.run({"--session", "s1", "q2"});
     REQUIRE(second.code == exit_ok);
+    CHECK(second.err.contains("(role from session, "));
     const json second_body = server.last_post();
     CHECK(text_at(second_body, "model") == alpha);
     CHECK(text_at(second_body, "session_id") == session_id);
@@ -1019,6 +1047,117 @@ TEST_CASE("keepalive comments keep a quiet call alive past the idle limit") {
     CHECK(server.post_count() == 1);
 }
 
+TEST_CASE("reviewer instructions are sent only with --role review") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    const RunResult review =
+        sandbox.run({"-m", std::string(alpha), "--role", "review", "Review this plan."});
+    REQUIRE(review.code == exit_ok);
+    CHECK(review.err.contains("openrouter-cli: asking test/alpha-1 (role review, "));
+    const json reviewed = server.last_post().at("messages");
+    REQUIRE(reviewed.size() == 2U);
+    CHECK(text_at(reviewed.at(0), "role") == "system");
+    CHECK(text_at(reviewed.at(0), "content").contains("RETHINK"));
+    CHECK(text_at(reviewed.at(1), "content") == "Review this plan.");
+
+    const RunResult plain = sandbox.run({"-m", std::string(alpha), "--role", "plain", "Hi"});
+    REQUIRE(plain.code == exit_ok);
+    const json asked = server.last_post().at("messages");
+    REQUIRE(asked.size() == 1U);
+    CHECK(text_at(asked.at(0), "content") == "Hi");
+
+    // Extra instructions travel as the system message under either spelling of the option.
+    for (const std::string option : {"--system-prompt", "-s"}) {
+        INFO(option);
+        REQUIRE(sandbox.run({"-m", std::string(alpha), option, "Answer in French.", "Hi"}).code ==
+                exit_ok);
+        const json prompted = server.last_post().at("messages");
+        REQUIRE(prompted.size() == 2U);
+        CHECK(text_at(prompted.at(0), "role") == "system");
+        CHECK(text_at(prompted.at(0), "content") == "Answer in French.");
+    }
+    const int sent_before = server.post_count();
+    CHECK(sandbox.run({"-m", std::string(alpha), "--system", "x", "Hi"}).code == exit_usage);
+    CHECK(server.post_count() == sent_before);
+}
+
+TEST_CASE("a long quiet start prints heartbeats that say no answer text has arrived") {
+    MockServer server;
+    server.set_scenario(Scenario::drip);
+    server.set_hold(heartbeat_hold);
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    const RunResult result = sandbox.run(ask("question"));
+
+    CHECK(result.code == exit_ok);
+    CHECK(result.out == "Hello world\n");
+    // libcurl times its progress callback approximately, so the seconds are not pinned.
+    const auto heartbeat = result.err.find("s, no answer text yet, ");
+    const auto answer_started = result.err.find("openrouter-cli: answer started after ");
+    REQUIRE(heartbeat != std::string::npos);
+    REQUIRE(answer_started != std::string::npos);
+    CHECK(heartbeat < answer_started);
+    CHECK(result.err.contains(" bytes of keep-alive and metadata received\n"));
+    CHECK_FALSE(result.err.contains("waiting for the response stream"));
+}
+
+TEST_CASE("a provider named before the answer is reported, and the role shows in plain mode") {
+    MockServer server;
+    server.set_scenario(Scenario::provider_first);
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    const RunResult result = sandbox.run({"-m", std::string(alpha), "--role", "plain", "question"});
+
+    CHECK(result.code == exit_ok);
+    CHECK(result.out == "Hello world\n");
+    CHECK(result.err.contains("openrouter-cli: asking test/alpha-1 (role plain, "));
+    const auto provider = result.err.find("openrouter-cli: provider reported: MockProvider\n");
+    const auto answer_started = result.err.find("openrouter-cli: answer started after ");
+    REQUIRE(provider != std::string::npos);
+    REQUIRE(answer_started != std::string::npos);
+    CHECK(provider < answer_started);
+}
+
+TEST_CASE("blank lines set the answer apart when stdout and stderr share a destination") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    const RunResult result =
+        sandbox.run_with(Launch{.args = ask("question"), .merged_output = true});
+
+    CHECK(result.code == exit_ok);
+    CHECK(result.err.empty());
+    const auto answer_started = result.out.find("openrouter-cli: answer started after ");
+    const auto answer = result.out.find("\n\nHello world\n\nopenrouter-cli: cost ");
+    REQUIRE(answer_started != std::string::npos);
+    REQUIRE(answer != std::string::npos);
+    // The blank line follows the "answer started" line directly.
+    CHECK(result.out.find('\n', answer_started) == answer);
+    CHECK_FALSE(result.out.contains("\n\n\n"));
+    // The separators go to stderr only, so the saved answer is what the model wrote.
+    CHECK(sandbox.only_answer() == "Hello world");
+}
+
+TEST_CASE("progress lines are dimmed on a color stream and the cost line is not") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    const RunResult result =
+        sandbox.run_with(Launch{.args = ask("question"), .extra_env = {"CLICOLOR_FORCE=1"}});
+
+    CHECK(result.code == exit_ok);
+    CHECK(result.out == "Hello world\n");
+    CHECK(result.err.contains("\x1b[2mopenrouter-cli: asking test/alpha-1 (role plain, "));
+    CHECK(result.err.contains("\x1b[2mopenrouter-cli: answer started after "));
+    CHECK_FALSE(line_starting(result.err, "openrouter-cli: cost $0.0042").empty());
+}
+
 TEST_CASE("SIGTERM mid-stream keeps the partial answer, and the busy session is refused") {
     MockServer server;
     server.set_scenario(Scenario::gated);
@@ -1084,6 +1223,31 @@ TEST_CASE("find, show, save and list run without the models prefix") {
     CHECK(server.post_count() == 0);
 }
 
+TEST_CASE("remove deletes one saved alias and refuses a name that is not saved") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    REQUIRE(sandbox.run({"save", "mine", "test/beta-2"}).code == exit_ok);
+    REQUIRE(sandbox.run({"save", "other", std::string(alpha)}).code == exit_ok);
+
+    const RunResult removed = sandbox.run({"remove", "Mine"});
+    CHECK(removed.code == exit_ok);
+    CHECK(removed.out == "removed alias mine (was test/beta-2)\n");
+    const RunResult listed = sandbox.run({"list"});
+    CHECK_FALSE(listed.out.contains("mine -> "));
+    CHECK(listed.out.contains("other -> " + std::string(alpha)));
+
+    const RunResult again = sandbox.run({"remove", "mine"});
+    CHECK(again.code == exit_model);
+    CHECK(again.err.contains("no saved alias is named \"mine\""));
+    CHECK(again.out.empty());
+
+    CHECK(sandbox.run({"models", "remove", "other"}).code == exit_ok);
+    CHECK(sandbox.run({"list"}).out.contains("no saved aliases"));
+    CHECK(sandbox.run({"remove"}).code == exit_usage);
+    CHECK(sandbox.run({"remove", "--"}).code == exit_usage);
+    CHECK(server.post_count() == 0);
+}
+
 TEST_CASE("command line grammar") {
     MockServer server;
     Sandbox sandbox(server.port());
@@ -1098,7 +1262,7 @@ TEST_CASE("command line grammar") {
     CHECK(sandbox.run({"-m", "x", "logout"}).code == exit_usage);
     CHECK(file_exists(sandbox.api_credential()));
     CHECK(sandbox.run({"-m", "x", "spend"}).code == exit_usage);
-    for (const std::string command : {"find", "show", "save", "list"}) {
+    for (const std::string command : {"find", "show", "save", "remove", "list"}) {
         INFO(command);
         CHECK(sandbox.run({"-m", "x", command}).code == exit_usage);
     }
@@ -1130,11 +1294,13 @@ TEST_CASE("help is shown for -h and --help on every command") {
         {.path = {"find"}, .usage = "  openrouter-cli find [OPTIONS] NAME\n"},
         {.path = {"show"}, .usage = "  openrouter-cli show MODEL\n"},
         {.path = {"save"}, .usage = "  openrouter-cli save ALIAS MODEL_ID\n"},
+        {.path = {"remove"}, .usage = "  openrouter-cli remove ALIAS\n"},
         {.path = {"list"}, .usage = "  openrouter-cli list\n"},
         {.path = {"models"}, .usage = "  openrouter-cli models COMMAND\n"},
         {.path = {"models", "find"}, .usage = "  openrouter-cli models find [OPTIONS] NAME\n"},
         {.path = {"models", "show"}, .usage = "  openrouter-cli models show MODEL\n"},
         {.path = {"models", "save"}, .usage = "  openrouter-cli models save ALIAS MODEL_ID\n"},
+        {.path = {"models", "remove"}, .usage = "  openrouter-cli models remove ALIAS\n"},
         {.path = {"models", "list"}, .usage = "  openrouter-cli models list\n"},
         {.path = {"spend"}, .usage = "  openrouter-cli spend [OPTIONS]\n"},
         {.path = {"login"}, .usage = "  openrouter-cli login [OPTIONS]\n"},
@@ -1177,11 +1343,13 @@ TEST_CASE("help is shown for -h and --help on every command") {
     CHECK(line_starting(root, "  list ").ends_with("List saved aliases"));
     CHECK(root.find("  find [OPTIONS] NAME ") != std::string::npos);
     CHECK(root.find("  show MODEL ") != std::string::npos);
+    CHECK(root.find("  remove ALIAS ") != std::string::npos);
+    CHECK(root.find("  -s, --system-prompt TEXT ") != std::string::npos);
     CHECK(root.find("\n  models") == std::string::npos);
     CHECK(root.find("models save") == std::string::npos);
     const std::string models_page = sandbox.run({"models", "--help"}).out;
-    for (const std::string_view row :
-         {"  find [OPTIONS] NAME ", "  show MODEL ", "  save ALIAS MODEL_ID ", "  list "}) {
+    for (const std::string_view row : {"  find [OPTIONS] NAME ", "  show MODEL ",
+                                       "  save ALIAS MODEL_ID ", "  remove ALIAS ", "  list "}) {
         INFO(row);
         CHECK(models_page.find(row) != std::string::npos);
     }

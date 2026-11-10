@@ -24,7 +24,7 @@
 
 [OpenRouter](https://openrouter.ai) is a service that gives you **one account for hundreds of AI models** from many different companies. `openrouter-cli` is a small program that sends your question, along with any files you choose, to one of those models. The answer appears in your terminal as the model writes it.
 
-Out of the box, the model plays the part of a **careful reviewer**. It reads your plan or code and replies with a verdict, then a list of problems ordered from most to least serious. Each problem says *where* it is, *why* it matters and *how* to fix it. You can also switch the reviewer off and ask ordinary questions.
+Out of the box, your question is sent exactly as you wrote it. Add `--role review` and the model plays the part of a **careful reviewer** instead: it reads your plan or code and replies with a verdict, then a list of problems ordered from most to least serious. Each problem says *where* it is, *why* it matters and *how* to fix it.
 
 It was made for people who work with AI coding assistants such as Claude Code and Codex, so the assistant can ask a *different* model to double-check its work. It is just as handy when you type the commands yourself.
 
@@ -157,69 +157,87 @@ openrouter-cli save reviewer AUTHOR/MODEL
 **Step 4.** Ask your question. This one is ![Usually paid](https://img.shields.io/badge/Usually%20paid-cf222e?style=flat-square) unless the price from step 2 was zero.
 
 ```bash
-openrouter-cli -m reviewer --role plain "Explain what a race condition is in three sentences."
+openrouter-cli -m reviewer "Explain what a race condition is in three sentences."
 ```
 
-Here `-m` picks the model, and `--role plain` asks an ordinary question. Leave out `--role plain` and the model reviews whatever you send it, which is what the recipes below do with your own files.
+Here `-m` picks the model, and the question goes out as written. Add `--role review` to have the model review whatever you send it, which is what the review recipes below do with your own files.
 
 ### What you will see
 
-The answer appears in your terminal as the model writes it. Models that "think" first can take **several minutes**, and that is normal. While you wait, a progress line appears every 30 seconds:
+The answer appears in your terminal as the model writes it. Models that "think" first can take **several minutes**, and that is normal: their thinking is not shown, so nothing appears until the answer itself begins. While you wait, progress lines tell you how far the call has got:
 
 ```text
-openrouter-cli: waiting, 60s elapsed, 0 bytes received
+openrouter-cli: asking AUTHOR/MODEL (role plain, effort high, up to 64000 output tokens, zdr)
+openrouter-cli: response stream started after 0.8s; reasoning text is excluded, so the answer can take a while
+openrouter-cli: provider reported: PROVIDER
+openrouter-cli: 10s, no answer text yet, 420 bytes of keep-alive and metadata received
+openrouter-cli: answer started after 41s
 ```
+
+A progress line appears every 10 seconds for the first minute and every 30 seconds after that. Once the answer is being written the lines stop, unless the text pauses for a whole interval. The provider line appears only when OpenRouter names the provider before the answer begins.
 
 When the answer is finished, one last line shows the price, which model and provider answered, how many tokens were used and where the answer was saved:
 
 ```text
-cost ... | MODEL via PROVIDER | in ... (cached ...) | out ... (reasoning ...) | answer /path/to/answer.md
+openrouter-cli: cost ... | MODEL via PROVIDER | in ... (cached ...) | out ... (reasoning ...) | answer /path/to/answer.md
 ```
+
+In a terminal a blank line sits above and below the answer, and the progress lines are dimmed, so the answer is easy to pick out:
+
+```text
+openrouter-cli: answer started after 41s
+
+A race condition happens when two parts of a program ...
+
+openrouter-cli: cost ... | MODEL via PROVIDER | ...
+```
+
+Those blank lines are only for reading. The answer and the `openrouter-cli:` lines travel on separate channels (stdout and stderr), so `> answer.md` and pipes receive the answer alone, and the saved answer file never contains them.
 
 ## Everyday recipes
 
 **Options always go first, and your question always goes last.** Swap the file names in these examples for your own files.
 
-**Review several files at once.** Repeat `-f` for each file. Lines are numbered, so the reviewer can point at exact lines.
+**Review several files at once.** `--role review` turns on the reviewer. Repeat `-f` for each file. Lines are numbered, so the reviewer can point at exact lines.
 
 ```bash
-openrouter-cli -m reviewer -f src/http.cpp -f src/http.hpp "Review the retry logic."
+openrouter-cli -m reviewer --role review -f src/http.cpp -f src/http.hpp "Review the retry logic."
 ```
 
 **Review your latest code changes.** A `-` in place of the question reads it from the pipe.
 
 ```bash
-git diff | openrouter-cli -m reviewer -
+git diff | openrouter-cli -m reviewer --role review -
 ```
 
 **Send a long question.** Type it between the two `EOF` lines.
 
 ```bash
-openrouter-cli -m reviewer -f plan.md - <<'EOF'
+openrouter-cli -m reviewer --role review -f plan.md - <<'EOF'
 What I am trying to do, what I changed,
 and what I want you to check...
 EOF
 ```
 
-**Ask an ordinary question** with no review format:
+**Ask an ordinary question.** Leave `--role` out and the model answers in its own words, with no review format:
 
 ```bash
-openrouter-cli -m reviewer --role plain "Explain this design."
+openrouter-cli -m reviewer "Explain this design."
 ```
 
 **Have a back-and-forth conversation.** Give it a name with `--session`. Later rounds use the same model automatically, so leave out `-m`.
 
 ```bash
-openrouter-cli -m reviewer --session review -f plan.md "Review this plan."
+openrouter-cli -m reviewer --role review --session review -f plan.md "Review this plan."
 openrouter-cli --session review -f plan.md "I fixed the second problem. Review the updated plan."
 ```
 
-The session remembers the conversation, but **it does not reread your files**. Attach a changed file again with `-f`. *Each round resends the whole conversation*, so later rounds can cost more than earlier ones.
+The session remembers the conversation and the role it started with, but **it does not reread your files**. Attach a changed file again with `-f`. *Each round resends the whole conversation*, so later rounds can cost more than earlier ones.
 
 **Choose a specific provider.** Copy a tag from the `TAG` column of `show`:
 
 ```bash
-openrouter-cli -m reviewer -p TAG "Review this plan."
+openrouter-cli -m reviewer --role review -p TAG "Review this plan."
 ```
 
 **Ask a question that starts with a dash** or matches a command name. Put `--` in front of it:
@@ -234,7 +252,7 @@ openrouter-cli -m reviewer -- "--force: is this flag safe?"
 | --- | --- |
 | A question: `openrouter-cli -m MODEL "..."` | ![Usually paid](https://img.shields.io/badge/Usually%20paid-cf222e?style=flat-square) |
 | Each follow-up round in a `--session` | ![Usually paid](https://img.shields.io/badge/Usually%20paid-cf222e?style=flat-square) |
-| `find`, `show`, `save`, `list` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
+| `find`, `show`, `save`, `remove`, `list` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
 | `status`, `account balance`, `account keys`, `account credits`, `account activity` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
 | `spend`, `spend --resolve` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
 | `login`, `logout`, `auth set`, `--help`, `--version` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
@@ -355,6 +373,7 @@ Everything below is optional detail. Click a heading to open it.
 | `find [--refresh] WORDS` | List models matching the words. `--refresh` downloads a fresh model list first. |
 | `show MODEL` | Prices, context and output limits, reasoning efforts and provider tags. |
 | `save ALIAS MODEL_ID` | Save a nickname for an exact model ID. A model has one nickname, so a new one replaces the old. |
+| `remove ALIAS` | Delete a saved nickname. |
 | `list` | List saved nicknames. |
 | `spend [--since PERIOD] [--resolve]` | Totals from the cost log. PERIOD is `today`, `7d`, `30d` or `all`. |
 | `login [--replace]` | Sign in with your browser and store a new key. |
@@ -366,7 +385,7 @@ Everything below is optional detail. Click a heading to open it.
 | `account credits` | Credits bought and used (Management key). |
 | `account activity [--days N]` | Usage per day, model and provider (Management key). |
 
-`find`, `show`, `save` and `list` also work with `models` in front, for example `openrouter-cli models save ALIAS MODEL_ID`.
+`find`, `show`, `save`, `remove` and `list` also work with `models` in front, for example `openrouter-cli models save ALIAS MODEL_ID`.
 
 `login` and `auth set` never overwrite a stored key unless you add `--replace`. Keys are checked with OpenRouter before they are stored. Deleting a key from this computer does not delete it at OpenRouter.
 
@@ -383,8 +402,8 @@ Everything below is optional detail. Click a heading to open it.
 | --- | --- |
 | `-m`, `--model MODEL` | The model: nickname, exact ID, `~author/family-latest` or plain words. |
 | `-f`, `--file FILE` | Attach a file, sent with line numbers. Repeat for more files. |
-| `--role ROLE` | `review` (default) asks for a structured review. `plain` sends no review instructions. |
-| `-s`, `--system TEXT` | Extra instructions for the model. `-s @FILE` reads them from a file. |
+| `--role ROLE` | `plain` (default) sends your question as written. `review` asks for a structured review. |
+| `-s`, `--system-prompt TEXT` | Extra instructions for the model, sent as its system prompt. `-s @FILE` reads them from a file. |
 | `-e`, `--effort LEVEL` | How hard the model thinks: `max`, `xhigh`, `high`, `medium`, `low`, `minimal` or `none`. Models that cannot choose ignore it. |
 | `--max-output-tokens N` | Most tokens the model may write, thinking included, up to the model's own limit. |
 | `-p`, `--provider TAG` | Use only this provider. Copy tags from `show`. Repeat for more. |

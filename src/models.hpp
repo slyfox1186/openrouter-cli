@@ -102,6 +102,10 @@ Result<std::map<std::string, AliasEntry>> load_aliases(const std::filesystem::pa
 Result<std::vector<std::string>> save_alias(const std::filesystem::path& state_dir,
                                             const std::string& alias, const std::string& model_id);
 
+// Removes one alias and returns what it pointed to, or nothing when no alias has that name.
+Result<std::optional<AliasEntry>> remove_alias(const std::filesystem::path& state_dir,
+                                               const std::string& alias);
+
 } // namespace orcli
 
 #endif // ORCLI_MODELS_HPP

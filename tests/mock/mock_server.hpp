@@ -36,6 +36,7 @@ enum class Scenario {
     drip,            // keepalive comments for the hold time, then as success
     gated,           // "Hello", keepalives until release_gate(), then as success
     large,           // large_answer_bytes of "x" in many chunks, then stop, usage, [DONE]
+    provider_first,  // as success, with the provider named before any answer text
 };
 
 inline constexpr std::size_t large_answer_bytes = 16384;

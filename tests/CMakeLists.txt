@@ -13,6 +13,7 @@ add_executable(unit_tests
     unit/test_http.cpp
     unit/test_help.cpp
     unit/test_models.cpp
+    unit/test_progress.cpp
     unit/test_request.cpp
     unit/test_secrets.cpp
     unit/test_session.cpp

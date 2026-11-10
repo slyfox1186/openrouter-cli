@@ -6,7 +6,8 @@ description: "Second opinion, critique or peer review from another AI model host
 # openrouter-cli
 
 `openrouter-cli` sends a question, plus any files you attach, to one OpenRouter model and prints
-its answer. The default `review` role makes the model act as a peer reviewer of a plan or code.
+its answer. By default the question is sent as written (`plain`). For a critique or peer review,
+pass `--role review`, which makes the model act as a reviewer of a plan or code.
 
 ## Billing
 
@@ -19,7 +20,7 @@ Every question is a billed call. Before one:
 3. Wait for approval, unless the user already approved that exact call in this turn.
 
 After the call, report the final `cost` line from stderr to the user. These commands are free
-and need no approval: `find`, `show`, `save`, `list`, `status`,
+and need no approval: `find`, `show`, `save`, `remove`, `list`, `status`,
 `account balance`, `account keys`, `account credits`, `account activity`, `spend`,
 `spend --resolve`.
 
@@ -38,8 +39,9 @@ the user what it says; when it shows no stored key or a rejected key, ask them t
   id, or plain words (`-m "gemini 4 argon"`). Exact IDs take precedence over aliases; a plain
   name that matches exactly one model is used without saving an alias.
 - `openrouter-cli save ALIAS MODEL_ID` saves an alias by hand. A model keeps one alias: saving
-  another name for the same id removes the old one. The four model commands also work with
-  `models` in front (`openrouter-cli models save ...`).
+  another name for the same id removes the old one.
+- `openrouter-cli remove ALIAS` deletes a saved alias.
+- These model commands also work with `models` in front (`openrouter-cli models save ...`).
 - Exit `4` means the name is unknown or matches several models; the candidates are printed. Pick
   the exact id the user meant, or ask them.
 - Pin a provider only when the user asks for one. `-p VALUE` (repeatable) is passed unchanged to
@@ -56,7 +58,7 @@ the user what it says; when it shows no stored key or a rejected key, ask them t
 Options come first and the query comes last:
 
 ```bash
-openrouter-cli -m google/gemini-4-argon -f src/http.cpp -f src/http.hpp \
+openrouter-cli -m google/gemini-4-argon --role review -f src/http.cpp -f src/http.hpp \
   "Goal: retry free GET requests safely. Constraints: ... Review the retry logic."
 ```
 
@@ -65,13 +67,13 @@ openrouter-cli -m google/gemini-4-argon -f src/http.cpp -f src/http.hpp \
   command-line argument is limited to about 128 KiB.
 
   ```bash
-  openrouter-cli -m google/gemini-4-argon -f plan.md - <<'EOF'
+  openrouter-cli -m google/gemini-4-argon --role review -f plan.md - <<'EOF'
   Goal, constraints, what changed, what you want checked...
   EOF
   ```
 
 - Put `--` before a query that starts with `-` or equals a subcommand word (`find`, `show`,
-  `save`, `list`, `models`, `auth`, `status`, `account`, `spend`, `login`, `logout`).
+  `save`, `remove`, `list`, `models`, `auth`, `status`, `account`, `spend`, `login`, `logout`).
 - The reviewer cannot read files, run commands or see this conversation. Send everything it
   needs: the user's goal, constraints, acceptance criteria, the plan or code, relevant excerpts of
   docs, and checks already run with their results.
@@ -81,11 +83,12 @@ openrouter-cli -m google/gemini-4-argon -f src/http.cpp -f src/http.hpp \
 
 ## Roles and options
 
-- `--role review` (default) returns `Assumptions`, a `Verdict` (`APPROVE`,
-  `APPROVE WITH CHANGES` or `RETHINK`), severity-ordered findings with location, evidence and
-  exact fix, optional enhancements, and what was not verified.
-- `--role plain` sends no review instructions; use it for a plain question.
-- `-s TEXT` or `-s @FILE` adds system text.
+- `--role plain` (default) sends no review instructions: the model answers the question as
+  written.
+- `--role review` returns `Assumptions`, a `Verdict` (`APPROVE`, `APPROVE WITH CHANGES` or
+  `RETHINK`), severity-ordered findings with location, evidence and exact fix, optional
+  enhancements, and what was not verified. Pass it whenever the user wants a review or critique.
+- `-s TEXT` or `-s @FILE` (long form `--system-prompt`) adds system prompt text.
 - `-e EFFORT` sets reasoning effort (`max`, `xhigh`, `high`, `medium`, `low`, `minimal`, `none`);
   the default comes from the user's `config.env` (or legacy `.env`). Models that cannot select effort ignore it.
 - `--max-output-tokens N` sets the output budget, reasoning included.
@@ -97,7 +100,7 @@ text from the first call. For the next round, reuse the same name without `-m`, 
 `--role`, for example to rebut a finding or to ask the model to verify your fixes:
 
 ```bash
-openrouter-cli -m google/gemini-4-argon --session http-retry -f src/http.cpp "Review ..."
+openrouter-cli -m google/gemini-4-argon --role review --session http-retry -f src/http.cpp "Review ..."
 openrouter-cli --session http-retry -f src/http.cpp "I fixed findings 1 and 3; verify them."
 ```
 
@@ -106,8 +109,11 @@ added to a session.
 
 ## Long calls
 
-Replies often take 3 to 25 minutes. stderr prints a heartbeat every 30 seconds; silence on stdout
-does not mean the call is stuck.
+Replies often take 3 to 25 minutes. Until the answer starts, stderr prints a progress line every
+10 seconds for the first minute and every 30 seconds after; `no answer text yet` is normal while
+a model reasons, because reasoning text is excluded. While answer text is arriving the lines
+stop. Silence on stdout does not mean the call is stuck. The `asking` line shows the role in use
+(`role from session` for a resumed session).
 
 - Claude Code: run the command with `run_in_background: true` and an explicit long `timeout`.
   Unattended runs cap background commands at 30 minutes by default (10 for text `-p` runs) and
@@ -115,7 +121,9 @@ does not mean the call is stuck.
 - Codex: run it as a long-running command and keep polling until it exits.
 
 stdout is the answer only. The answer is also saved to the file named at the end of the `cost`
-line, so read that file if stdout was lost.
+line, so read that file if stdout was lost. When stdout and stderr are captured together (a
+terminal, or `2>&1`), stderr adds a blank line above and below the answer to set it apart from
+the `openrouter-cli:` lines.
 
 ## Exit codes
 

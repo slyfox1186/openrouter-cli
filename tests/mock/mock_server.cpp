@@ -105,6 +105,12 @@ constexpr std::string_view hello_chunk =
     R"("delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]})"
     "\n\n";
 
+constexpr std::string_view routed_chunk =
+    R"(data: {"id":"gen-test-1","model":"test/alpha-1","choices":[],)"
+    R"("openrouter_metadata":{"endpoints":{"available":[)"
+    R"({"provider":"MockProvider","selected":true}]}}})"
+    "\n\n";
+
 constexpr std::string_view world_chunk =
     R"(data: {"id":"gen-test-1","model":"test/alpha-1","choices":[{"index":0,)"
     R"("delta":{"content":" world"},"finish_reason":null}]})"
@@ -193,6 +199,9 @@ std::vector<std::string> events_for(Scenario scenario) {
     case Scenario::success:
     case Scenario::drip:
         return owned({processing, hello_chunk, world_chunk, stop_chunk, usage_chunk, done_event});
+    case Scenario::provider_first:
+        return owned({processing, routed_chunk, hello_chunk, world_chunk, stop_chunk, usage_chunk,
+                      done_event});
     case Scenario::gated:
         return owned({world_chunk, stop_chunk, usage_chunk, done_event});
     case Scenario::success_no_cost:

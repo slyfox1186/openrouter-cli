@@ -869,8 +869,10 @@ Result<std::map<std::string, AliasEntry>> load_aliases(const std::filesystem::pa
     return std::move(*aliases);
 }
 
-Result<std::vector<std::string>> save_alias(const std::filesystem::path& state_dir,
-                                            const std::string& alias, const std::string& model_id) {
+namespace {
+
+// Every change to models.json is a read, an edit and an atomic write under this lock.
+Result<FileLock> lock_aliases(const std::filesystem::path& state_dir) {
     if (const auto made = ensure_private_dir(state_dir); !made) {
         return std::unexpected(made.error());
     }
@@ -878,7 +880,14 @@ Result<std::vector<std::string>> save_alias(const std::filesystem::path& state_d
     if (const auto made = ensure_private_dir(locks); !made) {
         return std::unexpected(made.error());
     }
-    const auto lock = FileLock::acquire(locks / aliases_lock_name, true);
+    return FileLock::acquire(locks / aliases_lock_name, true);
+}
+
+} // namespace
+
+Result<std::vector<std::string>> save_alias(const std::filesystem::path& state_dir,
+                                            const std::string& alias, const std::string& model_id) {
+    const auto lock = lock_aliases(state_dir);
     if (!lock) {
         return std::unexpected(lock.error());
     }
@@ -901,6 +910,29 @@ Result<std::vector<std::string>> save_alias(const std::filesystem::path& state_d
         return std::unexpected(written.error());
     }
     return replaced;
+}
+
+Result<std::optional<AliasEntry>> remove_alias(const std::filesystem::path& state_dir,
+                                               const std::string& alias) {
+    const auto lock = lock_aliases(state_dir);
+    if (!lock) {
+        return std::unexpected(lock.error());
+    }
+    auto aliases = load_aliases(state_dir);
+    if (!aliases) {
+        return std::unexpected(aliases.error());
+    }
+    const auto found = aliases->find(alias);
+    if (found == aliases->end()) {
+        return std::optional<AliasEntry>{};
+    }
+    std::optional<AliasEntry> removed = std::move(found->second);
+    aliases->erase(found);
+    const auto written = atomic_write(state_dir / aliases_file_name, encode_aliases(*aliases));
+    if (!written) {
+        return std::unexpected(written.error());
+    }
+    return removed;
 }
 
 } // namespace orcli

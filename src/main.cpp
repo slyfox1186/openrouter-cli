@@ -9,10 +9,12 @@
 #include "help.hpp"
 #include "http.hpp"
 #include "models.hpp"
+#include "progress.hpp"
 #include "request.hpp"
 #include "secrets.hpp"
 #include "session.hpp"
 #include "sse.hpp"
+#include "terminal.hpp"
 
 #include <CLI/CLI.hpp>
 #include <nlohmann/json.hpp>
@@ -51,7 +53,6 @@ namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
 constexpr std::string_view version_text = "openrouter-cli 0.1.0";
-constexpr std::chrono::seconds heartbeat_interval{30};
 constexpr std::chrono::seconds generation_lookup_window{30};
 constexpr std::size_t max_display_chars = 400;
 constexpr int internal_error_exit = 1;
@@ -71,7 +72,7 @@ int code_of(Exit exit) {
 struct AskArgs {
     std::string model;
     std::vector<std::string> files;
-    std::string role = "review";
+    std::string role = "plain";
     bool role_given = false;
     std::string system;
     std::string effort;
@@ -213,6 +214,28 @@ int cmd_models_save(const Config& config, const Http& http, const AliasTarget& t
                             display_metadata(old_alias));
     }
     write_stdout(text);
+    return code_of(Exit::ok);
+}
+
+int cmd_models_remove(const Config& config, const std::string& alias) {
+    const std::string name = normalize_alias(alias);
+    if (name.empty()) {
+        return report(Error{.code = Exit::usage, .message = "the alias has no letters or digits"});
+    }
+    const auto removed = remove_alias(config.state_dir, name);
+    if (!removed) {
+        return report(removed.error());
+    }
+    const std::optional<AliasEntry>& entry = *removed;
+    if (!entry.has_value()) {
+        return report(Error{
+            .code = Exit::model,
+            .message =
+                std::format("no saved alias is named \"{}\"; see `openrouter-cli list`", name),
+        });
+    }
+    write_stdout(std::format("removed alias {} (was {})\n", display_metadata(name),
+                             display_metadata(entry->model_id)));
     return code_of(Exit::ok);
 }
 
@@ -383,7 +406,7 @@ struct Prepared {
 };
 
 Result<std::string> system_text(const AskArgs& args, const Config& config) {
-    const auto role = args.role == "plain" ? Role::plain : Role::review;
+    const auto role = args.role == "review" ? Role::review : Role::plain;
     std::string text = system_prompt(role);
     if (args.system.empty()) {
         return text;
@@ -740,13 +763,78 @@ bool stream_ended(const StreamRun& run) {
            run.transfer.transport_error.empty() && !run.parse_error.has_value();
 }
 
+// SGR faint: progress recedes on a color terminal so the answer stands out from it.
+constexpr std::string_view sgr_progress = "2";
+
+// The stderr side of one call while its answer streams to stdout. The methods are called from
+// transfer callbacks, so none of them throws.
+class StatusLines {
+public:
+    StatusLines(bool shared_destination, bool color) noexcept
+        : spacing_(shared_destination), color_(color) {}
+
+    // Call before any stderr line that is not written through progress().
+    void separate() noexcept { write_stderr(spacing_.before_status()); }
+
+    // One "openrouter-cli: <line>" progress line; false when it could not be written.
+    bool progress(std::string_view line) noexcept {
+        separate();
+        try {
+            return write_stderr(paint(sgr_progress,
+                                      display_metadata(std::format("openrouter-cli: {}", line)),
+                                      color_) +
+                                "\n");
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void announce(const std::optional<std::string>& line) noexcept {
+        if (line.has_value()) {
+            progress(*line);
+        }
+    }
+
+    // Call before non-empty answer text goes to stdout.
+    void before_answer(std::string_view text) noexcept {
+        write_stderr(spacing_.before_answer(text));
+    }
+
+    // Call once the answer's last line has been ended on stdout; what follows is status only.
+    void answer_finished() noexcept {
+        spacing_.line_completed();
+        separate();
+    }
+
+private:
+    AnswerSpacing spacing_;
+    bool color_ = false;
+};
+
+// Notices that belong before a chunk's text reaches the terminal: the provider, when the
+// stream names it ahead of the answer, and the start of the answer.
+void announce_chunk(StatusLines& status, StreamProgress& progress, const StreamOutcome& outcome,
+                    std::string_view text) {
+    if (outcome.provider.has_value()) {
+        status.announce(progress.on_provider(*outcome.provider));
+    }
+    if (!text.empty()) {
+        status.announce(progress.on_answer_text(Clock::now()));
+        status.before_answer(text);
+    }
+}
+
 StreamRun run_stream(const Http& http, const Prepared& prepared, AnswerSink& sink,
-                     const CostLog& cost_log, const std::string& call_id) {
+                     const CostLog& cost_log, const std::string& call_id, StatusLines& status) {
     StreamRun run;
     SseParser parser;
     ChatStream chat;
-    std::size_t received = 0;
     bool generation_logged = false;
+    const auto started = Clock::now();
+    // An effort of "none" asks the model not to reason, so there is no hidden text to mention.
+    StreamProgress progress(started,
+                            prepared.model.has_reasoning &&
+                                prepared.request.effort_sent.value_or(std::string()) != "none");
 
     const auto log_generation = [&](std::string_view generation_id) {
         if (generation_logged || !valid_generation_id(generation_id)) {
@@ -759,6 +847,7 @@ StreamRun run_stream(const Http& http, const Prepared& prepared, AnswerSink& sin
             logged) {
             run.generation_saved = true;
         } else {
+            status.separate();
             diagnostic("openrouter-cli: cost log write failed: {}", logged.error().message);
         }
     };
@@ -766,7 +855,7 @@ StreamRun run_stream(const Http& http, const Prepared& prepared, AnswerSink& sin
     StreamHandlers handlers;
     handlers.on_generation_id = log_generation;
     handlers.on_body_bytes = [&](std::string_view bytes) {
-        received += bytes.size();
+        status.announce(progress.on_bytes(bytes.size(), Clock::now()));
         if (run.parse_error.has_value()) {
             return;
         }
@@ -781,6 +870,7 @@ StreamRun run_stream(const Http& http, const Prepared& prepared, AnswerSink& sin
                 run.parse_error = text.error();
                 return;
             }
+            announce_chunk(status, progress, chat.outcome(), *text);
             sink.write(*text);
             if (chat.outcome().generation_id.has_value()) {
                 log_generation(*chat.outcome().generation_id);
@@ -788,18 +878,8 @@ StreamRun run_stream(const Http& http, const Prepared& prepared, AnswerSink& sin
         }
     };
 
-    const auto started = Clock::now();
-    auto next = started + heartbeat_interval;
     handlers.should_continue = [&] { return !run.parse_error.has_value(); };
-    handlers.on_progress = [&] {
-        if (Clock::now() >= next) {
-            const auto elapsed =
-                std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - started);
-            diagnostic("openrouter-cli: waiting, {}s elapsed, {} bytes received", elapsed.count(),
-                       received);
-            next = Clock::now() + heartbeat_interval;
-        }
-    };
+    handlers.on_progress = [&] { status.announce(progress.on_tick(Clock::now())); };
 
     // Replacement keeps a file with invalid UTF-8 from aborting the call; dump() throws otherwise.
     const std::string body =
@@ -1053,6 +1133,14 @@ int final_exit(const Verdict& verdict, const Aftermath& after) {
     return code_of(Exit::ok);
 }
 
+// A resumed session keeps the system text it was created with, so its role is not known here.
+std::string_view role_label(const AskArgs& args, const Prepared& prepared) {
+    if (prepared.session.has_value() && prepared.session->exists()) {
+        return "from session";
+    }
+    return args.role == "review" ? "review" : "plain";
+}
+
 int cmd_ask(const AskArgs& args, const Config& config, const Http& http) {
     auto prepared = prepare(args, config, http);
     if (!prepared) {
@@ -1087,16 +1175,18 @@ int cmd_ask(const AskArgs& args, const Config& config, const Http& http) {
                        logged.error().message,
         });
     }
-    diagnostic("openrouter-cli: asking {} (effort {}, up to {} output tokens, {}{})",
-               display_metadata(prepared->model.id),
-               display_metadata(prepared->request.effort_sent.value_or("default")),
-               prepared->request.max_tokens, pending.privacy,
-               args.providers.empty()
-                   ? std::string()
-                   : ", providers " + display_metadata(join(args.providers, ",")));
+    StatusLines status(same_destination(STDOUT_FILENO, STDERR_FILENO), stream_color(STDERR_FILENO));
+    status.progress(std::format(
+        "asking {} (role {}, effort {}, up to {} output tokens, {}{})",
+        display_metadata(prepared->model.id), role_label(args, *prepared),
+        display_metadata(prepared->request.effort_sent.value_or("default")),
+        prepared->request.max_tokens, pending.privacy,
+        args.providers.empty() ? std::string()
+                               : ", providers " + display_metadata(join(args.providers, ","))));
 
-    const StreamRun run = run_stream(http, *prepared, *sink, cost_log, call_id);
+    const StreamRun run = run_stream(http, *prepared, *sink, cost_log, call_id, status);
     sink->finish(answer_path);
+    status.answer_finished();
     const Verdict verdict = judge(run, prepared->request.max_tokens);
     Aftermath after = record_outcome(http, cost_log, call_id, run, verdict);
 
@@ -1127,6 +1217,7 @@ struct ModelCommands {
     CLI::App* find = nullptr;
     CLI::App* show = nullptr;
     CLI::App* save = nullptr;
+    CLI::App* remove = nullptr;
     CLI::App* list = nullptr;
 
     [[nodiscard]] static bool used(const CLI::App* command) {
@@ -1142,6 +1233,7 @@ struct Cli {
     std::string show_name;
     std::string save_alias_name;
     std::string save_model_id;
+    std::string remove_alias_name;
     std::string since = "all";
     bool resolve = false;
     bool login_replace = false;
@@ -1169,9 +1261,11 @@ void add_ask_options(CLI::App& app, AskArgs& ask) {
     // default, which would swallow the query (CLI11 book, "Options": allow_extra_args).
     app.add_option("-f,--file", ask.files, "File to include, line-numbered (repeatable)")
         ->allow_extra_args(false);
-    app.add_option("--role", ask.role, "System prompt: review (default) or plain")
+    app.add_option("--role", ask.role,
+                   "plain (default) asks as written; review adds reviewer instructions")
         ->check(CLI::IsMember({"review", "plain"}));
-    app.add_option("-s,--system", ask.system, "Extra system text, or @FILE")->option_text("TEXT");
+    app.add_option("-s,--system-prompt", ask.system, "Extra system prompt text, or @FILE")
+        ->option_text("TEXT");
     app.add_option("-e,--effort", ask.effort,
                    "Reasoning effort: max, xhigh, high, medium, low, minimal, none")
         ->option_text("LEVEL");
@@ -1201,6 +1295,8 @@ ModelCommands add_model_leaves(CLI::App& parent, Cli& cli) {
     commands.save = parent.add_subcommand("save", "Save an alias for a model id");
     commands.save->add_option("alias", cli.save_alias_name, "Alias to save")->required();
     commands.save->add_option("model_id", cli.save_model_id, "Exact model id")->required();
+    commands.remove = parent.add_subcommand("remove", "Delete a saved alias");
+    commands.remove->add_option("alias", cli.remove_alias_name, "Alias to delete")->required();
     commands.list = parent.add_subcommand("list", "List saved aliases");
     return commands;
 }
@@ -1307,6 +1403,10 @@ std::optional<int> dispatch_models(const Cli& cli, const Config& config) {
         return cmd_models_save(config, public_http,
                                {.alias = cli.save_alias_name, .model_id = cli.save_model_id});
     }
+    if (ModelCommands::used(cli.short_models.remove) ||
+        ModelCommands::used(cli.nested_models.remove)) {
+        return cmd_models_remove(config, cli.remove_alias_name);
+    }
     if (ModelCommands::used(cli.short_models.list) || ModelCommands::used(cli.nested_models.list)) {
         return cmd_models_list(config);
     }
@@ -1369,7 +1469,9 @@ std::optional<Error> check_grammar(const CLI::App& app, const AskArgs& ask) {
     return std::nullopt;
 }
 
-// Examples use a placeholder alias and model id so the binary names no vendor. A session
+// Examples use a placeholder alias and model id so the binary names no vendor. A command
+// longer than 56 characters is split with a backslash, because example lines are never
+// wrapped and a 60-column page must still fit them. A session
 // follow-up drops -m because a session refuses any model but the one it was created with.
 HelpContent root_help() {
     return HelpContent{
@@ -1381,19 +1483,24 @@ HelpContent root_help() {
                     .commands = {"openrouter-cli save reviewer AUTHOR/MODEL"},
                 },
                 HelpExample{
-                    .caption = "Review a plan file",
-                    .commands = {R"(openrouter-cli -m reviewer -f plan.md "Review this plan")"},
+                    .caption = "Get a structured review of a plan file",
+                    .commands =
+                        {
+                            R"(openrouter-cli -m reviewer --role review \)",
+                            R"(  -f plan.md "Review this plan")",
+                        },
                 },
                 HelpExample{
                     .caption = "Send a diff as the question, read from stdin",
-                    .commands = {"git diff | openrouter-cli -m reviewer -"},
+                    .commands = {"git diff | openrouter-cli -m reviewer --role review -"},
                 },
                 HelpExample{
                     .caption =
                         "Keep a named conversation, then follow up (the session keeps its model)",
                     .commands =
                         {
-                            R"(openrouter-cli --session plan -m reviewer "Review it")",
+                            R"(openrouter-cli --session plan -m reviewer \)",
+                            R"(  --role review "Review it")",
                             R"(openrouter-cli --session plan "Is step 3 sound now?")",
                         },
                 },
@@ -1408,7 +1515,8 @@ HelpContent root_help() {
 }
 
 int run(std::span<char* const> argv) {
-    CLI::App app{"Ask any OpenRouter model to review a plan or code.", "openrouter-cli"};
+    CLI::App app{"Ask any OpenRouter model a question, or have it review a plan or code.",
+                 "openrouter-cli"};
     // Subcommands copy the formatter, the help flag and the option defaults when they are
     // created, so all three are set before any subcommand is added.
     app.formatter(std::make_shared<HelpFormatter>(root_help()));

@@ -502,6 +502,27 @@ TEST_CASE("save_alias clears every extra alias an older registry holds for the m
     CHECK(aliases.contains("sol"));
 }
 
+TEST_CASE("remove_alias deletes one alias and reports what it pointed to") {
+    const TempDir temp("remove-alias");
+    const auto nothing = orcli::remove_alias(temp.state(), "argon");
+    REQUIRE(nothing.has_value());
+    CHECK_FALSE(nothing->has_value());
+
+    REQUIRE(orcli::save_alias(temp.state(), "argon", "google/gemini-4-argon").has_value());
+    REQUIRE(orcli::save_alias(temp.state(), "sol", "openai/gpt-6-sol").has_value());
+    const auto removed = orcli::remove_alias(temp.state(), "argon");
+    REQUIRE(removed.has_value());
+    REQUIRE(removed->has_value());
+    CHECK(removed->value().model_id == "google/gemini-4-argon");
+
+    const std::map<std::string, AliasEntry> aliases = orcli::load_aliases(temp.state()).value();
+    CHECK(aliases.size() == 1);
+    CHECK(aliases.contains("sol"));
+    const auto again = orcli::remove_alias(temp.state(), "argon");
+    REQUIRE(again.has_value());
+    CHECK_FALSE(again->has_value());
+}
+
 TEST_CASE("load_aliases reports a corrupt registry as a configuration error") {
     const TempDir temp("corrupt");
     REQUIRE(orcli::ensure_private_dir(temp.state()).has_value());
