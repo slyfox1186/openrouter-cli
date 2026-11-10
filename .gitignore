@@ -59,10 +59,3 @@ vgcore.*
 *.swp
 *~
 .DS_Store
-
-# Machine-local agent notes and settings, kept out of the public repo.
-/.claude/
-/.codex/
-/CLAUDE.md
-/AGENTS.md
-/JEFF_START_HERE.md

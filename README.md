@@ -545,9 +545,7 @@ At run time, the commands that use a key also need `systemd-creds` on your `PATH
 
 Development used Clang 23.1.5 with GCC 15's libstdc++ on Ubuntu Linux and systemd 259. These are known working versions, not minimum requirements.
 
-**Current status:** clean-source acceptance has not yet passed.
-
-**For contributors.** `scripts/build.sh --check --no-install` runs every check without installing. `bash scripts/verify-clean.sh 2` (the number is the job count) is a full clean-room test. It copies the source into a temporary folder whose path contains spaces and an apostrophe, uses a separate home folder, runs the normal and `--check` builds, and installs and uninstalls only inside that scratch area. Logs are kept under `build/logs/clean-*`. The scratch folder is deleted on success and kept on failure so you can inspect it. It is a full build and test run, so expect it to take a while.
+**For contributors.** `scripts/build.sh --check --no-install` runs every check without installing.
 
 </details>
 
