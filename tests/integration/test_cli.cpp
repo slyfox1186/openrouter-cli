@@ -401,7 +401,7 @@ public:
     }
 
     Child spawn(const Launch& launch) {
-        REQUIRE_FALSE(launch.closed_stdout && launch.stdout_descriptor.has_value());
+        REQUIRE_FALSE((launch.closed_stdout && launch.stdout_descriptor.has_value()));
         ++runs_;
         const fs::path in_path = root_ / std::format("run-{}.in", runs_);
         const fs::path out_path = root_ / std::format("run-{}.out", runs_);
