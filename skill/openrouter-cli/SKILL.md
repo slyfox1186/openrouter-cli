@@ -12,14 +12,14 @@ its answer. The default `review` role makes the model act as a peer reviewer of 
 
 Every question is a billed call. Before one:
 
-1. Resolve the model and read its prices with `openrouter-cli models show <model>` (free).
+1. Resolve the model and read its prices with `openrouter-cli show <model>` (free).
 2. Tell the user the model id, any provider you will pin with `-p`, how many calls you will
    make, and the published input, cached input and output prices per million tokens from that
    output (the endpoint row's prices when you pin a provider).
 3. Wait for approval, unless the user already approved that exact call in this turn.
 
 After the call, report the final `cost` line from stderr to the user. These commands are free
-and need no approval: `models find`, `models show`, `models save`, `models list`, `status`,
+and need no approval: `find`, `show`, `save`, `list`, `status`,
 `account balance`, `account keys`, `account credits`, `account activity`, `spend`,
 `spend --resolve`.
 
@@ -32,17 +32,19 @@ the user what it says; when it shows no stored key or a rejected key, ask them t
 
 ## Choosing the model and provider
 
-- `openrouter-cli models list` shows saved aliases. Check it first.
-- `openrouter-cli models find "gemini 4 argon"` lists matching ids. Quote multi-word names.
+- `openrouter-cli list` shows saved aliases. Check it first.
+- `openrouter-cli find "gemini 4 argon"` lists matching ids. Quote multi-word names.
 - `-m` accepts a saved alias, an exact id (`google/gemini-4-argon`), a `~author/family-latest`
   id, or plain words (`-m "gemini 4 argon"`). Exact IDs take precedence over aliases; a plain
   name that matches exactly one model is used without saving an alias.
-- `openrouter-cli models save ALIAS MODEL_ID` saves an alias by hand.
+- `openrouter-cli save ALIAS MODEL_ID` saves an alias by hand. A model keeps one alias: saving
+  another name for the same id removes the old one. The four model commands also work with
+  `models` in front (`openrouter-cli models save ...`).
 - Exit `4` means the name is unknown or matches several models; the candidates are printed. Pick
   the exact id the user meant, or ask them.
 - Pin a provider only when the user asks for one. `-p VALUE` (repeatable) is passed unchanged to
   OpenRouter as `provider.only`; copy each value from the `TAG` column of the endpoint table in
-  `models show`, or use a tag's provider prefix (`google-vertex`) for that provider's standard
+  `show`, or use a tag's provider prefix (`google-vertex`) for that provider's standard
   endpoints. Flex, ultrafast and closed-weight tier endpoints are opt-in: a base slug never
   selects them, so pass the full tag (for example `google-vertex/global/priority`). The `fast`
   and `priority` suffixes are interchangeable. OpenRouter decides what matches.
@@ -68,8 +70,8 @@ openrouter-cli -m google/gemini-4-argon -f src/http.cpp -f src/http.hpp \
   EOF
   ```
 
-- Put `--` before a query that starts with `-` or equals a subcommand word (`models`, `auth`,
-  `status`, `account`, `spend`).
+- Put `--` before a query that starts with `-` or equals a subcommand word (`find`, `show`,
+  `save`, `list`, `models`, `auth`, `status`, `account`, `spend`, `login`, `logout`).
 - The reviewer cannot read files, run commands or see this conversation. Send everything it
   needs: the user's goal, constraints, acceptance criteria, the plan or code, relevant excerpts of
   docs, and checks already run with their results.
@@ -124,7 +126,7 @@ line, so read that file if stdout was lost.
 | `2` | Usage error | Fix the command; `openrouter-cli --help`. |
 | `3` | Refused before sending: secret found, input too large, session busy, credential file, cost log not writable | Nothing was sent or billed. Remove the flagged content, shrink the input, wait until the other call on that session ends, or report the cost log problem. |
 | `4` | Unknown or ambiguous model | Choose from the printed candidates or ask the user. |
-| `5` | API or network failure, rejected key, or no endpoint matching the model, providers and privacy | Report the message. For no endpoint, check tags with `models show`. A retry is another billed call; ask first. |
+| `5` | API or network failure, rejected key, or no endpoint matching the model, providers and privacy | Report the message. For no endpoint, check tags with `show`. A retry is another billed call; ask first. |
 | `6` | Incomplete answer (budget ran out, stream ended early, content filter) | The partial answer is in the answer file and the session is unchanged. Retry with a lower `--effort` or a higher `--max-output-tokens` only after telling the user it costs another call. |
 | `7` | Configuration problem: no stored key, key cannot be decrypted, plaintext key in settings, invalid settings | Follow Keys and sign-in above. Never read or print `config.env` or `.env`. |
 | `8` | Interrupted, during the answer or during the cost lookup after it | The partial answer was kept; report the cost line. |

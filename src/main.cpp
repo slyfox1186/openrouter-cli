@@ -145,7 +145,7 @@ Result<ModelInfo> resolve_or_report(const Config& config, const Catalog& catalog
     }
     if (resolution.kind == Resolution::Kind::none || !resolution.model.has_value()) {
         return fail(Exit::model, std::format("no model matches \"{}\"; try `openrouter-cli "
-                                             "models find <words>`",
+                                             "find <words>`",
                                              name));
     }
     return std::move(*resolution.model);
@@ -194,7 +194,7 @@ int cmd_models_save(const Config& config, const Http& http, const AliasTarget& t
         return report(Error{
             .code = Exit::model,
             .message = std::format("\"{}\" is not a model id in the catalog; "
-                                   "use `openrouter-cli models find`",
+                                   "use `openrouter-cli find`",
                                    target.model_id),
         });
     }
@@ -202,11 +202,17 @@ int cmd_models_save(const Config& config, const Http& http, const AliasTarget& t
     if (name.empty()) {
         return report(Error{.code = Exit::usage, .message = "the alias has no letters or digits"});
     }
-    if (auto saved = save_alias(config.state_dir, name, target.model_id); !saved) {
-        return report(saved.error());
+    const auto replaced = save_alias(config.state_dir, name, target.model_id);
+    if (!replaced) {
+        return report(replaced.error());
     }
-    write_stdout(std::format("saved alias {} -> {}\n", display_metadata(name),
-                             display_metadata(target.model_id)));
+    std::string text = std::format("saved alias {} -> {}\n", display_metadata(name),
+                                   display_metadata(target.model_id));
+    for (const std::string& old_alias : *replaced) {
+        text += std::format("removed alias {} (a model keeps one alias)\n",
+                            display_metadata(old_alias));
+    }
+    write_stdout(text);
     return code_of(Exit::ok);
 }
 
@@ -890,7 +896,7 @@ Verdict judge(const StreamRun& run, long long max_tokens) {
             text += "; the stored API key was rejected: run `openrouter-cli login --replace`";
         } else if (run.transfer.status == http_not_found ||
                    run.transfer.status == http_unavailable) {
-            text += "; check the -p tags with `openrouter-cli models show MODEL`, and under "
+            text += "; check the -p tags with `openrouter-cli show MODEL`, and under "
                     "--privacy zdr try --privacy no-training";
         }
         return {.outcome = "error", .exit = Exit::api, .message = text};
@@ -1116,6 +1122,18 @@ int cmd_ask(const AskArgs& args, const Config& config, const Http& http) {
 
 // ----- command line -----------------------------------------------------------------------
 
+// The model commands exist under two parents; both registrations fill the same Cli fields.
+struct ModelCommands {
+    CLI::App* find = nullptr;
+    CLI::App* show = nullptr;
+    CLI::App* save = nullptr;
+    CLI::App* list = nullptr;
+
+    [[nodiscard]] static bool used(const CLI::App* command) {
+        return command != nullptr && command->parsed();
+    }
+};
+
 // Every parsed option and subcommand of the command line.
 struct Cli {
     AskArgs ask;
@@ -1132,10 +1150,8 @@ struct Cli {
     bool logout_management = false;
     int activity_days = default_activity_days;
 
-    CLI::App* find = nullptr;
-    CLI::App* show = nullptr;
-    CLI::App* save = nullptr;
-    CLI::App* list = nullptr;
+    ModelCommands short_models;  // openrouter-cli save ...
+    ModelCommands nested_models; // openrouter-cli models save ..., the earlier spelling
     CLI::App* spend = nullptr;
     CLI::App* login = nullptr;
     CLI::App* set_key = nullptr;
@@ -1164,7 +1180,7 @@ void add_ask_options(CLI::App& app, AskArgs& ask) {
         ->check(CLI::PositiveNumber)
         ->option_text("N");
     app.add_option("-p,--provider", ask.providers,
-                   "Use only this provider (endpoint tag from `models show`; repeatable)")
+                   "Use only this provider (endpoint tag from `show`; repeatable)")
         ->allow_extra_args(false)
         ->option_text("TAG");
     app.add_option("--privacy", ask.privacy, "zdr (default) or no-training")
@@ -1175,19 +1191,30 @@ void add_ask_options(CLI::App& app, AskArgs& ask) {
     app.add_option("query", ask.query, "The question; - reads it from stdin");
 }
 
+ModelCommands add_model_leaves(CLI::App& parent, Cli& cli) {
+    ModelCommands commands;
+    commands.find = parent.add_subcommand("find", "List models matching words");
+    commands.find->add_flag("--refresh", cli.refresh, "Refetch the catalog first");
+    commands.find->add_option("name", cli.find_name, "Words to match")->required();
+    commands.show = parent.add_subcommand("show", "Prices, limits, efforts and provider tags");
+    commands.show->add_option("model", cli.show_name, "Alias, id or name")->required();
+    commands.save = parent.add_subcommand("save", "Save an alias for a model id");
+    commands.save->add_option("alias", cli.save_alias_name, "Alias to save")->required();
+    commands.save->add_option("model_id", cli.save_model_id, "Exact model id")->required();
+    commands.list = parent.add_subcommand("list", "List saved aliases");
+    return commands;
+}
+
 void add_models_commands(CLI::App& app, Cli& cli) {
+    cli.short_models = add_model_leaves(app, cli);
     auto* models = app.add_subcommand("models", "Find, inspect and save model ids");
     models->require_subcommand(1);
     models->fallthrough(false);
-    cli.find = models->add_subcommand("find", "List models matching words");
-    cli.find->add_flag("--refresh", cli.refresh, "Refetch the catalog first");
-    cli.find->add_option("name", cli.find_name, "Words to match")->required();
-    cli.show = models->add_subcommand("show", "Prices, limits, efforts and provider tags");
-    cli.show->add_option("model", cli.show_name, "Alias, id or name")->required();
-    cli.save = models->add_subcommand("save", "Save an alias for a model id");
-    cli.save->add_option("alias", cli.save_alias_name, "Alias to save")->required();
-    cli.save->add_option("model_id", cli.save_model_id, "Exact model id")->required();
-    cli.list = models->add_subcommand("list", "List saved aliases");
+    cli.nested_models = add_model_leaves(*models, cli);
+    // CLI11 copies a parent's group into each child when the child is created, so the group
+    // is emptied only now: `models` leaves the top-level page while `models --help` still
+    // lists its commands.
+    models->group("");
 }
 
 void add_account_commands(CLI::App& app, Cli& cli) {
@@ -1270,17 +1297,17 @@ std::optional<int> dispatch_account(const Cli& cli, const Config& config) {
 
 std::optional<int> dispatch_models(const Cli& cli, const Config& config) {
     const Http public_http(config, HttpKeys{});
-    if (cli.find->parsed()) {
+    if (ModelCommands::used(cli.short_models.find) || ModelCommands::used(cli.nested_models.find)) {
         return cmd_models_find(config, public_http, cli.find_name, cli.refresh);
     }
-    if (cli.show->parsed()) {
+    if (ModelCommands::used(cli.short_models.show) || ModelCommands::used(cli.nested_models.show)) {
         return cmd_models_show(config, public_http, cli.show_name);
     }
-    if (cli.save->parsed()) {
+    if (ModelCommands::used(cli.short_models.save) || ModelCommands::used(cli.nested_models.save)) {
         return cmd_models_save(config, public_http,
                                {.alias = cli.save_alias_name, .model_id = cli.save_model_id});
     }
-    if (cli.list->parsed()) {
+    if (ModelCommands::used(cli.short_models.list) || ModelCommands::used(cli.nested_models.list)) {
         return cmd_models_list(config);
     }
     return std::nullopt;
@@ -1351,7 +1378,7 @@ HelpContent root_help() {
             {
                 HelpExample{
                     .caption = "Save a short alias for a model id",
-                    .commands = {"openrouter-cli models save reviewer AUTHOR/MODEL"},
+                    .commands = {"openrouter-cli save reviewer AUTHOR/MODEL"},
                 },
                 HelpExample{
                     .caption = "Review a plan file",

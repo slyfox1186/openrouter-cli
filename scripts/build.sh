@@ -456,7 +456,7 @@ run_checks() {
             if step "build debug" cmake --build "$DEBUG_DIR" -j "$JOBS"; then debug_built=1; fi
         fi
         if [[ "$debug_built" == 1 ]]; then
-            step "tests (debug, ASan+UBSan)" ctest --test-dir "$DEBUG_DIR" --verbose --no-tests=error
+            step "tests (debug, ASan+UBSan)" ctest --test-dir "$DEBUG_DIR" --output-on-failure --no-tests=error
         else
             skipped "debug tests" "debug build failed"
         fi
@@ -468,7 +468,7 @@ run_checks() {
     fi
     if [[ "$release_built" == 1 ]]; then
         if [[ "$QUICK" == 0 ]]; then
-            step "tests (release)" ctest --test-dir "$RELEASE_DIR" --verbose --no-tests=error
+            step "tests (release)" ctest --test-dir "$RELEASE_DIR" --output-on-failure --no-tests=error
         fi
         step "linkage check" linkage_check
     else

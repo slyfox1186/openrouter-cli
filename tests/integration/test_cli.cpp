@@ -690,7 +690,7 @@ TEST_CASE("an OpenRouter no-endpoints error exits 5 with a hint to inspect the m
     CHECK(result.code == exit_api);
     CHECK(result.err.contains("HTTP 404"));
     CHECK_FALSE(result.err.contains("No endpoints found"));
-    CHECK(result.err.contains("models show"));
+    CHECK(result.err.contains("`openrouter-cli show MODEL`"));
     CHECK(server.post_count() == 1);
 }
 
@@ -1044,6 +1044,46 @@ TEST_CASE("SIGTERM mid-stream keeps the partial answer, and the busy session is 
     CHECK(server.post_count() == 1);
 }
 
+TEST_CASE("find, show, save and list run without the models prefix") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+
+    const RunResult found = sandbox.run({"find", "beta"});
+    CHECK(found.code == exit_ok);
+    CHECK(found.out == sandbox.run({"models", "find", "beta"}).out);
+    CHECK(found.out.contains("test/beta-2"));
+
+    const RunResult shown = sandbox.run({"show", std::string(alpha)});
+    CHECK(shown.code == exit_ok);
+    CHECK(shown.out == sandbox.run({"models", "show", std::string(alpha)}).out);
+    CHECK(shown.out.contains("mockcloud/fp8"));
+
+    CHECK(sandbox.run({"save", "mine", "test/beta-2"}).code == exit_ok);
+    // Required arguments are filled before command names are matched, so an alias may be
+    // spelled like a command.
+    const RunResult first = sandbox.run({"save", "list", std::string(alpha)});
+    CHECK(first.code == exit_ok);
+    CHECK(first.out == "saved alias list -> " + std::string(alpha) + "\n");
+    // A model keeps one alias, so the second name for it replaces the first.
+    const RunResult second = sandbox.run({"models", "save", "show", std::string(alpha)});
+    CHECK(second.code == exit_ok);
+    CHECK(second.out == "saved alias show -> " + std::string(alpha) +
+                            "\nremoved alias list (a model keeps one alias)\n");
+    const RunResult listed = sandbox.run({"list"});
+    CHECK(listed.code == exit_ok);
+    CHECK(listed.out == sandbox.run({"models", "list"}).out);
+    CHECK(listed.out.contains("mine -> test/beta-2"));
+    CHECK(listed.out.contains("show -> " + std::string(alpha)));
+    CHECK_FALSE(listed.out.contains("list -> "));
+
+    CHECK(sandbox.run({"save", "mine"}).code == exit_usage);
+    CHECK(sandbox.run({"save"}).code == exit_usage);
+    CHECK(sandbox.run({"find"}).code == exit_usage);
+    CHECK(sandbox.run({"show"}).code == exit_usage);
+    CHECK(sandbox.run({"list", "show", std::string(alpha)}).code == exit_usage);
+    CHECK(server.post_count() == 0);
+}
+
 TEST_CASE("command line grammar") {
     MockServer server;
     Sandbox sandbox(server.port());
@@ -1058,6 +1098,10 @@ TEST_CASE("command line grammar") {
     CHECK(sandbox.run({"-m", "x", "logout"}).code == exit_usage);
     CHECK(file_exists(sandbox.api_credential()));
     CHECK(sandbox.run({"-m", "x", "spend"}).code == exit_usage);
+    for (const std::string command : {"find", "show", "save", "list"}) {
+        INFO(command);
+        CHECK(sandbox.run({"-m", "x", command}).code == exit_usage);
+    }
     CHECK(sandbox.run({"-p", "mockcloud", "status"}).code == exit_usage);
     CHECK(sandbox.run({}).code == exit_usage);
     CHECK(server.post_count() == 0);
@@ -1066,6 +1110,11 @@ TEST_CASE("command line grammar") {
     CHECK(literal.code == exit_ok);
     CHECK(last_user_text(server.last_post()) == "models");
     CHECK(server.post_count() == 1);
+
+    const RunResult short_word = sandbox.run({"-m", std::string(alpha), "--", "list"});
+    CHECK(short_word.code == exit_ok);
+    CHECK(last_user_text(server.last_post()) == "list");
+    CHECK(server.post_count() == 2);
 }
 
 TEST_CASE("help is shown for -h and --help on every command") {
@@ -1078,6 +1127,10 @@ TEST_CASE("help is shown for -h and --help on every command") {
     };
     const std::vector<Page> pages{
         {.path = {}, .usage = "  openrouter-cli [OPTIONS] QUERY\n  openrouter-cli COMMAND\n"},
+        {.path = {"find"}, .usage = "  openrouter-cli find [OPTIONS] NAME\n"},
+        {.path = {"show"}, .usage = "  openrouter-cli show MODEL\n"},
+        {.path = {"save"}, .usage = "  openrouter-cli save ALIAS MODEL_ID\n"},
+        {.path = {"list"}, .usage = "  openrouter-cli list\n"},
         {.path = {"models"}, .usage = "  openrouter-cli models COMMAND\n"},
         {.path = {"models", "find"}, .usage = "  openrouter-cli models find [OPTIONS] NAME\n"},
         {.path = {"models", "show"}, .usage = "  openrouter-cli models show MODEL\n"},
@@ -1119,6 +1172,19 @@ TEST_CASE("help is shown for -h and --help on every command") {
     CHECK(root.find("HELP") == std::string::npos);
     CHECK(root.find("VERSION") == std::string::npos);
     CHECK(root.find("\nEXAMPLES\n") != std::string::npos);
+    // The short commands are the listed spelling; the models group still documents itself.
+    CHECK(line_starting(root, "  save ALIAS MODEL_ID ").ends_with("Save an alias for a model id"));
+    CHECK(line_starting(root, "  list ").ends_with("List saved aliases"));
+    CHECK(root.find("  find [OPTIONS] NAME ") != std::string::npos);
+    CHECK(root.find("  show MODEL ") != std::string::npos);
+    CHECK(root.find("\n  models") == std::string::npos);
+    CHECK(root.find("models save") == std::string::npos);
+    const std::string models_page = sandbox.run({"models", "--help"}).out;
+    for (const std::string_view row :
+         {"  find [OPTIONS] NAME ", "  show MODEL ", "  save ALIAS MODEL_ID ", "  list "}) {
+        INFO(row);
+        CHECK(models_page.find(row) != std::string::npos);
+    }
     const std::string find_page = sandbox.run({"models", "find", "--help"}).out;
     CHECK(line_starting(find_page, "      --refresh ").ends_with("Refetch the catalog first"));
     CHECK(find_page.find("REFRESH") == std::string::npos);
@@ -1507,7 +1573,11 @@ TEST_CASE("login exchanges the pasted code without an Authorization header") {
     const auto instructions = login.err.find("3. Copy the code");
     const auto prompt = login.err.find("Paste the code here, then press Enter: ");
     const auto progress = login.err.find("Completing sign-in with OpenRouter...");
-    const auto success = login.err.find("logged in;");
+    const auto success =
+        login.err.find("Signed in to OpenRouter. Your new API key is stored encrypted.");
+    const auto name_row = login.err.find("\n  Name  openrouter-cli-on-");
+    const auto file_row = login.err.find("\n  File  " + sandbox.api_credential().string() + "\n");
+    const auto next_step = login.err.find("\nNext: openrouter-cli status\n");
     REQUIRE(instructions != std::string::npos);
     REQUIRE(prompt != std::string::npos);
     REQUIRE(progress != std::string::npos);
@@ -1515,6 +1585,18 @@ TEST_CASE("login exchanges the pasted code without an Authorization header") {
     CHECK(instructions < prompt);
     CHECK(prompt < progress);
     CHECK(progress < success);
+    REQUIRE(name_row != std::string::npos);
+    REQUIRE(file_row != std::string::npos);
+    REQUIRE(next_step != std::string::npos);
+    CHECK(success < name_row);
+    CHECK(name_row < file_row);
+    CHECK(file_row < next_step);
+    CHECK(login.err.starts_with("Sign in to OpenRouter\n\n  1. Open this link"));
+    // Stdout carries the link alone, so a script can capture it.
+    CHECK(login.out.starts_with("https://openrouter.ai/auth?"));
+    CHECK(login.out.ends_with("\n"));
+    CHECK(std::ranges::count(login.out, '\n') == 1);
+    CHECK(login.all().find('\x1b') == std::string::npos);
 
     const std::vector<RecordedRequest> checks = server.requests_to("/key");
     REQUIRE(checks.size() == 1U);
@@ -1522,6 +1604,32 @@ TEST_CASE("login exchanges the pasted code without an Authorization header") {
     REQUIRE(file_exists(sandbox.api_credential()));
     REQUIRE(sandbox.run(ask("question")).code == exit_ok);
     CHECK(server.last_authorization() == bearer(mock::login_key()));
+}
+
+TEST_CASE("login colors its text only when asked and never changes the wording") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    const RunResult plain =
+        sandbox.run_with(Launch{.args = {"login"}, .stdin_text = "mock-code\n"});
+    REQUIRE(plain.code == exit_ok);
+
+    const RunResult forced = sandbox.run_with(Launch{.args = {"login", "--replace"},
+                                                     .stdin_text = "mock-code\n",
+                                                     .extra_env = {"CLICOLOR_FORCE=1"}});
+    REQUIRE(forced.code == exit_ok);
+    CHECK(forced.err.contains("\x1b[1mSign in to OpenRouter\x1b[0m"));
+    CHECK(forced.err.contains("\x1b[1mPaste the code here, then press Enter:\x1b[0m "));
+    CHECK(forced.err.contains("\x1b[1;32mSigned in to OpenRouter.\x1b[0m"));
+    CHECK(forced.out.starts_with("\x1b[1;36mhttps://openrouter.ai/auth?"));
+    CHECK(strip_escapes(forced.err) == plain.err);
+
+    const RunResult refused =
+        sandbox.run_with(Launch{.args = {"login", "--replace"},
+                                .stdin_text = "mock-code\n",
+                                .extra_env = {"NO_COLOR=1", "CLICOLOR_FORCE=1"}});
+    REQUIRE(refused.code == exit_ok);
+    CHECK(refused.all().find('\x1b') == std::string::npos);
+    CHECK(refused.err == plain.err);
 }
 
 TEST_CASE("login shows its prompt before the user supplies a code") {
@@ -1543,7 +1651,7 @@ TEST_CASE("login shows its prompt before the user supplies a code") {
     constexpr std::string_view code = "mock-code\n";
     REQUIRE(::write(input.get(), code.data(), code.size()) == static_cast<ssize_t>(code.size()));
     CHECK(child.wait() == exit_ok);
-    CHECK(child.err().contains("logged in;"));
+    CHECK(child.err().contains("Signed in to OpenRouter."));
 }
 
 TEST_CASE("login reports blank input and EOF beneath the prompt without sending") {
@@ -1580,6 +1688,8 @@ TEST_CASE("a plaintext key in .env stops every command except login, logout and 
                                                    {"status"},
                                                    {"models", "list"},
                                                    {"models", "find", "beta"},
+                                                   {"list"},
+                                                   {"find", "beta"},
                                                    {"spend"},
                                                    {"account", "balance"}}) {
             INFO("command ", args.front());
@@ -2275,6 +2385,21 @@ TEST_CASE("auth set and logout finish their work when stderr cannot be written")
     const RunResult removed = sandbox.run_with(Launch{.args = {"logout"}, .failed_stderr = true});
     CHECK(removed.code == exit_ok);
     CHECK_FALSE(file_exists(sandbox.api_credential()));
+}
+
+TEST_CASE("login stops before reading a code when the link or the prompt cannot be written") {
+    for (const bool stdout_closed : {true, false}) {
+        INFO("broken stream: ", stdout_closed ? "stdout" : "stderr");
+        MockServer server;
+        Sandbox sandbox(server.port());
+        Launch launch{.args = {"login"}, .stdin_text = "mock-code\n"};
+        launch.closed_stdout = stdout_closed;
+        launch.failed_stderr = !stdout_closed;
+        const RunResult result = sandbox.run_with(launch);
+        CHECK(result.code == exit_config);
+        CHECK(server.requests().empty());
+        CHECK_FALSE(file_exists(sandbox.api_credential()));
+    }
 }
 
 // Each printed row is about 56 bytes, so 200 rows pass the stdio buffer of a pipe (4096 or 8192

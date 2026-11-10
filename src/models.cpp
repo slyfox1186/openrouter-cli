@@ -869,14 +869,14 @@ Result<std::map<std::string, AliasEntry>> load_aliases(const std::filesystem::pa
     return std::move(*aliases);
 }
 
-Result<void> save_alias(const std::filesystem::path& state_dir, const std::string& alias,
-                        const std::string& model_id) {
+Result<std::vector<std::string>> save_alias(const std::filesystem::path& state_dir,
+                                            const std::string& alias, const std::string& model_id) {
     if (const auto made = ensure_private_dir(state_dir); !made) {
-        return made;
+        return std::unexpected(made.error());
     }
     const std::filesystem::path locks = state_dir / locks_dir_name;
     if (const auto made = ensure_private_dir(locks); !made) {
-        return made;
+        return std::unexpected(made.error());
     }
     const auto lock = FileLock::acquire(locks / aliases_lock_name, true);
     if (!lock) {
@@ -886,8 +886,21 @@ Result<void> save_alias(const std::filesystem::path& state_dir, const std::strin
     if (!aliases) {
         return std::unexpected(aliases.error());
     }
+    std::vector<std::string> replaced;
+    for (const auto& [name, entry] : *aliases) {
+        if (entry.model_id == model_id && name != alias) {
+            replaced.push_back(name);
+        }
+    }
+    for (const std::string& name : replaced) {
+        aliases->erase(name);
+    }
     aliases->insert_or_assign(alias, AliasEntry{.model_id = model_id, .saved = utc_now()});
-    return atomic_write(state_dir / aliases_file_name, encode_aliases(*aliases));
+    const auto written = atomic_write(state_dir / aliases_file_name, encode_aliases(*aliases));
+    if (!written) {
+        return std::unexpected(written.error());
+    }
+    return replaced;
 }
 
 } // namespace orcli

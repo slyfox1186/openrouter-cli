@@ -6,6 +6,8 @@
 #include "credentials.hpp"
 #include "fsutil.hpp"
 #include "http.hpp"
+#include "secrets.hpp"
+#include "terminal.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +33,13 @@ constexpr std::string_view key_prefix = "sk-or-";
 constexpr std::string_view blank_chars = " \t\r\n";
 constexpr std::string_view revoke_hint =
     "the key stays valid at OpenRouter until you revoke it at https://openrouter.ai/settings/keys";
+
+// The help pages use the same codes for the same roles.
+constexpr std::string_view sgr_strong = "1";
+constexpr std::string_view sgr_literal = "1;36";
+constexpr std::string_view sgr_label = "36";
+constexpr std::string_view sgr_quiet = "2";
+constexpr std::string_view sgr_success = "1;32";
 
 std::string_view kind_label(KeyKind kind) {
     return kind == KeyKind::management ? "Management key" : "API key";
@@ -218,6 +227,36 @@ Result<std::string> read_code() {
     return code;
 }
 
+std::string login_heading(bool color) {
+    return std::format("{}\n\n"
+                       "  {} Open this link in a browser. Over SSH, a browser on any computer "
+                       "works.\n\n",
+                       paint(sgr_strong, "Sign in to OpenRouter", color),
+                       paint(sgr_strong, "1.", color));
+}
+
+// Ends with the prompt, without a newline, so the pasted code lands on the prompt's line.
+std::string login_steps_and_prompt(bool color) {
+    return std::format("\n  {} Sign in to your OpenRouter account and approve access.\n"
+                       "  {} Copy the code the browser shows you, then come back to this "
+                       "terminal.\n\n"
+                       "{} ",
+                       paint(sgr_strong, "2.", color), paint(sgr_strong, "3.", color),
+                       paint(sgr_strong, "Paste the code here, then press Enter:", color));
+}
+
+// The key name and the path are shown on their own short rows so neither wraps mid-sentence.
+std::string login_success(std::string_view label, std::string_view file, bool color) {
+    return std::format("\n{} Your new API key is stored encrypted.\n\n"
+                       "  {}  {}\n"
+                       "  {}  {}\n\n"
+                       "Next: {}\n",
+                       paint(sgr_success, "Signed in to OpenRouter.", color),
+                       paint(sgr_label, "Name", color), display_metadata(label),
+                       paint(sgr_label, "File", color), display_metadata(file),
+                       paint(sgr_literal, "openrouter-cli status", color));
+}
+
 // After the exchange request is sent, OpenRouter may hold a key this process never stored.
 void print_minted_key_hint(std::string_view label, bool certainly_created) {
     diagnostic("openrouter-cli: OpenRouter {} the key '{}'; if "
@@ -247,25 +286,24 @@ int cmd_login(const Config& config, bool replace) {
         return report(pkce.error());
     }
     const std::string label = login_key_label(host_name());
-    std::println(stderr, "Sign in to OpenRouter\n\n"
-                         "1. Open this link in your browser. Over SSH, use any computer:\n");
-    std::println("{}", authorization_url(pkce->challenge, label));
-    if (std::fflush(stdout) != 0) {
+    const bool color = stream_color(STDERR_FILENO);
+    write_stderr(login_heading(color));
+    // The link is the only thing on stdout, so a script can capture it.
+    if (!write_stdout(paint(sgr_literal, authorization_url(pkce->challenge, label),
+                            stream_color(STDOUT_FILENO)) +
+                      "\n")) {
         return report(Error{.code = Exit::config, .message = "cannot write to standard output"});
     }
-    std::println(stderr, "\n2. Sign in to your OpenRouter account and approve access.\n"
-                         "3. Copy the code shown in your browser and return to this terminal.\n");
-    std::print(stderr, "Paste the code here, then press Enter: ");
-    if (std::fflush(stderr) != 0) {
+    if (!write_stderr(login_steps_and_prompt(color))) {
         return report(Error{.code = Exit::config, .message = "cannot write the login prompt"});
     }
 
     auto code = read_code();
-    std::println(stderr, "");
+    write_stderr("\n");
     if (!code) {
         return report(code.error());
     }
-    std::println(stderr, "Completing sign-in with OpenRouter...");
+    write_stderr(paint(sgr_quiet, "Completing sign-in with OpenRouter...", color) + "\n");
     // OpenRouter's OAuth guide sends the exchange without an Authorization header, while the
     // generated API reference lists bearer security for it; this follows the guide.
     const Http http(config, HttpKeys{});
@@ -297,8 +335,8 @@ int cmd_login(const Config& config, bool replace) {
         return status;
     }
     warn_if_not_durable(KeyKind::inference, *stored, "openrouter-cli login");
-    diagnostic("openrouter-cli: logged in; the key is stored encrypted in {}",
-               credential_file(config.state_dir, KeyKind::inference).string());
+    write_stderr(login_success(
+        label, credential_file(config.state_dir, KeyKind::inference).string(), color));
     warn_plaintext_keys(config);
     return exit_code(Exit::ok);
 }

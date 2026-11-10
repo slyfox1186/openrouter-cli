@@ -97,8 +97,10 @@ struct Catalog {
 Result<Catalog> load_catalog(const std::filesystem::path& state_dir, std::chrono::hours ttl,
                              const FetchText& fetch, bool force_refresh);
 Result<std::map<std::string, AliasEntry>> load_aliases(const std::filesystem::path& state_dir);
-Result<void> save_alias(const std::filesystem::path& state_dir, const std::string& alias,
-                        const std::string& model_id);
+// A model has one alias at a time: saving removes every other alias of model_id and returns
+// their names, so the caller can say what was replaced.
+Result<std::vector<std::string>> save_alias(const std::filesystem::path& state_dir,
+                                            const std::string& alias, const std::string& model_id);
 
 } // namespace orcli
 

@@ -138,20 +138,20 @@ openrouter-cli status
 **Step 1.** Search for a model. This is ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) and needs no key.
 
 ```bash
-openrouter-cli models find "gemini"
+openrouter-cli find "gemini"
 ```
 
 **Step 2.** Look at its prices and limits. Also ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square).
 Replace `AUTHOR/MODEL` with an exact ID from the search results.
 
 ```bash
-openrouter-cli models show AUTHOR/MODEL
+openrouter-cli show AUTHOR/MODEL
 ```
 
 **Step 3.** Give it a short nickname so you never have to type the full ID again.
 
 ```bash
-openrouter-cli models save reviewer AUTHOR/MODEL
+openrouter-cli save reviewer AUTHOR/MODEL
 ```
 
 **Step 4.** Ask your question. This one is ![Usually paid](https://img.shields.io/badge/Usually%20paid-cf222e?style=flat-square) unless the price from step 2 was zero.
@@ -216,7 +216,7 @@ openrouter-cli --session review -f plan.md "I fixed the second problem. Review t
 
 The session remembers the conversation, but **it does not reread your files**. Attach a changed file again with `-f`. *Each round resends the whole conversation*, so later rounds can cost more than earlier ones.
 
-**Choose a specific provider.** Copy a tag from the `TAG` column of `models show`:
+**Choose a specific provider.** Copy a tag from the `TAG` column of `show`:
 
 ```bash
 openrouter-cli -m reviewer -p TAG "Review this plan."
@@ -234,12 +234,12 @@ openrouter-cli -m reviewer -- "--force: is this flag safe?"
 | --- | --- |
 | A question: `openrouter-cli -m MODEL "..."` | ![Usually paid](https://img.shields.io/badge/Usually%20paid-cf222e?style=flat-square) |
 | Each follow-up round in a `--session` | ![Usually paid](https://img.shields.io/badge/Usually%20paid-cf222e?style=flat-square) |
-| `models find`, `models show`, `models save`, `models list` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
+| `find`, `show`, `save`, `list` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
 | `status`, `account balance`, `account keys`, `account credits`, `account activity` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
 | `spend`, `spend --resolve` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
 | `login`, `logout`, `auth set`, `--help`, `--version` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
 
-A question costs whatever the model's published price says, so it is free only when `models show` lists a price of zero.
+A question costs whatever the model's published price says, so it is free only when `show` lists a price of zero.
 
 **A paid question is never retried automatically**, because a retry could charge you twice. If a question fails, the program tells you, and you decide whether to try again.
 
@@ -300,7 +300,7 @@ The skill tells the assistant to show you the model and its prices and to **wait
 
 ## When something goes wrong
 
-Every command explains itself with `-h` or `--help`, for example `openrouter-cli models --help`.
+Every command explains itself with `-h` or `--help`, for example `openrouter-cli spend --help`.
 
 When a command fails, it prints a short message and ends with an *exit code*. Your shell shows the code of the last command with `echo $?`.
 
@@ -311,7 +311,7 @@ When a command fails, it prints a short message and ends with an *exit code*. Yo
 | **2** | The command was typed wrong. | Check `openrouter-cli --help`. Remember: options first, question last. |
 | **3** | Stopped before sending. A key or password was found, the input was too big, the session was busy, or the cost log could not be written. ![Nothing was sent or charged](https://img.shields.io/badge/Nothing%20was%20sent%20or%20charged-1a7f37?style=flat-square) | Remove the flagged text, send less, or wait for the other question in that session to finish. |
 | **4** | The model name was not found, or it matched more than one model. | Pick one of the printed choices, or use the exact ID. |
-| **5** | OpenRouter or the network had a problem, the key was rejected, or no provider matched your model, provider and privacy choices. | Read the message. For "no provider", check the tags with `models show`. Trying again is another paid question. |
+| **5** | OpenRouter or the network had a problem, the key was rejected, or no provider matched your model, provider and privacy choices. | Read the message. For "no provider", check the tags with `show`. Trying again is another paid question. |
 | **6** | The answer was cut short, for example because it ran out of room. | Any partial answer is kept in the answer file named in the message, unless the message says saving failed. Try a lower `-e` or a higher `--max-output-tokens`. Trying again is another paid question. |
 | **7** | A setup problem, such as no key stored, a key that cannot be decrypted, a key found in the settings file, or a bad setting. | Run `openrouter-cli status` and follow what it says. |
 | **8** | You interrupted it (for example with <kbd>Ctrl</kbd>+<kbd>C</kbd>), while the answer was arriving or while the cost was being looked up. | Any partial answer is kept in the answer file named in the message, unless the message says saving failed. |
@@ -352,10 +352,10 @@ Everything below is optional detail. Click a heading to open it.
 | Command | What it does |
 | --- | --- |
 | `openrouter-cli [OPTIONS] QUERY` | Ask a question. `-` as the query reads it from standard input. |
-| `models find [--refresh] WORDS` | List models matching the words. `--refresh` downloads a fresh model list first. |
-| `models show MODEL` | Prices, context and output limits, reasoning efforts and provider tags. |
-| `models save ALIAS MODEL_ID` | Save a nickname for an exact model ID. |
-| `models list` | List saved nicknames. |
+| `find [--refresh] WORDS` | List models matching the words. `--refresh` downloads a fresh model list first. |
+| `show MODEL` | Prices, context and output limits, reasoning efforts and provider tags. |
+| `save ALIAS MODEL_ID` | Save a nickname for an exact model ID. A model has one nickname, so a new one replaces the old. |
+| `list` | List saved nicknames. |
 | `spend [--since PERIOD] [--resolve]` | Totals from the cost log. PERIOD is `today`, `7d`, `30d` or `all`. |
 | `login [--replace]` | Sign in with your browser and store a new key. |
 | `logout [--management]` | Delete stored keys from this computer. `--management` deletes only the Management key. |
@@ -366,9 +366,11 @@ Everything below is optional detail. Click a heading to open it.
 | `account credits` | Credits bought and used (Management key). |
 | `account activity [--days N]` | Usage per day, model and provider (Management key). |
 
+`find`, `show`, `save` and `list` also work with `models` in front, for example `openrouter-cli models save ALIAS MODEL_ID`.
+
 `login` and `auth set` never overwrite a stored key unless you add `--replace`. Keys are checked with OpenRouter before they are stored. Deleting a key from this computer does not delete it at OpenRouter.
 
-**How model names are matched.** `-m` accepts an exact ID, a saved nickname, an `~author/family-latest` ID or plain words. An exact ID wins over a nickname, and a nickname wins over plain words. Plain words that match exactly one model are used without saving anything. Only `models save` creates a nickname. The model list is cached; if an automatic refresh fails, the old list is used with a dated warning, but a failed `--refresh` is reported as an error.
+**How model names are matched.** `-m` accepts an exact ID, a saved nickname, an `~author/family-latest` ID or plain words. An exact ID wins over a nickname, and a nickname wins over plain words. Plain words that match exactly one model are used without saving anything. Only `save` creates a nickname. The model list is cached; if an automatic refresh fails, the old list is used with a dated warning, but a failed `--refresh` is reported as an error.
 
 </details>
 
@@ -385,7 +387,7 @@ Everything below is optional detail. Click a heading to open it.
 | `-s`, `--system TEXT` | Extra instructions for the model. `-s @FILE` reads them from a file. |
 | `-e`, `--effort LEVEL` | How hard the model thinks: `max`, `xhigh`, `high`, `medium`, `low`, `minimal` or `none`. Models that cannot choose ignore it. |
 | `--max-output-tokens N` | Most tokens the model may write, thinking included, up to the model's own limit. |
-| `-p`, `--provider TAG` | Use only this provider. Copy tags from `models show`. Repeat for more. |
+| `-p`, `--provider TAG` | Use only this provider. Copy tags from `show`. Repeat for more. |
 | `--privacy MODE` | `zdr` (default) or `no-training`. See [Privacy and safety](#privacy-and-safety). |
 | `--session NAME` | Keep the conversation under this name for follow-ups. |
 | `-h`, `--help` | Show help. |
@@ -495,7 +497,7 @@ To move the files instead, on the same computer:
 
 1. Stop any running questions and make a private backup.
 2. Copy the old `.env` to the new `config.env` path, and the contents of the old `state/` to the new state folder. Never overwrite or merge a file that already exists there, especially the cost log, keys, sessions or nicknames. Keep ownership and private permissions.
-3. Unset `OPENROUTER_CLI_HOME`, then check `openrouter-cli status` and `openrouter-cli models list`.
+3. Unset `OPENROUTER_CLI_HOME`, then check `openrouter-cli status` and `openrouter-cli list`.
 4. Keep the old files until you are sure everything works.
 
 Encrypted keys only open for the same user on the same computer. On a new computer, sign in again instead of copying them.
@@ -503,11 +505,11 @@ Encrypted keys only open for the same user on the same computer. On a new comput
 </details>
 
 <details>
-<summary><b>Help colors</b></summary>
+<summary><b>Colors</b></summary>
 
 <br>
 
-Help text uses your terminal's colors. Set `NO_COLOR` to any nonempty value to turn color off; it wins over everything else. Set `CLICOLOR_FORCE=1` to keep color on when output is piped. Piped help is wrapped to `COLUMNS` characters, or 80 when that is not set.
+Help text and the sign-in steps use your terminal's colors. Set `NO_COLOR` to any nonempty value to turn color off; it wins over everything else. Set `CLICOLOR_FORCE=1` to keep color on when output is piped. Piped help is wrapped to `COLUMNS` characters, or 80 when that is not set.
 
 </details>
 

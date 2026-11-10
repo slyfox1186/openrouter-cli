@@ -462,6 +462,46 @@ TEST_CASE("aliases round trip through save_alias and load_aliases") {
     CHECK(aliases.at("sol").saved.size() == utc_length);
 }
 
+TEST_CASE("save_alias keeps one alias per model and names the ones it removed") {
+    const TempDir temp("one-alias");
+    const auto first = orcli::save_alias(temp.state(), "gemini4", "google/gemini-4-argon");
+    REQUIRE(first.has_value());
+    CHECK(first->empty());
+    REQUIRE(orcli::save_alias(temp.state(), "sol", "openai/gpt-6-sol").has_value());
+
+    const auto second = orcli::save_alias(temp.state(), "g4", "google/gemini-4-argon");
+    REQUIRE(second.has_value());
+    CHECK(*second == std::vector<std::string>{"gemini4"});
+    const auto same = orcli::save_alias(temp.state(), "g4", "google/gemini-4-argon");
+    REQUIRE(same.has_value());
+    CHECK(same->empty());
+
+    const std::map<std::string, AliasEntry> aliases = orcli::load_aliases(temp.state()).value();
+    CHECK(aliases.size() == 2);
+    CHECK(aliases.at("g4").model_id == "google/gemini-4-argon");
+    CHECK(aliases.at("sol").model_id == "openai/gpt-6-sol");
+    CHECK_FALSE(aliases.contains("gemini4"));
+}
+
+TEST_CASE("save_alias clears every extra alias an older registry holds for the model") {
+    const TempDir temp("old-registry");
+    REQUIRE(orcli::ensure_private_dir(temp.state()).has_value());
+    REQUIRE(orcli::atomic_write(temp.state() / "models.json",
+                                R"({"aliases": {
+                                    "g4": {"model_id": "google/gemini-4-argon", "saved": "a"},
+                                    "gemini4": {"model_id": "google/gemini-4-argon", "saved": "b"},
+                                    "sol": {"model_id": "openai/gpt-6-sol", "saved": "c"}}})")
+                .has_value());
+
+    const auto removed = orcli::save_alias(temp.state(), "argon", "google/gemini-4-argon");
+    REQUIRE(removed.has_value());
+    CHECK(*removed == std::vector<std::string>{"g4", "gemini4"});
+    const std::map<std::string, AliasEntry> aliases = orcli::load_aliases(temp.state()).value();
+    CHECK(aliases.size() == 2);
+    CHECK(aliases.contains("argon"));
+    CHECK(aliases.contains("sol"));
+}
+
 TEST_CASE("load_aliases reports a corrupt registry as a configuration error") {
     const TempDir temp("corrupt");
     REQUIRE(orcli::ensure_private_dir(temp.state()).has_value());

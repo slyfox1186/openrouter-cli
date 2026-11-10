@@ -1,12 +1,13 @@
 #include "help.hpp"
 
+#include "terminal.hpp"
+
 #include <CLI/CLI.hpp>
 
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <format>
 #include <memory>
 #include <optional>
@@ -69,12 +70,7 @@ public:
     explicit Line(bool color) : color_(color) {}
 
     Line& add(std::string_view text, Tone tone = Tone::plain) {
-        const std::string_view code = sgr_code(tone);
-        if (color_ && !code.empty() && !text.empty()) {
-            text_ += std::format("\x1b[{}m{}\x1b[0m", code, text);
-        } else {
-            text_ += text;
-        }
+        text_ += paint(sgr_code(tone), text, color_);
         width_ += text.size();
         return *this;
     }
@@ -234,7 +230,8 @@ bool has_options(const CLI::App& app) {
 
 std::vector<const CLI::App*> listed_commands(const CLI::App& app) {
     return app.get_subcommands([](const CLI::App* command) {
-        return !command->get_disabled() && !command->get_name().empty();
+        return !command->get_disabled() && !command->get_name().empty() &&
+               !command->get_group().empty();
     });
 }
 
@@ -442,11 +439,6 @@ void render_command_hint(std::string& out, std::string_view path, const HelpStyl
     emit(out, line);
 }
 
-std::string_view environment(const char* name) {
-    const char* value = std::getenv(name);
-    return value == nullptr ? std::string_view{} : std::string_view{value};
-}
-
 std::optional<std::size_t> read_terminal_columns() {
     winsize size{};
     if (::ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) != 0) {
@@ -471,16 +463,6 @@ std::optional<std::size_t> positive_number(std::string_view text) {
 
 } // namespace
 
-bool help_color(const ColorInputs& inputs) {
-    if (!inputs.no_color.empty()) {
-        return false;
-    }
-    if (!inputs.force.empty() && inputs.force != "0") {
-        return true;
-    }
-    return inputs.terminal && !inputs.term.empty() && inputs.term != "dumb";
-}
-
 std::size_t help_width(std::optional<std::size_t> terminal_columns, std::string_view columns_env) {
     std::optional<std::size_t> columns = terminal_columns;
     if (columns.has_value() && *columns == 0) {
@@ -494,14 +476,8 @@ std::size_t help_width(std::optional<std::size_t> terminal_columns, std::string_
 
 HelpStyle detect_help_style() {
     const bool terminal = ::isatty(STDOUT_FILENO) == 1;
-    const ColorInputs inputs{
-        .no_color = environment("NO_COLOR"),
-        .force = environment("CLICOLOR_FORCE"),
-        .term = environment("TERM"),
-        .terminal = terminal,
-    };
     return HelpStyle{
-        .color = help_color(inputs),
+        .color = stream_color(STDOUT_FILENO),
         .width =
             help_width(terminal ? read_terminal_columns() : std::nullopt, environment("COLUMNS")),
     };

@@ -12,7 +12,6 @@
 
 namespace {
 
-using orcli::ColorInputs;
 using orcli::HelpContent;
 using orcli::HelpExample;
 using orcli::HelpFormatter;
@@ -65,6 +64,9 @@ struct Fixture {
         save->add_option("alias", values.alias, "Alias to save")->required();
         save->add_option("model_id", values.model_id, "Exact model id")->required();
         app.add_subcommand("status", "Who is logged in");
+        auto* hidden = app.add_subcommand("legacy", "Old spelling kept working");
+        hidden->add_subcommand("leaf", "Reached only through the old spelling");
+        hidden->group("");
         app.add_subcommand("a-very-long-command-name-that-overflows", "Overflowing row");
     }
 
@@ -119,20 +121,6 @@ std::string strip_escapes(std::string_view text) {
 }
 
 } // namespace
-
-TEST_CASE("help color follows NO_COLOR, CLICOLOR_FORCE, the terminal and TERM") {
-    CHECK(orcli::help_color({.no_color = "", .force = "", .term = "xterm", .terminal = true}));
-    CHECK_FALSE(
-        orcli::help_color({.no_color = "1", .force = "", .term = "xterm", .terminal = true}));
-    CHECK_FALSE(
-        orcli::help_color({.no_color = "1", .force = "1", .term = "xterm", .terminal = true}));
-    CHECK(orcli::help_color({.no_color = "", .force = "1", .term = "", .terminal = false}));
-    CHECK_FALSE(orcli::help_color({.no_color = "", .force = "0", .term = "", .terminal = false}));
-    CHECK_FALSE(
-        orcli::help_color({.no_color = "", .force = "", .term = "xterm", .terminal = false}));
-    CHECK_FALSE(orcli::help_color({.no_color = "", .force = "", .term = "", .terminal = true}));
-    CHECK_FALSE(orcli::help_color({.no_color = "", .force = "", .term = "dumb", .terminal = true}));
-}
 
 TEST_CASE("help width prefers the terminal, then COLUMNS, then 80, clamped to 40..100") {
     CHECK(orcli::help_width(std::nullopt, "") == kWide);
@@ -251,6 +239,15 @@ TEST_CASE("a narrow page stacks every description under its cell") {
             CHECK(line.size() <= kNarrow);
         }
     }
+}
+
+TEST_CASE("a command whose group is empty is left off the page with its children") {
+    const Fixture fixture(HelpStyle{.color = false, .width = kWide});
+    const std::string page = fixture.app.help();
+
+    CHECK_FALSE(has(page, "legacy"));
+    CHECK_FALSE(has(page, "Old spelling kept working"));
+    CHECK(has(page, "status"));
 }
 
 TEST_CASE("a null app renders nothing") {
