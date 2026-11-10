@@ -142,13 +142,13 @@ openrouter-cli find "gemini"
 ```
 
 **Step 2.** Look at its prices and limits. Also ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square).
-Replace `AUTHOR/MODEL` with an exact ID from the search results.
+Replace `AUTHOR/MODEL` with an exact ID from the search results. An ID is the model's name at OpenRouter: who makes it, a slash, then the model, as in `google/gemini-4-argon`. It is not a folder on your computer.
 
 ```bash
 openrouter-cli show AUTHOR/MODEL
 ```
 
-**Step 3.** Give it a short nickname so you never have to type the full ID again.
+**Step 3.** Give it a short nickname so you never have to type the full ID again. The examples on this page use the nickname `reviewer`, which only works after this step.
 
 ```bash
 openrouter-cli save reviewer AUTHOR/MODEL
@@ -208,6 +208,12 @@ openrouter-cli -m reviewer --role review -f src/http.cpp -f src/http.hpp "Review
 
 ```bash
 git diff | openrouter-cli -m reviewer --role review -
+```
+
+`git diff` only shows unstaged changes to files git already tracks, so it can print nothing, and an empty question is refused. To send the changes from your last commit instead (the repository needs at least two commits):
+
+```bash
+git diff HEAD~1 HEAD | openrouter-cli -m reviewer --role review -
 ```
 
 **Send a long question.** Type it between the two `EOF` lines.
