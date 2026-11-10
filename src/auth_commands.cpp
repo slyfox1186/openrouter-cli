@@ -113,11 +113,10 @@ VerifyKey verifier_for(const Config& config, KeyKind kind) {
 void warn_if_not_durable(KeyKind kind, const StoreOutcome& outcome,
                          std::string_view repeat_command) {
     if (!outcome.durable) {
-        std::println(stderr,
-                     "openrouter-cli: warning: the {} is stored and working, but the directory "
-                     "sync failed, so its survival of a power loss is unconfirmed; after a "
-                     "restart run `openrouter-cli status` and repeat `{}` if it is gone",
-                     kind_label(kind), repeat_command);
+        diagnostic("openrouter-cli: warning: the {} is stored and working, but the directory "
+                   "sync failed, so its survival of a power loss is unconfirmed; after a "
+                   "restart run `openrouter-cli status` and repeat `{}` if it is gone",
+                   kind_label(kind), repeat_command);
     }
 }
 
@@ -220,10 +219,9 @@ Result<std::string> read_code() {
 
 // After the exchange request is sent, OpenRouter may hold a key this process never stored.
 void print_minted_key_hint(std::string_view label, bool certainly_created) {
-    std::println(stderr,
-                 "openrouter-cli: OpenRouter {} the key '{}'; if "
-                 "https://openrouter.ai/settings/keys lists it, revoke it",
-                 certainly_created ? "created" : "may have created", label);
+    diagnostic("openrouter-cli: OpenRouter {} the key '{}'; if "
+               "https://openrouter.ai/settings/keys lists it, revoke it",
+               certainly_created ? "created" : "may have created", label);
 }
 
 } // namespace
@@ -298,8 +296,8 @@ int cmd_auth_login(const Config& config, bool replace) {
         return status;
     }
     warn_if_not_durable(KeyKind::inference, *stored, "openrouter-cli auth login");
-    std::println(stderr, "openrouter-cli: logged in; the key is stored encrypted in {}",
-                 credential_file(config.state_dir, KeyKind::inference).string());
+    diagnostic("openrouter-cli: logged in; the key is stored encrypted in {}",
+               credential_file(config.state_dir, KeyKind::inference).string());
     warn_plaintext_keys(config);
     return exit_code(Exit::ok);
 }
@@ -320,8 +318,8 @@ int cmd_auth_set(const Config& config, bool management, bool replace) {
         return report(stored.error());
     }
     warn_if_not_durable(kind, *stored, set_command(kind));
-    std::println(stderr, "openrouter-cli: the {} is stored encrypted in {}", kind_label(kind),
-                 credential_file(config.state_dir, kind).string());
+    diagnostic("openrouter-cli: the {} is stored encrypted in {}", kind_label(kind),
+               credential_file(config.state_dir, kind).string());
     warn_plaintext_keys(config);
     return exit_code(Exit::ok);
 }
@@ -332,12 +330,12 @@ int cmd_auth_logout(const Config& config, bool management_only) {
         return report(removed.error());
     }
     for (const KeyKind kind : *removed) {
-        std::println(stderr, "openrouter-cli: removed the stored {}", kind_label(kind));
+        diagnostic("openrouter-cli: removed the stored {}", kind_label(kind));
     }
     if (removed->empty()) {
-        std::println(stderr, "openrouter-cli: already logged out");
+        diagnostic("openrouter-cli: already logged out");
     }
-    std::println(stderr, "openrouter-cli: {}", revoke_hint);
+    diagnostic("openrouter-cli: {}", revoke_hint);
     warn_plaintext_keys(config);
     return exit_code(Exit::ok);
 }

@@ -428,6 +428,9 @@ Result<std::string> read_regular_file(const fs::path& file, std::size_t max_byte
                     std::format("{} exceeds the {}-byte limit", file.string(), max_bytes));
     }
     std::string text;
+    // The size was checked against the limit above; the loop still enforces the limit, because
+    // the file can grow while it is read.
+    text.reserve(static_cast<std::size_t>(info.st_size));
     std::array<char, read_chunk_size> buffer{};
     for (;;) {
         if (interrupt_requested()) {

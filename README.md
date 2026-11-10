@@ -447,7 +447,7 @@ Then edit the file. Exported environment variables with the same names do **not*
 | `OPENROUTER_CLI_MAX_OUTPUT_TOKENS` | `64000` | Output budget, thinking included, capped at each model's limit. |
 | `OPENROUTER_CLI_PRIVACY` | `zdr` | Default privacy mode. |
 | `OPENROUTER_CLI_CATALOG_TTL_HOURS` | `24` | Hours before the cached model list is refreshed. |
-| `OPENROUTER_CLI_IDLE_TIMEOUT_SECONDS` | `300` | Give up when nothing arrives for this long. |
+| `OPENROUTER_CLI_IDLE_TIMEOUT_SECONDS` | `300` | Give up when no data is sent or received for this long. |
 | `OPENROUTER_CLI_TOTAL_TIMEOUT_SECONDS` | `3600` | Longest a single question may take. |
 | `OPENROUTER_CLI_MAX_FILE_BYTES` | `1048576` | Largest single attached file (1 MiB). |
 | `OPENROUTER_CLI_MAX_INPUT_BYTES` | `4194304` | Largest total input per question (4 MiB). |

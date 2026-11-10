@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <format>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -99,7 +100,14 @@ std::string fence_for(std::string_view content) {
 }
 
 Result<std::string> pack_files(const std::vector<FileSnapshot>& files, std::size_t max_bytes) {
+    std::size_t content_bytes = 0;
+    for (const FileSnapshot& file : files) {
+        content_bytes = std::add_sat(content_bytes, file.content.size());
+    }
     std::string out;
+    // A lower bound of the packed size (headings and line numbers come on top), never above the
+    // limit that the loop enforces.
+    out.reserve(std::min(content_bytes, max_bytes));
     for (const FileSnapshot& file : files) {
         const std::string fence = fence_for(file.content);
         const std::size_t lines = count_lines(file.content);

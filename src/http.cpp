@@ -62,6 +62,10 @@ constexpr int progress_abort = 1;
 constexpr int progress_continue = 0;
 constexpr const char* user_agent =
     "Mozilla/5.0 (X11; Linux x86_64; rv:159.0) Gecko/20100101 Firefox/159.0";
+constexpr const char* no_handle_error = "libcurl could not create a transfer handle";
+// An empty value removes the header. Left alone, libcurl adds "Expect: 100-continue" to bodies
+// over 1 MiB and sends the whole POST again when the server answers 417.
+constexpr const char* no_expect_header = "Expect:";
 
 // Constant initialization keeps the flag safe to access from the signal handler.
 std::atomic<bool>& interrupt_flag() noexcept {
@@ -74,10 +78,21 @@ void on_terminate_signal(int /*signal*/) {
     interrupt_flag().store(true);
 }
 
-struct EasyDeleter {
-    void operator()(CURL* handle) const { curl_easy_cleanup(handle); }
+// Clears every option when a request starts and when it ends, because options point at that
+// request's locals. curl_easy_reset keeps the handle's live connections, TLS sessions and DNS
+// cache, which is what lets the next request reuse them.
+class OptionScope {
+public:
+    explicit OptionScope(CURL* handle) noexcept : handle_(handle) { curl_easy_reset(handle_); }
+    OptionScope(const OptionScope&) = delete;
+    OptionScope& operator=(const OptionScope&) = delete;
+    OptionScope(OptionScope&&) = delete;
+    OptionScope& operator=(OptionScope&&) = delete;
+    ~OptionScope() { curl_easy_reset(handle_); }
+
+private:
+    CURL* handle_;
 };
-using EasyHandle = std::unique_ptr<CURL, EasyDeleter>;
 
 struct SlistDeleter {
     void operator()(curl_slist* list) const { curl_slist_free_all(list); }
@@ -89,6 +104,16 @@ template <class T> Result<void> set_option(CURL* handle, CURLoption option, T va
         return fail(Exit::api, "libcurl rejected a transfer option");
     }
     return {};
+}
+
+// The first failure in a group of option results, so each group is checked in one place.
+Result<void> first_failure(std::span<const Result<void>> results) {
+    const auto failed = std::ranges::find_if_not(
+        results, [](const Result<void>& result) { return result.has_value(); });
+    if (failed == results.end()) {
+        return {};
+    }
+    return std::unexpected(failed->error());
 }
 
 Result<void> append_header(HeaderList& list, const std::string& header) {
@@ -159,12 +184,7 @@ Result<HeaderList> base_headers(const Config& config, std::string_view key) {
     return list;
 }
 
-Result<EasyHandle> new_handle(const std::string& url, long total_timeout_seconds) {
-    EasyHandle handle(curl_easy_init());
-    if (handle == nullptr) {
-        return fail(Exit::api, "libcurl could not create a transfer handle");
-    }
-    CURL* raw = handle.get();
+Result<void> configure(CURL* raw, const std::string& url, long total_timeout_seconds) {
     const std::array results{
         set_option(raw, CURLOPT_URL, url.c_str()),
         set_option(raw, CURLOPT_NOSIGNAL, 1L),
@@ -178,12 +198,23 @@ Result<EasyHandle> new_handle(const std::string& url, long total_timeout_seconds
         set_option(raw, CURLOPT_TIMEOUT, total_timeout_seconds),
         set_option(raw, CURLOPT_TCP_KEEPALIVE, 1L),
     };
-    for (const auto& result : results) {
-        if (!result) {
-            return std::unexpected(result.error());
-        }
+    return first_failure(results);
+}
+
+// A null body leaves the request a GET. A POST always opens its own connection: libcurl sends
+// a request again when a reused connection turns out to be dead, and a POST must never be
+// sent twice.
+Result<void> post_options(CURL* raw, const std::string* json_body) {
+    if (json_body == nullptr) {
+        return {};
     }
-    return handle;
+    const std::array results{
+        set_option(raw, CURLOPT_FRESH_CONNECT, 1L),
+        set_option(raw, CURLOPT_POST, 1L),
+        set_option(raw, CURLOPT_POSTFIELDS, json_body->c_str()),
+        set_option(raw, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(json_body->size())),
+    };
+    return first_failure(results);
 }
 
 // Sleeps in short slices so Ctrl-C still stops a retry wait promptly.
@@ -285,6 +316,7 @@ struct Attempt {
 
 struct Request {
     const Config* config = nullptr;
+    CURL* handle = nullptr;
     std::string url;
     std::string_view key;                   // empty: no Authorization header
     const std::string* json_body = nullptr; // set: POST with this body
@@ -298,72 +330,69 @@ bool budget_exhausted(const std::optional<Clock::time_point>& deadline) {
                std::chrono::milliseconds::zero();
 }
 
+// Bounds one attempt by what is left of a lookup window; no deadline keeps the default.
+Result<void> apply_deadline(CURL* raw, const std::optional<Clock::time_point>& deadline) {
+    if (!deadline.has_value()) {
+        return {};
+    }
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - Clock::now());
+    if (remaining <= std::chrono::milliseconds::zero()) {
+        return fail(Exit::api, "generation lookup time limit reached");
+    }
+    const auto bounded = std::min(remaining, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                 std::chrono::seconds{get_timeout_seconds}));
+    return set_option(raw, CURLOPT_TIMEOUT_MS, static_cast<long>(bounded.count()));
+}
+
+Result<HeaderList> request_headers(const Request& request) {
+    auto headers = base_headers(*request.config, request.key);
+    if (!headers || request.json_body == nullptr) {
+        return headers;
+    }
+    for (const char* header :
+         {"Content-Type: application/json", "Accept: application/json", no_expect_header}) {
+        if (auto added = append_header(*headers, std::string(header)); !added) {
+            return std::unexpected(added.error());
+        }
+    }
+    return headers;
+}
+
 // Performs one transfer. When body_limit is small (the PKCE exchange) the buffer is reserved
 // up front, so a response holding a key is never spread over reallocated, uncleared memory.
 Result<Attempt> perform(const Request& request) {
     if (interrupt_flag().load()) {
         return fail(Exit::interrupted, "interrupted");
     }
-    auto handle = new_handle(request.url, get_timeout_seconds);
-    if (!handle) {
-        return std::unexpected(handle.error());
+    CURL* raw = request.handle;
+    if (raw == nullptr) {
+        return fail(Exit::api, no_handle_error);
     }
-    auto headers = base_headers(*request.config, request.key);
+    const OptionScope options(raw);
+    auto headers = request_headers(request);
     if (!headers) {
         return std::unexpected(headers.error());
     }
-    if (request.json_body != nullptr) {
-        for (const char* header : {"Content-Type: application/json", "Accept: application/json"}) {
-            if (auto added = append_header(*headers, std::string(header)); !added) {
-                return std::unexpected(added.error());
-            }
-        }
-    }
     GetBuffer buffer;
-    buffer.handle = handle->get();
+    buffer.handle = raw;
     buffer.limit = request.body_limit;
     if (request.body_limit < max_get_body_bytes) {
         buffer.body.reserve(request.body_limit);
     }
-    CURL* raw = handle->get();
-    if (request.deadline.has_value()) {
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(*request.deadline - Clock::now());
-        if (remaining <= std::chrono::milliseconds::zero()) {
-            return fail(Exit::api, "generation lookup time limit reached");
-        }
-        const auto bounded =
-            std::min(remaining, std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::seconds{get_timeout_seconds}));
-        if (auto setup = set_option(raw, CURLOPT_TIMEOUT_MS, static_cast<long>(bounded.count()));
-            !setup) {
-            return std::unexpected(setup.error());
-        }
-    }
+    // In order: the deadline replaces the default timeout that configure() sets.
     const std::array setup{
+        configure(raw, request.url, get_timeout_seconds),
+        apply_deadline(raw, request.deadline),
         set_option(raw, CURLOPT_HTTPHEADER, headers->get()),
         set_option(raw, CURLOPT_WRITEFUNCTION, &receive_bytes<get_write>),
         set_option(raw, CURLOPT_WRITEDATA, static_cast<void*>(&buffer)),
         set_option(raw, CURLOPT_XFERINFOFUNCTION, &abort_on_interrupt),
         set_option(raw, CURLOPT_NOPROGRESS, 0L),
+        post_options(raw, request.json_body),
     };
-    for (const auto& result : setup) {
-        if (!result) {
-            return std::unexpected(result.error());
-        }
-    }
-    if (request.json_body != nullptr) {
-        const std::string& body = *request.json_body;
-        const std::array post_setup{
-            set_option(raw, CURLOPT_POST, 1L),
-            set_option(raw, CURLOPT_POSTFIELDS, body.c_str()),
-            set_option(raw, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size())),
-        };
-        for (const auto& result : post_setup) {
-            if (!result) {
-                return std::unexpected(result.error());
-            }
-        }
+    if (auto ready = first_failure(setup); !ready) {
+        return std::unexpected(ready.error());
     }
     Attempt attempt;
     attempt.code = curl_easy_perform(raw);
@@ -399,11 +428,47 @@ std::chrono::milliseconds retry_wait(const Attempt& attempt, std::chrono::millis
     return backoff;
 }
 
+// What fetch() carries from one attempt to the next.
+struct Lookup {
+    std::string_view path_and_query;
+    std::optional<Clock::time_point> deadline; // set: a 404 is retried until then
+    std::optional<HttpResponse> last_complete; // the answer once that window has closed
+};
+
+// The window closed before another attempt could start.
+Result<HttpResponse> window_closed(Lookup& lookup) {
+    if (lookup.last_complete.has_value()) {
+        return std::move(*lookup.last_complete);
+    }
+    return fail(Exit::api, "generation lookup time limit reached");
+}
+
+// An attempt that could not run. Once the window has closed, the last complete response
+// outranks the failure, except for an interrupt.
+Result<HttpResponse> attempt_failed(const Error& error, Lookup& lookup) {
+    if (error.code != Exit::interrupted && lookup.last_complete.has_value() &&
+        budget_exhausted(lookup.deadline)) {
+        return std::move(*lookup.last_complete);
+    }
+    return std::unexpected(error);
+}
+
+// The result of an attempt that is not retried. `expired` says the window closed during it.
+Result<HttpResponse> finished(Attempt& attempt, Lookup& lookup, bool expired) {
+    if (attempt.code == CURLE_OK) {
+        return HttpResponse{.status = attempt.status, .body = std::move(attempt.body)};
+    }
+    if (expired && lookup.last_complete.has_value()) {
+        return std::move(*lookup.last_complete);
+    }
+    return fail(Exit::api,
+                std::format("GET {}: {}", lookup.path_and_query, curl_easy_strerror(attempt.code)));
+}
+
 struct StreamState {
     const StreamHandlers* handlers = nullptr;
     StreamResult* result = nullptr;
-    Clock::time_point last_byte;
-    Clock::duration idle_limit{};
+    ActivityClock activity;
     bool generation_id_seen = false;
     bool final_headers = false;
     bool content_type_seen = false;
@@ -422,31 +487,36 @@ bool continue_stream(StreamState& state) {
     return true;
 }
 
+// The three-digit code of a status line, or 0 when it cannot be read.
+long status_of(std::string_view status_line) {
+    constexpr std::size_t status_length = 3;
+    const auto space = status_line.find(' ');
+    if (space == std::string_view::npos) {
+        return 0;
+    }
+    const auto code = trim(status_line.substr(space + 1));
+    if (code.size() < status_length) {
+        return 0;
+    }
+    const auto number = code.substr(0, status_length);
+    long status = 0;
+    const auto parsed = std::from_chars(number.data(), std::to_address(number.end()), status);
+    const bool whole = parsed.ec == std::errc{} && parsed.ptr == std::to_address(number.end());
+    return whole ? status : 0;
+}
+
 std::size_t stream_header(std::span<const char> data, void* user) {
     auto* state = static_cast<StreamState*>(user);
     const std::size_t bytes = data.size();
-    state->last_byte = Clock::now();
+    state->activity.received(Clock::now());
     try {
         const std::string_view line(data.data(), bytes);
         if (line.starts_with("HTTP/")) {
             state->final_headers = false;
             state->content_type_seen = false;
-            state->header_status = 0;
+            state->header_status = status_of(line);
             state->generation_id.clear();
             state->result->event_stream = false;
-            const auto space = line.find(' ');
-            if (space != std::string_view::npos) {
-                const auto code = trim(line.substr(space + 1));
-                constexpr std::size_t status_length = 3;
-                if (code.size() >= status_length) {
-                    const auto number = code.substr(0, status_length);
-                    const auto parsed = std::from_chars(
-                        number.data(), std::to_address(number.end()), state->header_status);
-                    if (parsed.ec != std::errc{} || parsed.ptr != std::to_address(number.end())) {
-                        state->header_status = 0;
-                    }
-                }
-            }
             return bytes;
         }
         if (state->final_headers) {
@@ -490,7 +560,7 @@ std::size_t stream_header(std::span<const char> data, void* user) {
 std::size_t stream_write(std::span<const char> data, void* user) {
     auto* state = static_cast<StreamState*>(user);
     const std::size_t bytes = data.size();
-    state->last_byte = Clock::now();
+    state->activity.received(Clock::now());
     try {
         if (bytes > max_get_body_bytes - state->received) {
             state->callback_error = "stream response exceeds 64 MiB";
@@ -517,13 +587,15 @@ std::size_t stream_write(std::span<const char> data, void* user) {
 // The declared callback type enforces libcurl's required non-const void* parameter.
 constexpr curl_xferinfo_callback stream_progress = [](void* user, curl_off_t /*dltotal*/,
                                                       curl_off_t /*dlnow*/, curl_off_t /*ultotal*/,
-                                                      curl_off_t /*ulnow*/) {
+                                                      curl_off_t ulnow) {
     auto* state = static_cast<StreamState*>(user);
     if (interrupt_flag().load()) {
         state->result->interrupted = true;
         return progress_abort;
     }
-    if (Clock::now() - state->last_byte > state->idle_limit) {
+    const auto now = Clock::now();
+    state->activity.uploaded(ulnow, now);
+    if (state->activity.idle(now)) {
         state->result->idle_timeout = true;
         return progress_abort;
     }
@@ -573,7 +645,12 @@ CurlGlobal::~CurlGlobal() {
     }
 }
 
-Http::Http(const Config& config, HttpKeys keys) : config_(config), keys_(std::move(keys)) {}
+void CurlHandleDeleter::operator()(void* handle) const noexcept {
+    curl_easy_cleanup(handle);
+}
+
+Http::Http(const Config& config, HttpKeys keys)
+    : config_(config), keys_(std::move(keys)), handle_(curl_easy_init()) {}
 
 Result<std::string_view> Http::key_for(Auth auth) const {
     switch (auth) {
@@ -613,19 +690,22 @@ Result<HttpResponse> Http::fetch(std::string_view path_and_query, const GetOptio
     if (!key) {
         return std::unexpected(key.error());
     }
-    const auto started = Clock::now();
-    const std::optional<Clock::time_point> deadline =
-        options.retry_404_for.count() > 0 ? std::optional{started + options.retry_404_for}
-                                          : std::nullopt;
+    Lookup lookup{
+        .path_and_query = path_and_query,
+        .deadline = options.retry_404_for.count() > 0
+                        ? std::optional{Clock::now() + options.retry_404_for}
+                        : std::nullopt,
+        .last_complete = std::nullopt,
+    };
     const Request request{
         .config = &config_.get(),
+        .handle = handle_.get(),
         .url = config_.get().base_url + std::string(path_and_query),
         .key = *key,
         .json_body = nullptr,
         .body_limit = max_get_body_bytes,
-        .deadline = deadline,
+        .deadline = lookup.deadline,
     };
-    std::optional<HttpResponse> last_complete;
     int retries = 0;
     auto backoff = std::chrono::duration_cast<std::chrono::milliseconds>(first_backoff);
 
@@ -633,45 +713,28 @@ Result<HttpResponse> Http::fetch(std::string_view path_and_query, const GetOptio
         if (interrupt_requested()) {
             return fail(Exit::interrupted, "interrupted");
         }
-        if (budget_exhausted(deadline)) {
-            if (last_complete.has_value()) {
-                return std::move(*last_complete);
-            }
-            return fail(Exit::api, "generation lookup time limit reached");
+        if (budget_exhausted(lookup.deadline)) {
+            return window_closed(lookup);
         }
         auto attempt = perform(request);
         if (!attempt) {
-            if (attempt.error().code != Exit::interrupted && budget_exhausted(deadline) &&
-                last_complete.has_value()) {
-                return std::move(*last_complete);
-            }
-            return std::unexpected(attempt.error());
+            return attempt_failed(attempt.error(), lookup);
         }
         if (attempt->too_large) {
             return fail(Exit::api, std::format("GET {}: response larger than {} bytes",
                                                path_and_query, attempt->limit));
         }
-        const bool success = attempt->code == CURLE_OK && attempt->status >= http_ok_min &&
-                             attempt->status <= http_ok_max;
-        const bool expired = budget_exhausted(deadline);
-        if (expired && attempt->code != CURLE_OK && last_complete.has_value()) {
-            return std::move(*last_complete);
-        }
-        if (success || expired ||
-            !should_retry(*attempt, retries, deadline.has_value() && !expired)) {
-            if (attempt->code != CURLE_OK) {
-                return fail(Exit::api, std::format("GET {}: {}", path_and_query,
-                                                   curl_easy_strerror(attempt->code)));
-            }
-            return HttpResponse{.status = attempt->status, .body = std::move(attempt->body)};
+        const bool expired = budget_exhausted(lookup.deadline);
+        if (expired || !should_retry(*attempt, retries, lookup.deadline.has_value())) {
+            return finished(*attempt, lookup, expired);
         }
         auto wait = retry_wait(*attempt, backoff);
-        if (deadline.has_value()) {
+        if (lookup.deadline.has_value()) {
             wait = std::min(wait, std::chrono::duration_cast<std::chrono::milliseconds>(
-                                      *deadline - Clock::now()));
+                                      *lookup.deadline - Clock::now()));
         }
         if (attempt->code == CURLE_OK) {
-            last_complete =
+            lookup.last_complete =
                 HttpResponse{.status = attempt->status, .body = std::move(attempt->body)};
         }
         if (!interruptible_sleep(wait)) {
@@ -688,11 +751,12 @@ StreamResult Http::post_stream(std::string_view path, const std::string& body,
     StreamResult result;
     const std::string url = config_.get().base_url + std::string(path);
 
-    auto handle = new_handle(url, config_.get().total_timeout_seconds);
-    if (!handle) {
-        result.transport_error = handle.error().message;
+    CURL* raw = handle_.get();
+    if (raw == nullptr) {
+        result.transport_error = no_handle_error;
         return result;
     }
+    const OptionScope options(raw);
     const auto key = key_for(Auth::inference);
     if (!key) {
         result.transport_error = key.error().message;
@@ -707,6 +771,7 @@ StreamResult Http::post_stream(std::string_view path, const std::string& body,
              "Content-Type: application/json",
              "Accept: text/event-stream",
              "X-OpenRouter-Metadata: enabled",
+             no_expect_header,
          }) {
         if (auto added = append_header(*headers, std::string(header)); !added) {
             result.transport_error = added.error().message;
@@ -714,18 +779,19 @@ StreamResult Http::post_stream(std::string_view path, const std::string& body,
         }
     }
 
-    StreamState state;
-    state.handlers = &handlers;
-    state.result = &result;
-    state.last_byte = Clock::now();
-    state.idle_limit = std::chrono::seconds{config_.get().idle_timeout_seconds};
+    StreamState state{
+        .handlers = &handlers,
+        .result = &result,
+        .activity =
+            ActivityClock(Clock::now(), std::chrono::seconds{config_.get().idle_timeout_seconds}),
+        .generation_id = {},
+        .callback_error = {},
+    };
 
-    CURL* raw = handle->get();
     const std::array setup{
+        configure(raw, url, config_.get().total_timeout_seconds),
         set_option(raw, CURLOPT_HTTPHEADER, headers->get()),
-        set_option(raw, CURLOPT_POST, 1L),
-        set_option(raw, CURLOPT_POSTFIELDS, body.c_str()),
-        set_option(raw, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size())),
+        post_options(raw, &body),
         set_option(raw, CURLOPT_HEADERFUNCTION, &receive_bytes<stream_header>),
         set_option(raw, CURLOPT_HEADERDATA, static_cast<void*>(&state)),
         set_option(raw, CURLOPT_WRITEFUNCTION, &receive_bytes<stream_write>),
@@ -734,11 +800,9 @@ StreamResult Http::post_stream(std::string_view path, const std::string& body,
         set_option(raw, CURLOPT_XFERINFODATA, static_cast<void*>(&state)),
         set_option(raw, CURLOPT_NOPROGRESS, 0L),
     };
-    for (const auto& outcome : setup) {
-        if (!outcome) {
-            result.transport_error = outcome.error().message;
-            return result;
-        }
+    if (auto ready = first_failure(setup); !ready) {
+        result.transport_error = ready.error().message;
+        return result;
     }
 
     const CURLcode code = curl_easy_perform(raw);
@@ -766,6 +830,7 @@ Result<std::string> Http::post_json(std::string_view path, const std::string& bo
     // failure could never succeed and would hide the first error.
     auto attempt = perform(Request{
         .config = &config_.get(),
+        .handle = handle_.get(),
         .url = config_.get().base_url + std::string(path),
         .key = *key,
         .json_body = &body,

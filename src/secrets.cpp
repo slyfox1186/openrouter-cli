@@ -404,13 +404,33 @@ std::optional<Span> find_url_credentials(std::string_view text, std::size_t from
     return std::nullopt;
 }
 
-std::size_t next_keyword(std::string_view lowered, std::size_t from) {
-    std::size_t first = kNotFound;
-    for (const std::string_view keyword : kCredentialKeywords) {
-        first = std::min(first, lowered.find(keyword, from));
+// Where each credential keyword next occurs at or after a moving offset. A keyword's search
+// only ever moves forward, and an absent keyword is searched once, so walking every candidate
+// in a text costs one pass per keyword however many candidates are rejected.
+class KeywordCursor {
+public:
+    explicit KeywordCursor(std::string_view lowered) : lowered_(lowered) {
+        for (auto&& [next, keyword] : std::views::zip(next_, kCredentialKeywords)) {
+            next = lowered_.find(keyword);
+        }
     }
-    return first;
-}
+
+    // Start of the earliest keyword at or after `from`, or kNotFound.
+    std::size_t at_or_after(std::size_t from) {
+        std::size_t earliest = kNotFound;
+        for (auto&& [next, keyword] : std::views::zip(next_, kCredentialKeywords)) {
+            if (next < from) {
+                next = lowered_.find(keyword, from);
+            }
+            earliest = std::min(earliest, next);
+        }
+        return earliest;
+    }
+
+private:
+    std::string_view lowered_;
+    std::array<std::size_t, kCredentialKeywords.size()> next_{};
+};
 
 // ":=" and "=>" assign; "==" and "===" compare, so they are not assignments.
 std::size_t assignment_operator_size(std::string_view rest) {
@@ -428,8 +448,11 @@ std::optional<Span> quoted_value(std::string_view text, std::size_t open) {
     if (open >= text.size() || !is_in(kQuotes, text.at(open))) {
         return std::nullopt;
     }
-    const std::size_t close = text.find(text.at(open), open + 1);
-    if (close == kNotFound || close > text.find('\n', open + 1)) {
+    // One search stops at the closing quote or at the end of the line, whichever comes first.
+    const std::array<char, 2> stops{text.at(open), '\n'};
+    const std::size_t close =
+        text.find_first_of(std::string_view(stops.data(), stops.size()), open + 1);
+    if (close == kNotFound || text.at(close) == '\n') {
         return std::nullopt;
     }
     const std::string_view value = text.substr(open + 1, close - open - 1);
@@ -453,17 +476,20 @@ std::optional<Span> quoted_assignment_at(std::string_view text, std::size_t keyw
     return quoted_value(text, skip_blanks(text, cursor + operator_size));
 }
 
-// True when only blanks, optionally around "export", precede name_begin on its line.
+std::string_view without_trailing_blanks(std::string_view text) {
+    const std::size_t last = text.find_last_not_of(kBlanks);
+    return text.substr(0, last == kNotFound ? 0 : last + 1);
+}
+
+// True when only blanks, optionally around "export", precede name_begin on its line. Read
+// backwards from the name, so the cost does not grow with the length of the line.
 bool starts_line(std::string_view text, std::size_t name_begin) {
     const std::string_view before = text.substr(0, name_begin);
-    const std::size_t newline = before.rfind('\n');
-    std::string_view lead = newline == kNotFound ? before : before.substr(newline + 1);
-    lead.remove_prefix(run_length(lead, 0, kBlanks));
-    if (!lead.starts_with(kExport)) {
-        return lead.empty();
+    std::string_view lead = without_trailing_blanks(before);
+    if (lead.size() < before.size() && lead.ends_with(kExport)) {
+        lead = without_trailing_blanks(lead.substr(0, lead.size() - kExport.size()));
     }
-    lead.remove_prefix(kExport.size());
-    return !lead.empty() && run_length(lead, 0, kBlanks) == lead.size();
+    return lead.empty() || lead.ends_with('\n');
 }
 
 std::optional<Span> unquoted_value(std::string_view text, std::size_t value_begin) {
@@ -492,15 +518,36 @@ std::optional<Span> env_assignment_at(std::string_view text, std::size_t keyword
 
 using AssignmentParser = std::optional<Span> (*)(std::string_view text, std::size_t keyword);
 
-std::optional<Span> find_assignment(std::string_view text, std::string_view lowered,
-                                    std::size_t from, AssignmentParser parse) {
-    for (std::size_t keyword = next_keyword(lowered, from); keyword != kNotFound;
-         keyword = next_keyword(lowered, keyword + 1)) {
-        if (const auto span = parse(text, keyword)) {
-            return span;
+struct AssignmentRule {
+    AssignmentParser parse = nullptr;
+    // The characters of the name a keyword sits in. The parser's verdict is the same for every
+    // keyword inside one run of them, so a rejected run is skipped whole.
+    std::string_view name_chars;
+};
+
+constexpr std::array kAssignmentRules{
+    AssignmentRule{.parse = quoted_assignment_at, .name_chars = kNameChars},
+    AssignmentRule{.parse = env_assignment_at, .name_chars = kWordChars},
+};
+
+constexpr std::string_view kAssignmentPattern = "credential-assignment";
+
+// Every assignment a rule finds, each search resuming after the previous value; only the first
+// when first_only is set.
+void find_assignments(const AssignmentRule& rule, std::string_view text, KeywordCursor cursor,
+                      bool first_only, std::vector<Match>& found) {
+    std::size_t keyword = cursor.at_or_after(0);
+    while (keyword != kNotFound) {
+        const std::optional<Span> span = rule.parse(text, keyword);
+        if (span.has_value()) {
+            found.push_back(Match{.pattern = kAssignmentPattern, .span = *span});
+            if (first_only) {
+                return;
+            }
         }
+        keyword = cursor.at_or_after(
+            span.has_value() ? span->end : keyword + run_length(text, keyword, rule.name_chars));
     }
-    return std::nullopt;
 }
 
 using Finder = std::optional<Span> (*)(std::string_view text, std::size_t from);
@@ -544,20 +591,14 @@ std::vector<Match> find_all(std::string_view text, bool first_only = false) {
         }
     }
     const std::string lowered = to_lower(text);
-    for (const AssignmentParser parser : {quoted_assignment_at, env_assignment_at}) {
+    const KeywordCursor keywords(lowered);
+    for (const AssignmentRule& rule : kAssignmentRules) {
         if (first_only && std::ranges::any_of(found, [](const Match& match) {
-                return match.pattern == "credential-assignment";
+                return match.pattern == kAssignmentPattern;
             })) {
             break;
         }
-        std::size_t from = 0;
-        while (const auto span = find_assignment(text, lowered, from, parser)) {
-            found.push_back(Match{.pattern = "credential-assignment", .span = *span});
-            if (first_only) {
-                break;
-            }
-            from = span->end;
-        }
+        find_assignments(rule, text, keywords, first_only, found);
     }
     return found;
 }

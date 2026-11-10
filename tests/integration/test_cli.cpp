@@ -2251,3 +2251,50 @@ TEST_CASE("known prompt overhead refuses before waiting for stdin beyond the agg
     CHECK(child.wait() == exit_refused);
     CHECK(server.post_count() == 0);
 }
+
+TEST_CASE("an error keeps its exit code when stderr cannot be written") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    const RunResult result = sandbox.run_with(
+        Launch{.args = {"models", "find", "zzzz-no-such-model"}, .failed_stderr = true});
+    CHECK(result.code == exit_model);
+}
+
+TEST_CASE("auth set and logout finish their work when stderr cannot be written") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    const RunResult stored = sandbox.run_with(Launch{
+        .args = {"auth", "set"}, .stdin_text = inference_key() + "\n", .failed_stderr = true});
+    CHECK(stored.code == exit_ok);
+    CHECK(file_exists(sandbox.api_credential()));
+
+    const RunResult removed =
+        sandbox.run_with(Launch{.args = {"auth", "logout"}, .failed_stderr = true});
+    CHECK(removed.code == exit_ok);
+    CHECK_FALSE(file_exists(sandbox.api_credential()));
+}
+
+// Each printed row is about 56 bytes, so 200 rows pass the stdio buffer of a pipe (4096 or 8192
+// bytes) long before the last lookup; a throwing write there would abandon the rest.
+TEST_CASE("spend --resolve prices every call when stdout is closed") {
+    constexpr int calls = 200;
+    MockServer server;
+    server.set_route("/generation", [](const RecordedRequest&) {
+        return Reply{.status = http_ok,
+                     .body = R"({"data":{"total_cost":0.0123,"provider_name":"MockProvider",)"
+                             R"("model":"test/alpha-1"}})"};
+    });
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    for (int index = 0; index < calls; ++index) {
+        log_unpriced_call(sandbox, std::format("{:032x}", index), std::format("gen-{}", index));
+    }
+
+    const RunResult result =
+        sandbox.run_with(Launch{.args = {"spend", "--resolve"}, .closed_stdout = true});
+
+    CHECK(result.code == exit_ok);
+    CHECK(sandbox.records_of("resolved").size() == static_cast<std::size_t>(calls));
+    CHECK(server.generation_count() == calls);
+    CHECK(server.post_count() == 0);
+}

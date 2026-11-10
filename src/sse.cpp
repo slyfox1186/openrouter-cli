@@ -168,12 +168,12 @@ std::string record_choice(const json& chunk, StreamOutcome& outcome) {
         outcome.error_type = "provider_error";
         outcome.error_message = "provider reported an error";
     }
-    const std::optional<std::string> content = string_member(member(choice, "delta"), "content");
+    std::optional<std::string> content = string_member(member(choice, "delta"), "content");
     if (!content.has_value() || outcome.error_type.has_value()) {
         return {};
     }
     outcome.text.append(*content);
-    return *content;
+    return std::move(*content);
 }
 
 } // namespace

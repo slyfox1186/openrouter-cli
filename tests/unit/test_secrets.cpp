@@ -148,6 +148,58 @@ TEST_CASE("ordinary code near credential names is not detected") {
     CHECK(patterns_in("API_KEY=your_api_key_goes_here").empty());
 }
 
+TEST_CASE("many keywords inside one identifier are accepted or rejected together") {
+    const std::string value = cycle(kAlnumChars, kSecretValue);
+    std::string name;
+    for (int count = 0; count < 200; ++count) {
+        name += "password_secret_";
+    }
+    CHECK(patterns_in(name + "x").empty());
+    CHECK(patterns_in(name + " = \"" + value + "\"") == Patterns{"credential-assignment"});
+    CHECK(patterns_in(name + "=" + value) == Patterns{"credential-assignment"});
+}
+
+TEST_CASE("rejected candidates on a line do not hide a later assignment") {
+    const std::string value = cycle(kAlnumChars, kSecretValue);
+    CHECK(patterns_in("password == \"" + value + "\" || secret = \"" + value + "\"") ==
+          Patterns{"credential-assignment"});
+    std::string short_env;
+    std::string short_quoted;
+    for (int count = 0; count < 200; ++count) {
+        short_env += "secret=x ";
+        short_quoted += "secret='x' ";
+    }
+    CHECK(patterns_in(short_env).empty());
+    CHECK(patterns_in(short_quoted).empty());
+    CHECK(patterns_in(short_quoted + "secret='" + value + "'") ==
+          Patterns{"credential-assignment"});
+    CHECK(patterns_in("secret=" + value + " " + short_env) == Patterns{"credential-assignment"});
+    // An unquoted value counts only on a line that starts with the assignment.
+    CHECK(patterns_in(short_env + "secret=" + value).empty());
+}
+
+TEST_CASE("unquoted assignments need the line start, optionally after export") {
+    const std::string value = cycle(kAlnumChars, kSecretValue);
+    CHECK(patterns_in("\texport  DB_PASSWORD=" + value) == Patterns{"credential-assignment"});
+    CHECK(patterns_in("exported DB_PASSWORD=" + value).empty());
+    CHECK(patterns_in("export export DB_PASSWORD=" + value).empty());
+    CHECK(patterns_in("x export DB_PASSWORD=" + value).empty());
+    CHECK(orcli::sanitize_for_display("note\n  DB_PASSWORD=" + value + "\nend",
+                                      std::string::npos) == "note\n  DB_PASSWORD=[redacted]\nend");
+}
+
+TEST_CASE("every assignment on a line is redacted once, and quotes do not span lines") {
+    const std::string value = cycle(kAlnumChars, kSecretValue);
+    CHECK(orcli::sanitize_for_display("password=\"" + value + "\" secret='" + value + "'",
+                                      std::string::npos) ==
+          "password=\"[redacted]\" secret='[redacted]'");
+    // A keyword inside a value that already matched is not a second candidate.
+    CHECK(orcli::sanitize_for_display("password=\"" + value + "secret=" + value + "\"",
+                                      std::string::npos) == "password=\"[redacted]\"");
+    const std::string split = "password = \"" + value + "\n" + value + "\"";
+    CHECK(orcli::sanitize_for_display(split, std::string::npos) == split);
+}
+
 TEST_CASE("findings carry the source and 1-based line, once per line and pattern") {
     const std::string key = "sk-or-v1-" + cycle(kHexChars, kOpenRouterBody);
     const std::string aws = "AKIA" + cycle(kUpperChars, kAwsBody);

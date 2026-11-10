@@ -67,18 +67,6 @@ int code_of(Exit exit) {
     return exit_code(exit);
 }
 
-// Diagnostics must not interrupt answer persistence or accounting after a paid request.
-template <typename... Args>
-bool diagnostic(std::format_string<Args...> format, Args&&... args) noexcept {
-    try {
-        const std::string text = display_metadata(std::format(format, std::forward<Args>(args)...));
-        return std::fwrite(text.data(), 1, text.size(), stderr) == text.size() &&
-               std::fputc('\n', stderr) != EOF && std::fflush(stderr) == 0;
-    } catch (...) {
-        return false;
-    }
-}
-
 struct AskArgs {
     std::string model;
     std::vector<std::string> files;
@@ -149,7 +137,7 @@ Result<ModelInfo> resolve_or_report(const Config& config, const Catalog& catalog
     }
     auto resolution = resolve(name, catalog.models, *aliases);
     if (resolution.kind == Resolution::Kind::ambiguous) {
-        std::print(stderr, "{}", format_candidates(resolution.candidates));
+        write_stderr(format_candidates(resolution.candidates));
         return fail(Exit::model, std::format("\"{}\" matches {} models; pass one exact id from "
                                              "the list above",
                                              name, resolution.candidates.size()));
@@ -216,7 +204,8 @@ int cmd_models_save(const Config& config, const Http& http, const AliasTarget& t
     if (auto saved = save_alias(config.state_dir, name, target.model_id); !saved) {
         return report(saved.error());
     }
-    std::println("saved alias {} -> {}", display_metadata(name), display_metadata(target.model_id));
+    write_stdout(std::format("saved alias {} -> {}\n", display_metadata(name),
+                             display_metadata(target.model_id)));
     return code_of(Exit::ok);
 }
 
@@ -270,9 +259,8 @@ struct ResolveCandidate {
     std::string generation_id;
 };
 
-std::vector<ResolveCandidate> resolve_candidates(std::string_view log_contents) {
+std::vector<ResolveCandidate> resolve_candidates(const SpendReport& report) {
     std::vector<ResolveCandidate> candidates;
-    const auto report = fold_log({.contents = log_contents, .since_iso = ""});
     for (const auto& call : report.unresolved) {
         if (!call.cost.has_value() && call.generation_id.has_value()) {
             candidates.push_back(ResolveCandidate{
@@ -317,14 +305,15 @@ Result<LookupOutcome> resolve_one(const Http& http, const CostLog& cost_log,
     if (auto logged = cost_log.append(resolved_record(call.call_id, *stats)); !logged) {
         return fail(Exit::persist, "cost log write failed: " + logged.error().message);
     }
-    std::println("{}  {}  ${:g}", display_metadata(call.call_id), display_metadata(call.model),
-                 *stats->total_cost);
+    write_stdout(std::format("{}  {}  ${:g}\n", display_metadata(call.call_id),
+                             display_metadata(call.model), *stats->total_cost));
     return LookupOutcome::resolved;
 }
 
 // Looks up, oldest first, every logged call whose cost is unknown but whose generation id is
 // known. No cap: the lookups are free, and a fixed batch could starve older calls behind ids
-// that never resolve. Each found charge is appended at once, so Ctrl-C loses nothing.
+// that never resolve. Each found charge is appended at once, so Ctrl-C loses nothing, and its
+// line is written without throwing, so a closed stdout cannot stop the remaining lookups.
 int cmd_spend_resolve(const Config& config) {
     const auto contents = read_cost_log(config);
     if (!contents) {
@@ -335,7 +324,7 @@ int cmd_spend_resolve(const Config& config) {
         diagnostic("openrouter-cli: ignored {} corrupt cost-log records",
                    folded.corrupt_lines.size());
     }
-    const auto candidates = resolve_candidates(*contents);
+    const auto candidates = resolve_candidates(folded);
     if (candidates.empty()) {
         std::println("no unresolved calls with a generation id");
         return code_of(Exit::ok);
@@ -369,11 +358,11 @@ int cmd_spend_resolve(const Config& config) {
         }
     }
     if (!still_unknown.empty()) {
-        std::println("no charge yet at OpenRouter: {}",
-                     display_metadata(join(still_unknown, ", ")));
+        write_stdout(std::format("no charge yet at OpenRouter: {}\n",
+                                 display_metadata(join(still_unknown, ", "))));
     }
-    std::println("resolved {}, still unknown {}, failed {}, of {} unresolved calls", resolved,
-                 still_unknown.size(), failed, candidates.size());
+    write_stdout(std::format("resolved {}, still unknown {}, failed {}, of {} unresolved calls\n",
+                             resolved, still_unknown.size(), failed, candidates.size()));
     return failed > 0 ? code_of(Exit::api) : code_of(Exit::ok);
 }
 
@@ -382,7 +371,6 @@ int cmd_spend_resolve(const Config& config) {
 struct Prepared {
     ModelInfo model;
     std::optional<Session> session;
-    std::vector<Message> messages;
     Message user_turn;
     BuiltRequest request;
 };
@@ -405,11 +393,16 @@ Result<std::string> system_text(const AskArgs& args, const Config& config) {
     return text.empty() ? extra : text + "\n\n" + extra;
 }
 
-Result<std::vector<FileSnapshot>> read_files(const AskArgs& args, const Config& config) {
+struct FileLimits {
+    std::size_t per_file = 0;
+    std::size_t total = 0;
+};
+
+Result<std::vector<FileSnapshot>> read_files(const AskArgs& args, const FileLimits& limits) {
     std::vector<FileSnapshot> files;
-    std::size_t remaining = config.max_input_bytes;
+    std::size_t remaining = limits.total;
     for (const auto& path : args.files) {
-        auto snapshot = read_snapshot(fs::path(path), std::min(config.max_file_bytes, remaining));
+        auto snapshot = read_snapshot(fs::path(path), std::min(limits.per_file, remaining));
         if (!snapshot) {
             return std::unexpected(snapshot.error());
         }
@@ -531,6 +524,19 @@ Result<Conversation> prepare_conversation(Prepared& prepared, const AskArgs& arg
     return conversation;
 }
 
+// The query as given, or standard input for "-", read within what is left of the input budget.
+Result<std::string> query_text(const AskArgs& args, std::size_t remaining) {
+    if (args.query != "-") {
+        return args.query;
+    }
+    auto text = read_input(remaining, false);
+    if (!text) {
+        return fail(text.error().code == Exit::usage ? Exit::refused : text.error().code,
+                    text.error().message);
+    }
+    return std::move(*text);
+}
+
 Privacy selected_privacy(const AskArgs& args, const Config& config) {
     if (args.privacy.empty()) {
         return config.privacy;
@@ -540,11 +546,11 @@ Privacy selected_privacy(const AskArgs& args, const Config& config) {
 
 Result<Prepared> prepare(const AskArgs& args, const Config& config, const Http& http) {
     Prepared prepared;
-    const auto conversation = prepare_conversation(prepared, args, config, http);
+    auto conversation = prepare_conversation(prepared, args, config, http);
     if (!conversation) {
         return std::unexpected(conversation.error());
     }
-    const auto& [system, history] = *conversation;
+    auto& [system, history] = *conversation;
 
     std::size_t remaining = config.max_input_bytes;
     const auto consume = [&](std::size_t bytes) {
@@ -562,15 +568,11 @@ Result<Prepared> prepare(const AskArgs& args, const Config& config, const Http& 
             return fail(Exit::refused, "session history exceeds OPENROUTER_CLI_MAX_INPUT_BYTES");
         }
     }
-    std::string query = args.query;
-    if (query == "-") {
-        auto text = read_input(remaining, false);
-        if (!text) {
-            return fail(text.error().code == Exit::usage ? Exit::refused : text.error().code,
-                        text.error().message);
-        }
-        query = std::move(*text);
+    const auto query_read = query_text(args, remaining);
+    if (!query_read) {
+        return std::unexpected(query_read.error());
     }
+    const std::string& query = *query_read;
     if (query.empty()) {
         return fail(Exit::usage, "the query is empty");
     }
@@ -578,9 +580,7 @@ Result<Prepared> prepare(const AskArgs& args, const Config& config, const Http& 
     if (!consume(query.size())) {
         return fail(Exit::refused, "request text exceeds OPENROUTER_CLI_MAX_INPUT_BYTES");
     }
-    Config input_config = config;
-    input_config.max_input_bytes = remaining;
-    auto files = read_files(args, input_config);
+    auto files = read_files(args, {.per_file = config.max_file_bytes, .total = remaining});
     if (!files) {
         return std::unexpected(files.error());
     }
@@ -597,14 +597,20 @@ Result<Prepared> prepare(const AskArgs& args, const Config& config, const Http& 
         return std::unexpected(packed.error());
     }
     prepared.user_turn = Message{.role = "user", .content = user_message(query, *packed)};
+
+    // The checks above were the last readers of the system text and the history, so both move
+    // into the request; only the new turn is copied, because the session commit needs it later.
+    RequestInput input;
+    input.model = &prepared.model;
+    input.messages.reserve(history.size() + 2);
     if (!system.empty()) {
-        prepared.messages.push_back(Message{.role = "system", .content = system});
+        input.messages.push_back(Message{.role = "system", .content = std::move(system)});
     }
-    std::ranges::copy(history, std::back_inserter(prepared.messages));
-    prepared.messages.push_back(prepared.user_turn);
+    std::ranges::move(history, std::back_inserter(input.messages));
+    input.messages.push_back(prepared.user_turn);
 
     std::size_t total = 0;
-    for (const auto& message : prepared.messages) {
+    for (const auto& message : input.messages) {
         total = std::add_sat(total, message.content.size());
     }
     if (total > config.max_input_bytes) {
@@ -613,9 +619,6 @@ Result<Prepared> prepare(const AskArgs& args, const Config& config, const Http& 
                                                total, config.max_input_bytes));
     }
 
-    RequestInput input;
-    input.model = &prepared.model;
-    input.messages = prepared.messages;
     input.effort = args.effort.empty() ? config.default_effort : args.effort;
     input.max_output_tokens =
         args.max_output_tokens > 0 ? args.max_output_tokens : config.max_output_tokens;
@@ -850,7 +853,7 @@ Verdict judge(const StreamRun& run, long long max_tokens) {
         return {
             .outcome = "error",
             .exit = Exit::api,
-            .message = "no data from OpenRouter within the idle timeout "
+            .message = "no data sent or received within the idle timeout "
                        "(OPENROUTER_CLI_IDLE_TIMEOUT_SECONDS)",
         };
     }

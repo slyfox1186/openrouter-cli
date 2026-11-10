@@ -4,8 +4,12 @@
 #include "common.hpp"
 #include "config.hpp"
 #include "credentials.hpp"
+#include "secrets.hpp"
 
+#include <format>
 #include <string>
+#include <string_view>
+#include <utility>
 
 namespace orcli {
 
@@ -16,6 +20,24 @@ namespace orcli {
 // ----- shared helpers (commands.cpp) -------------------------------------------------------
 
 [[nodiscard]] int exit_code(Exit exit);
+
+// Write and flush; false when either failed. They never throw, so a closed or full stream
+// cannot replace an exit code or stop the work that follows a message.
+bool write_stdout(std::string_view text) noexcept;
+bool write_stderr(std::string_view text) noexcept;
+
+// One stderr line with terminal controls neutralized, which includes newlines: multi-line text
+// goes through write_stderr instead.
+template <typename... Args>
+bool diagnostic(std::format_string<Args...> format, Args&&... args) noexcept {
+    try {
+        std::string line = display_metadata(std::format(format, std::forward<Args>(args)...));
+        line.push_back('\n');
+        return write_stderr(line);
+    } catch (...) {
+        return false;
+    }
+}
 
 // Prints "openrouter-cli: <message>" to stderr and returns the error's exit code.
 int report(const Error& error);

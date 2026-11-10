@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -80,6 +81,40 @@ struct StreamResult {
     std::string transport_error; // curl error text, empty when the transfer completed
 };
 
+// Idle detection for a streamed call. Activity is a received byte or an advance of the upload
+// total, so a large request on a slow link is not mistaken for a silent server; an upload that
+// stops advancing still becomes idle.
+class ActivityClock {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    ActivityClock(Clock::time_point start, Clock::duration limit) : last_(start), limit_(limit) {}
+
+    void received(Clock::time_point now) { last_ = now; }
+
+    // `total` is the count of request bytes sent so far.
+    void uploaded(std::int64_t total, Clock::time_point now) {
+        if (total > uploaded_) {
+            uploaded_ = total;
+            last_ = now;
+        }
+    }
+
+    [[nodiscard]] bool idle(Clock::time_point now) const { return now - last_ > limit_; }
+
+private:
+    Clock::time_point last_;
+    Clock::duration limit_;
+    std::int64_t uploaded_ = 0;
+};
+
+// Closes a libcurl easy handle. Defined in http.cpp, so this header needs no libcurl include.
+struct CurlHandleDeleter {
+    void operator()(void* handle) const noexcept;
+};
+
+// One client keeps one libcurl handle, so its GET requests share a connection and TLS session
+// instead of paying a handshake each. It serves one request at a time.
 class Http {
 public:
     Http(const Config& config, HttpKeys keys);
@@ -96,14 +131,15 @@ public:
                                           const GetOptions& options) const;
 
     // POST base_url + path with a JSON body and the inference key, streaming the response.
-    // Never retried. Applies the idle timeout (time since the last received byte) and the total
-    // timeout.
+    // Never retried, by this class or by libcurl: it always opens its own connection and sends
+    // no Expect header. Applies the idle timeout (time since the last byte sent or received)
+    // and the total timeout.
     [[nodiscard]] StreamResult post_stream(std::string_view path, const std::string& body,
                                            const StreamHandlers& handlers) const;
 
-    // POST base_url + path with a JSON body, reading a bounded JSON response. Never retried:
-    // the PKCE exchange code is single-use. Returns the body for 2xx; Exit::api otherwise, with
-    // only a sanitized, length-bounded error message.
+    // POST base_url + path with a JSON body, reading a bounded JSON response. Never retried,
+    // under the same rules as post_stream: the PKCE exchange code is single-use. Returns the
+    // body for 2xx; Exit::api otherwise, with only a sanitized, length-bounded error message.
     [[nodiscard]] Result<std::string> post_json(std::string_view path, const std::string& body,
                                                 Auth auth) const;
 
@@ -112,6 +148,7 @@ private:
 
     std::reference_wrapper<const Config> config_;
     HttpKeys keys_;
+    std::unique_ptr<void, CurlHandleDeleter> handle_;
 };
 
 } // namespace orcli
