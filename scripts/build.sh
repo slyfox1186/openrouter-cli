@@ -412,7 +412,7 @@ linkage_check() {
         [[ "$line" == *'(NEEDED)'* ]] || continue
         needed="${line#*[}"; needed="${needed%%]*}"
         case "$needed" in
-        libssl.so.3|libcrypto.so.3|libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*|ld-linux*.so.*) ;;
+        libssl.so.[34]|libcrypto.so.[34]|libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*|ld-linux*.so.*) ;;
         *) echo "unexpected direct shared dependency: $needed"; return 1 ;;
         esac
     done <<< "$dynamic"
@@ -427,8 +427,8 @@ linkage_check() {
         [[ -n "$line" ]] || continue
         entry="${line%%[[:space:]]*}"
         case "${entry##*/}" in
-        libssl.so.3) expected="${selected[0]}"; ssl=1 ;;
-        libcrypto.so.3) expected="${selected[1]}"; crypto=1 ;;
+        libssl.so.[34]) expected="${selected[0]}"; ssl=1 ;;
+        libcrypto.so.[34]) expected="${selected[1]}"; crypto=1 ;;
         linux-vdso.so.*|libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*|ld-linux*.so.*) continue ;;
         *)
             # System OpenSSL may itself depend on distro-provided compression libraries.
@@ -443,7 +443,7 @@ linkage_check() {
             echo "$entry does not resolve to the selected system library"; return 1;
         }
     done <<< "$deps"
-    [[ "$ssl" == 1 && "$crypto" == 1 ]] || { echo "shared OpenSSL 3 is missing"; return 1; }
+    [[ "$ssl" == 1 && "$crypto" == 1 ]] || { echo "shared OpenSSL 3 or 4 is missing"; return 1; }
     "$BINARY" --version
 }
 

@@ -41,6 +41,12 @@ target_compile_definitions(integration_tests PRIVATE
 add_dependencies(integration_tests openrouter-cli)
 add_test(NAME integration COMMAND integration_tests --no-colors=true)
 
+# Release builds compile orcli_core and orcli_help to LTO bitcode. lld reads it from any link;
+# GNU ld, used when lld is missing, reads it only from an LTO link.
+if(ORCLI_IPO_SUPPORTED)
+    set_property(TARGET unit_tests integration_tests PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+endif()
+
 find_program(ORCLI_BASH bash REQUIRED)
 add_test(NAME installer COMMAND "${ORCLI_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/shell/test_build.sh")
 add_test(NAME download_headers COMMAND "${CMAKE_COMMAND}"

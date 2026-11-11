@@ -4,12 +4,30 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 
 namespace orcli {
+
+// P4052R0 renamed C++26 std::add_sat to std::saturating_add and set the feature-test macro to
+// 202603L. libstdc++ 16 (Arch) ships only the new name and libstdc++ 15 (Ubuntu 26.04) only the
+// old one; the requires-clause keeps the standard's integer-only constraint.
+#if __cpp_lib_saturation_arithmetic >= 202603L
+template <class T>
+    requires requires(T value) { std::saturating_add(value, value); }
+constexpr T saturating_add(T left, T right) noexcept {
+    return std::saturating_add(left, right);
+}
+#else
+template <class T>
+    requires requires(T value) { std::add_sat(value, value); }
+constexpr T saturating_add(T left, T right) noexcept {
+    return std::add_sat(left, right);
+}
+#endif
 
 // The same recovery identifier is accepted from headers, stream chunks and stored records.
 inline bool valid_generation_id(std::string_view value) {

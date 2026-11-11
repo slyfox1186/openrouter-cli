@@ -16,7 +16,6 @@
 #include <format>
 #include <map>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <ranges>
 #include <sstream>
@@ -356,10 +355,10 @@ int clamp_days(int days) {
 }
 
 void add_into(ActivityRow& total, const ActivityRow& row) {
-    total.requests = std::add_sat(total.requests, row.requests);
-    total.prompt_tokens = std::add_sat(total.prompt_tokens, row.prompt_tokens);
-    total.completion_tokens = std::add_sat(total.completion_tokens, row.completion_tokens);
-    total.reasoning_tokens = std::add_sat(total.reasoning_tokens, row.reasoning_tokens);
+    total.requests = orcli::saturating_add(total.requests, row.requests);
+    total.prompt_tokens = orcli::saturating_add(total.prompt_tokens, row.prompt_tokens);
+    total.completion_tokens = orcli::saturating_add(total.completion_tokens, row.completion_tokens);
+    total.reasoning_tokens = orcli::saturating_add(total.reasoning_tokens, row.reasoning_tokens);
     total.usage += row.usage;
 }
 

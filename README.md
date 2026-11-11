@@ -54,7 +54,7 @@ You will need:
 - [ ] A **Linux** computer with a 64-bit Intel or AMD processor (*x86-64*) and the standard GNU C library (*glibc*). Ubuntu, Debian, Fedora and Arch all use glibc.
 - [ ] **systemd 256 or newer**, which is what encrypts your key. Type `systemctl --version` to see yours.
 - [ ] An **OpenRouter account** from [openrouter.ai](https://openrouter.ai). Paid questions need credits on that account.
-- [ ] These build tools: **git**, **Clang** with C++26 support, **CMake 4.0 or newer**, **Ninja**, the **OpenSSL 3** development files, the static C++ runtime library and **binutils**.
+- [ ] These build tools: **git**, **Clang** with C++26 support, **CMake 4.0 or newer**, **Ninja**, the **OpenSSL 3 or 4** development files, the static C++ runtime library and **binutils**.
 - [ ] An internet connection the first time you build. The build downloads a few libraries from GitHub, pinned to exact versions and checked against known fingerprints (SHA-256).
 
 On **Ubuntu 26.04**, this command installs the build tools:
@@ -545,11 +545,11 @@ Help text and the sign-in steps use your terminal's colors. Set `NO_COLOR` to an
 
 `openrouter-cli` is written in C++26 and builds with Clang only. Configuration checks that your compiler and standard library have the C++26 features the code uses (including `std::expected`, `std::print`, `std::format`, `std::flat_map`, `std::ranges::to`, `std::views::enumerate`, saturation arithmetic and `std::jthread`) before anything is downloaded. Building also needs Bash, GNU coreutils, `find`, `sort`, `readelf` and `ldd`.
 
-Release builds produce portable x86-64 code. For code tuned to your own processor, set the CMake option `ORCLI_NATIVE=ON`. Link-time optimization is used when the toolchain supports it. libcurl's threaded DNS resolver is kept on. libcurl and the C++ runtime are linked in statically, while OpenSSL 3 and glibc come from your system; static OpenSSL is not supported. The build refuses binaries with an embedded RPATH or RUNPATH and checks that the system's normal library loader finds the right OpenSSL.
+Release builds produce portable x86-64 code. For code tuned to your own processor, set the CMake option `ORCLI_NATIVE=ON`. Link-time optimization is used when the toolchain supports it. libcurl's threaded DNS resolver is kept on. libcurl and the C++ runtime are linked in statically, while OpenSSL 3 or 4 and glibc come from your system; static OpenSSL is not supported. The build refuses binaries with an embedded RPATH or RUNPATH and checks that the system's normal library loader finds the right OpenSSL.
 
 At run time, the commands that use a key also need `systemd-creds` on your `PATH` and a working systemd user credential service. A recent systemd version alone does not guarantee that, for example inside a container.
 
-Development used Clang 23.1.5 with GCC 15's libstdc++ on Ubuntu Linux and systemd 259. These are known working versions, not minimum requirements.
+Development used Clang 23.1.5 with GCC 15's libstdc++ and OpenSSL 3.5 on Ubuntu Linux and systemd 259. It also builds and passes its tests with Clang 23.1.4, GCC 16's libstdc++ and OpenSSL 4.1 on Arch Linux. These are known working versions, not minimum requirements.
 
 **For contributors.** `scripts/build.sh --check --no-install` runs every check without installing.
 

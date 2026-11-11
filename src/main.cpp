@@ -32,7 +32,6 @@
 #include <format>
 #include <iterator>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <print>
 #include <span>
@@ -641,7 +640,7 @@ Result<Prepared> prepare(const AskArgs& args, const Config& config, const Http& 
 
     std::size_t total = 0;
     for (const auto& message : input.messages) {
-        total = std::add_sat(total, message.content.size());
+        total = orcli::saturating_add(total, message.content.size());
     }
     if (total > config.max_input_bytes) {
         return fail(Exit::refused, std::format("the request text is {} bytes, over the {} byte "

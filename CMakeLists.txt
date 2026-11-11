@@ -62,8 +62,14 @@ check_cxx_source_compiles([[
         std::move_only_function<int()> function = [] { return 1; };
         std::jthread worker([] {});
         const std::span<const int> view{values};
-        std::println("{}", std::format("{}", std::add_sat(function(), view.front())));
-        return std::mul_sat(0, table[1]);
+        std::println("{}", std::format("{}", function() + view.front()));
+    #if __cpp_lib_saturation_arithmetic >= 202603L
+        return std::saturating_add(0, table[1]);
+    #elif defined(__cpp_lib_saturation_arithmetic)
+        return std::add_sat(0, table[1]);
+    #else
+    #error "saturation arithmetic is required"
+    #endif
     }
 ]] ORCLI_HAS_REQUIRED_CXX26)
 if(NOT ORCLI_HAS_REQUIRED_CXX26)
@@ -72,10 +78,10 @@ endif()
 
 set(CMAKE_SKIP_RPATH TRUE)
 set(OPENSSL_USE_STATIC_LIBS FALSE)
-find_package(OpenSSL 3 REQUIRED COMPONENTS SSL Crypto)
+find_package(OpenSSL 3...<5 REQUIRED COMPONENTS SSL Crypto)
 foreach(_library IN ITEMS OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
     if(NOT "${${_library}}" MATCHES "\\.so(\\.[0-9]+)*$")
-        message(FATAL_ERROR "Shared system OpenSSL is required, but ${_library} resolved to '${${_library}}' in '${CMAKE_BINARY_DIR}'. For an existing build directory, rerun the same scripts/build.sh command with --fresh added. If that does not help, install the shared OpenSSL 3 development libraries and check the OpenSSL search paths.")
+        message(FATAL_ERROR "Shared system OpenSSL is required, but ${_library} resolved to '${${_library}}' in '${CMAKE_BINARY_DIR}'. For an existing build directory, rerun the same scripts/build.sh command with --fresh added. If that does not help, install the shared OpenSSL 3 or 4 development libraries and check the OpenSSL search paths.")
     endif()
 endforeach()
 find_package(Threads REQUIRED)
