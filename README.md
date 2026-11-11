@@ -43,7 +43,6 @@ Here is what you can expect from it:
 - You can see a model's prices **before you spend a cent**. Searching for models and checking prices is ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square).
 - Your OpenRouter key is stored ***encrypted***. The program has no way to save it as plain text.
 - Every answer is saved to a file on your computer, and every charge goes into a local cost log.
-- Before anything leaves your computer, the program looks for passwords and keys in what you are sending and refuses to send them.
 - Follow-up questions can continue the same conversation.
 - Private routing is on by default. How long a request may be kept depends on your OpenRouter privacy settings and the provider's policy ([details](#privacy-and-safety)).
 
@@ -300,7 +299,7 @@ openrouter-cli account activity --days 7
 
 **Your key is encrypted.** It is stored with [systemd-creds](https://www.freedesktop.org/software/systemd/man/latest/systemd-creds.html), which locks it to *your user account on this computer*. A copy on another computer will not open, so sign in separately on each computer. If encryption is not available (some containers, for example), the program stops with an error rather than saving your key unprotected.
 
-**It checks what you send.** Before sending anything, it scans your question, your extra instructions, the conversation history and every attached file for known kinds of passwords and keys. It also refuses files known to hold credentials. When it finds one, **nothing is sent and nothing is charged**. The scan can miss unusual formats and can sometimes flag harmless text, so *please still look at what you send*.
+**It sends what you give it.** Your question, your extra instructions, the conversation history and every attached file go to OpenRouter exactly as they are. Nothing is scanned for passwords or keys, and files such as `.env` are attached like any other file, so *look at what you send*.
 
 **Private routing is on by default.** The default setting, `--privacy zdr`, only uses providers that do not train on your data and are listed as *zero data retention* (ZDR). Your OpenRouter privacy settings may also allow *Safety Retention* providers, which may keep requests. What is kept in the end depends on those settings and on each provider's policy. Read [OpenRouter's privacy guide](https://openrouter.ai/docs/guides/features/zdr) before sending sensitive material. If a model has no zero-retention provider, `--privacy no-training` lets you use it, but that provider may keep your request.
 
@@ -333,7 +332,7 @@ When a command fails, it prints a short message and ends with an *exit code*. Yo
 | **0** | It worked. | Nothing. |
 | **1** | Something unexpected went wrong inside the program. | Read the message. Report it if it repeats. |
 | **2** | The command was typed wrong. | Check `openrouter-cli --help`. Remember: options first, question last. |
-| **3** | Stopped before sending. A key or password was found, the input was too big, the session was busy, or the cost log could not be written. ![Nothing was sent or charged](https://img.shields.io/badge/Nothing%20was%20sent%20or%20charged-1a7f37?style=flat-square) | Remove the flagged text, send less, or wait for the other question in that session to finish. |
+| **3** | Stopped before sending. The input was too big, the session was busy, or the cost log could not be written. ![Nothing was sent or charged](https://img.shields.io/badge/Nothing%20was%20sent%20or%20charged-1a7f37?style=flat-square) | Send less, or wait for the other question in that session to finish. |
 | **4** | The model name was not found, or it matched more than one model. | Pick one of the printed choices, or use the exact ID. |
 | **5** | OpenRouter or the network had a problem, the key was rejected, or no provider matched your model, provider and privacy choices. | Read the message. For "no provider", check the tags with `show`. Trying again is another paid question. |
 | **6** | The answer was cut short, for example because it ran out of room. | Any partial answer is kept in the answer file named in the message, unless the message says saving failed. When it ran out of room, the message says how much went to thinking and to the answer when OpenRouter reports those counts, and whether a higher `--max-output-tokens` can help or only a lower `-e` or less input. Trying again is another paid question. |

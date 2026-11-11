@@ -4,9 +4,9 @@
 #include "common.hpp"
 #include "config.hpp"
 #include "credentials.hpp"
+#include "display.hpp"
 #include "fsutil.hpp"
 #include "http.hpp"
-#include "secrets.hpp"
 #include "terminal.hpp"
 
 #include <cstddef>

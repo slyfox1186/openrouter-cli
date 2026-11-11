@@ -163,19 +163,20 @@ TEST_CASE("read_snapshot refuses directories and missing files") {
     CHECK(missing.error().code == orcli::Exit::usage);
 }
 
-TEST_CASE("read_snapshot refuses credential files by resolved path") {
+TEST_CASE("read_snapshot reads credential-named files like any other file") {
     const TempDir dir;
-    write_file(dir.path() / ".env", "OPENROUTER_API_KEY=SENTINEL\n");
+    const std::string text = "OPENROUTER_API_KEY=SENTINEL\n";
+    write_file(dir.path() / ".env", text);
     fs::create_symlink(dir.path() / ".env", dir.path() / "notes.txt");
     const auto linked = orcli::read_snapshot(dir.path() / "notes.txt", kLimit);
-    REQUIRE_FALSE(linked.has_value());
-    CHECK(linked.error().code == orcli::Exit::refused);
-    CHECK_FALSE(linked.error().message.contains("SENTINEL"));
+    REQUIRE(linked.has_value());
+    CHECK(linked->content == text);
     const auto direct = orcli::read_snapshot(dir.path() / ".env", kLimit);
-    REQUIRE_FALSE(direct.has_value());
-    CHECK(direct.error().code == orcli::Exit::refused);
-    write_file(dir.path() / ".env.example", "OPENROUTER_API_KEY=\n");
-    CHECK(orcli::read_snapshot(dir.path() / ".env.example", kLimit).has_value());
+    REQUIRE(direct.has_value());
+    CHECK(direct->content == text);
+    fs::create_directory(dir.path() / ".ssh");
+    write_file(dir.path() / ".ssh/id_ed25519", text);
+    CHECK(orcli::read_snapshot(dir.path() / ".ssh/id_ed25519", kLimit).has_value());
 }
 
 TEST_CASE("bounded packing counts framing and line number overhead") {

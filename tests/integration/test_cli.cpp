@@ -937,20 +937,23 @@ TEST_CASE("show prints the output budget a call sends by default") {
     CHECK(server.last_post().at("max_tokens").get<long long>() == configured_budget);
 }
 
-TEST_CASE("a secret in an attached file stops the call before anything is sent") {
+TEST_CASE("attached files holding key-shaped values are sent unchanged") {
     MockServer server;
     Sandbox sandbox(server.port());
     sandbox.store_api_key();
     const fs::path notes = sandbox.work() / "notes.txt";
     write_text(notes, "first line\nkey " + mock::fake_api_key() + "\n");
+    const fs::path env = sandbox.work() / ".env";
+    write_text(env, "PASSWORD=" + mock::fake_key('5') + "\n");
 
-    const RunResult result = sandbox.run({"-m", std::string(alpha), "-f", notes.string(), "q"});
+    const RunResult result =
+        sandbox.run({"-m", std::string(alpha), "-f", notes.string(), "-f", env.string(), "q"});
 
-    CHECK(result.code == exit_refused);
-    CHECK(result.err.contains("notes.txt:2"));
-    CHECK_FALSE(result.err.contains(mock::fake_api_key()));
-    CHECK(server.post_count() == 0);
-    CHECK(sandbox.records_of("pending").empty());
+    CHECK(result.code == exit_ok);
+    CHECK(server.post_count() == 1);
+    const std::string sent = server.last_post().at("messages").dump();
+    CHECK(sent.contains(mock::fake_api_key()));
+    CHECK(sent.contains("PASSWORD=" + mock::fake_key('5')));
 }
 
 TEST_CASE("a cost log that cannot be written stops the call before anything is sent") {
@@ -2526,23 +2529,23 @@ TEST_CASE("status neutralizes terminal controls in provider metadata") {
     CHECK_FALSE(result.out.contains("\nspoof"));
 }
 
-TEST_CASE("every stored user and assistant history message is scanned before resending") {
+TEST_CASE("stored user and assistant history holding a key-shaped value is resent unchanged") {
     for (const std::size_t index : {std::size_t{0}, std::size_t{1}}) {
         MockServer server;
         Sandbox sandbox(server.port());
         sandbox.store_api_key();
-        REQUIRE(
-            sandbox.run({"--session", "secret-history", "-m", std::string(alpha), "first"}).code ==
-            exit_ok);
-        const auto path = sandbox.state_dir() / "sessions/secret-history.json";
+        REQUIRE(sandbox.run({"--session", "key-history", "-m", std::string(alpha), "first"}).code ==
+                exit_ok);
+        const auto path = sandbox.state_dir() / "sessions/key-history.json";
         auto session = json::parse(read_text(path));
         session["history"][index]["content"] = mock::fake_key('7');
         write_text(path, session.dump());
-        const auto result = sandbox.run({"--session", "secret-history", "second"});
-        CHECK(result.code == exit_refused);
-        CHECK(result.err.contains("session history"));
-        CHECK_FALSE(result.all().contains(mock::fake_key('7')));
-        CHECK(server.post_count() == 1);
+        const auto result = sandbox.run({"--session", "key-history", "second"});
+        CHECK(result.code == exit_ok);
+        CHECK(server.post_count() == 2);
+        const json sent = server.last_post().at("messages");
+        REQUIRE(sent.size() > index);
+        CHECK(text_at(sent.at(index), "content") == mock::fake_key('7'));
     }
 }
 

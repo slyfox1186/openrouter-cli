@@ -5,13 +5,13 @@
 #include "context.hpp"
 #include "costlog.hpp"
 #include "credentials.hpp"
+#include "display.hpp"
 #include "fsutil.hpp"
 #include "help.hpp"
 #include "http.hpp"
 #include "models.hpp"
 #include "progress.hpp"
 #include "request.hpp"
-#include "secrets.hpp"
 #include "session.hpp"
 #include "sse.hpp"
 #include "terminal.hpp"
@@ -441,35 +441,6 @@ Result<std::vector<FileSnapshot>> read_files(const AskArgs& args, const FileLimi
     return files;
 }
 
-struct PromptText {
-    std::string_view query;
-    std::string_view system;
-};
-
-Result<void> refuse_secrets(const std::vector<Message>& messages,
-                            const std::vector<FileSnapshot>& files, const PromptText& prompt) {
-    std::vector<SecretFinding> findings =
-        scan_text({.text = prompt.system, .source = "system text"});
-    std::ranges::move(scan_text({.text = prompt.query, .source = "query"}),
-                      std::back_inserter(findings));
-    for (const auto& message : messages) {
-        std::ranges::move(scan_text({.text = message.content, .source = "session history"}),
-                          std::back_inserter(findings));
-    }
-    for (const auto& file : files) {
-        std::ranges::move(scan_text({.text = file.content, .source = file.display_path}),
-                          std::back_inserter(findings));
-    }
-    if (findings.empty()) {
-        return {};
-    }
-    for (const auto& finding : findings) {
-        diagnostic("openrouter-cli: possible secret in {}:{} ({})", finding.source, finding.line,
-                   finding.pattern);
-    }
-    return fail(Exit::refused, "nothing was sent; remove or replace the values above and retry");
-}
-
 Result<ModelInfo> session_model(const Config& config, const Http& http, const AskArgs& args,
                                 const SessionData& data) {
     auto catalog = catalog_for(config, http, false);
@@ -612,9 +583,6 @@ Result<Prepared> prepare(const AskArgs& args, const Config& config, const Http& 
     auto files = read_files(args, {.per_file = config.max_file_bytes, .total = remaining});
     if (!files) {
         return std::unexpected(files.error());
-    }
-    if (auto clean = refuse_secrets(history, *files, {.query = query, .system = system}); !clean) {
-        return std::unexpected(clean.error());
     }
 
     constexpr std::size_t separator_bytes = 2;

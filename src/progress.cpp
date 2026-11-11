@@ -1,6 +1,6 @@
 #include "progress.hpp"
 
-#include "secrets.hpp"
+#include "display.hpp"
 
 #include <chrono>
 #include <cstddef>

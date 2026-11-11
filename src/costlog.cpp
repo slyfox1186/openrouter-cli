@@ -2,8 +2,8 @@
 
 #include "account.hpp"
 #include "common.hpp"
+#include "display.hpp"
 #include "fsutil.hpp"
-#include "secrets.hpp"
 
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>

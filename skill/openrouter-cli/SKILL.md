@@ -84,8 +84,8 @@ openrouter-cli -m google/gemini-4-argon --role review -f src/http.cpp -f src/htt
   needs: the user's goal, constraints, acceptance criteria, the plan or code, relevant excerpts of
   docs, and checks already run with their results.
 - Never send secrets, `.env` files, credentials or private data unrelated to the question. The
-  CLI refuses known secret formats and credential files (exit `3`, nothing sent), but it cannot
-  catch everything; choosing safe context is your job.
+  CLI sends text and files exactly as given and checks none of them for secrets; choosing safe
+  context is your job.
 
 ## Roles and options
 
@@ -141,7 +141,7 @@ the `openrouter-cli:` lines.
 | `0` | Success | Judge the answer (below) and report the cost line. |
 | `1` | Internal error | Report the message to the user. |
 | `2` | Usage error | Fix the command; `openrouter-cli --help`. |
-| `3` | Refused before sending: secret found, input too large, session busy, credential file, cost log not writable | Nothing was sent or billed. Remove the flagged content, shrink the input, wait until the other call on that session ends, or report the cost log problem. |
+| `3` | Refused before sending: input too large, session busy, cost log not writable | Nothing was sent or billed. Shrink the input, wait until the other call on that session ends, or report the cost log problem. |
 | `4` | Unknown or ambiguous model | Choose from the printed candidates or ask the user. |
 | `5` | API or network failure, rejected key, or no endpoint matching the model, providers and privacy | Report the message. For no endpoint, check tags with `show`. A retry is another billed call; ask first. |
 | `6` | Incomplete answer (output limit reached, stream ended early, content filter) | The partial answer is in the answer file and the session is unchanged. For an output limit the message gives the reasoning and answer token counts when usage allows, and says whether a higher `--max-output-tokens` can help. Retry as it advises only after telling the user it costs another call. |

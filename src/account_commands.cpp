@@ -5,8 +5,8 @@
 #include "config.hpp"
 #include "costlog.hpp"
 #include "credentials.hpp"
+#include "display.hpp"
 #include "http.hpp"
-#include "secrets.hpp"
 
 #include <algorithm>
 #include <chrono>

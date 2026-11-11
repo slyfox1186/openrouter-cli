@@ -4,7 +4,7 @@
 #include "common.hpp"
 #include "config.hpp"
 #include "credentials.hpp"
-#include "secrets.hpp"
+#include "display.hpp"
 
 #include <format>
 #include <string>

@@ -17,8 +17,8 @@ struct FileSnapshot {
     std::string content;
 };
 
-// Reads a file once. Exit::refused when the resolved path is not a regular file, is a
-// credential file, holds a NUL byte in its first 8 KiB, or exceeds max_bytes.
+// Reads a file once. Exit::refused when the resolved path is not a regular file, holds a NUL
+// byte in its first 8 KiB, or exceeds max_bytes.
 Result<FileSnapshot> read_snapshot(const std::filesystem::path& path, std::size_t max_bytes);
 
 // Shortest backtick fence (at least three) longer than any backtick run in content.

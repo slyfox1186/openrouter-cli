@@ -2,7 +2,6 @@
 
 #include "common.hpp"
 #include "fsutil.hpp"
-#include "secrets.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -58,10 +57,6 @@ Result<FileSnapshot> read_snapshot(const std::filesystem::path& path, std::size_
     }
     if (!fs::is_regular_file(resolved, error)) {
         return fail(Exit::refused, std::format("{} is not a regular file", shown));
-    }
-    if (const auto reason = credential_path_reason(resolved)) {
-        return fail(Exit::refused, std::format("{} is not sent: {} is a credential path ({})",
-                                               shown, resolved.string(), *reason));
     }
     const auto size = fs::file_size(resolved, error);
     if (error) {

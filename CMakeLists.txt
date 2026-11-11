@@ -203,12 +203,12 @@ add_library(orcli_core STATIC
     src/credentials.cpp
     src/context.cpp
     src/costlog.cpp
+    src/display.cpp
     src/fsutil.cpp
     src/http.cpp
     src/models.cpp
     src/progress.cpp
     src/request.cpp
-    src/secrets.cpp
     src/session.cpp
     src/sse.cpp)
 target_include_directories(orcli_core PUBLIC src)

@@ -1,7 +1,7 @@
 #include "account.hpp"
 
 #include "common.hpp"
-#include "secrets.hpp"
+#include "display.hpp"
 
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
