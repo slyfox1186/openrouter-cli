@@ -12,6 +12,7 @@ check_pie_supported()
 
 option(ORCLI_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(ORCLI_NATIVE "Optimize release builds for the CPU of the building machine" ON)
+option(ORCLI_WERROR "Treat warnings in first-party code as errors" OFF)
 include(CTest)
 include(FetchContent)
 
@@ -173,6 +174,12 @@ FetchContent_MakeAvailable(curl)
 
 set(BUILD_TESTING ${_orcli_build_testing})
 
+# Every target created from here on is first-party; the dependencies above already exist, so
+# they never get it. OpenSSF: blanket -Werror belongs in development builds (scripts/build.sh
+# --check turns it on), not in builds from source, where a newer compiler's new warning would
+# stop the build.
+set(CMAKE_COMPILE_WARNING_AS_ERROR ${ORCLI_WERROR})
+
 # ---------------------------------------------------------------------------------------------
 # Code generation: OpenSSF "Compiler Options Hardening Guide for C and C++" (TL;DR set, plus the
 # x86_64 and production-code additions), frame pointers and -fno-plt as in the Arch and Ubuntu
@@ -198,11 +205,11 @@ set(ORCLI_CODEGEN_FLAGS
 # ends several structs in [1] arrays that it allocates past (lib/headers.h, lib/hash.h).
 target_compile_options(libcurl_static PRIVATE ${ORCLI_CODEGEN_FLAGS} -fexceptions)
 
-# First-party code also gets warnings as errors, strict flexible arrays and libstdc++ assertions.
+# First-party code also gets warnings, strict flexible arrays and libstdc++ assertions.
 add_library(orcli_flags INTERFACE)
 target_compile_options(orcli_flags INTERFACE
     -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat -Wformat=2
-    -Wimplicit-fallthrough -Werror=format-security -Werror
+    -Wimplicit-fallthrough -Werror=format-security
     -fstrict-flex-arrays=3 ${ORCLI_CODEGEN_FLAGS})
 target_compile_definitions(orcli_flags INTERFACE _GLIBCXX_ASSERTIONS)
 target_link_options(orcli_flags INTERFACE

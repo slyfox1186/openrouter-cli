@@ -62,10 +62,11 @@ printf '#!/bin/sh\n' > "$tools/ccache" && chmod +x "$tools/ccache"
 printf '#!/bin/sh\n' > "$tools/clang-99" && chmod +x "$tools/clang-99"
 ln -s ../ccache "$tools/wrappers/clang"
 saved_path="$PATH"
-LINKER_TYPE=DEFAULT FRESH=0
+LINKER_TYPE=DEFAULT FRESH=0 CHECK=0
 PORTABLE=0 CC_PATH="$tools/clang-99" CXX_PATH="$tools/wrappers/clang"
 PATH="$tools:$saved_path" set_common_args
 check 'native code by default' has_arg -DORCLI_NATIVE=ON
+check 'warnings do not fail a normal build' has_arg -DORCLI_WERROR=OFF
 check 'unwrapped compiler gets ccache' has_arg "-DCMAKE_C_COMPILER_LAUNCHER=$tools/ccache"
 check 'ccache wrapper is not wrapped again' has_arg -DCMAKE_CXX_COMPILER_LAUNCHER=
 PORTABLE=1
@@ -74,6 +75,11 @@ set_common_args
 check 'portable turns native off' has_arg -DORCLI_NATIVE=OFF
 check 'no ccache leaves the launcher empty' has_arg -DCMAKE_C_COMPILER_LAUNCHER=
 check 'fresh is off unless asked' reject has_arg --fresh
+CHECK=1
+set_common_args
+check 'check builds treat warnings as errors' has_arg -DORCLI_WERROR=ON
+check 'check builds pass one warning setting' reject has_arg -DORCLI_WERROR=OFF
+CHECK=0
 unset -f find_tool has_arg
 source "$SOURCE_ROOT/scripts/build.sh"
 
@@ -135,6 +141,18 @@ check 'failed primary skill link stops secondary link' test ! -L "$HOME/.claude/
 check 'real skill directory protected on uninstall' reject uninstall
 check 'real skill contents retained' test -f "$HOME/.agents/skills/openrouter-cli/SKILL.md"
 
+# The warning note counts compiler diagnostics only, colored or not.
+note_for() { LOG="$SCRATCH/note.log"; printf '%b' "$1" > "$LOG"; warning_note; }
+check 'compiler warning noted' test "$(note_for 'src/a.cpp:1:2: warning: x\n')" != ''
+check 'warnings counted' test "$(note_for 'a.cpp:1:2: warning: x\nb.c:3:4: warning: y\n')" = \
+    "note: 2 compiler warnings in this build (see the log); --check fails on warnings in this project's own code"
+check 'colored compiler warning noted' \
+    test "$(note_for '\e[1msrc/a.cpp:1:2: \e[0;1;35mwarning: \e[0mx\n')" != ''
+check 'driver warning not counted' test "$(note_for 'clang++: warning: argument unused\n')" = ''
+check 'linker warning not counted' test "$(note_for 'ld.lld: warning: x\n')" = ''
+check 'clean log gives no note' test "$(note_for 'compiling\n')" = ''
+unset -f note_for
+
 LOG=/dev/full
 check 'logging failure reported' reject run_logged printf 'cannot log this\n'
 LOG="$SCRATCH/check.log"
@@ -186,5 +204,13 @@ check 'install still was not called' test ! -e "$install_marker"
 run_checks() { printf 'checks passed\n'; }
 check 'passing checks reach installation' complete_run
 check 'installation observation works' test -f "$install_marker"
+
+run_checks() { printf 'src/a.cpp:1:2: warning: x\n'; }
+LOG="$SCRATCH/warned.log"
+CHECK=0
+check 'normal run notes warnings' test "$(complete_run)" != "$(printf 'src/a.cpp:1:2: warning: x')"
+CHECK=1
+: > "$LOG"
+check 'check run adds no note' test "$(complete_run)" = "$(printf 'src/a.cpp:1:2: warning: x')"
 
 exit "$((failures > 0))"

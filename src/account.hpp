@@ -104,6 +104,12 @@ std::vector<ActivityRow> summarize_activity(const std::vector<ActivityRow>& rows
 std::string format_activity(const std::vector<ActivityRow>& rows, int days,
                             std::string_view today_utc);
 
+// The non-empty `error.message` string of an OpenRouter error body. The HTTP status, not the
+// body's `error.code`, decides what a refusal means.
+std::optional<std::string> api_error_message(std::string_view body);
+// That message as one terminal-safe line of at most 400 characters, for an error report.
+std::optional<std::string> provider_reason(std::string_view body);
+
 } // namespace orcli
 
 #endif // ORCLI_ACCOUNT_HPP

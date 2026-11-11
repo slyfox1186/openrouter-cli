@@ -345,6 +345,10 @@ std::string login_key() {
     return fake_key('3');
 }
 
+std::string management_key() {
+    return fake_key('2');
+}
+
 json key_data() {
     return {{"label", std::string(masked_key_label)},
             {"usage", 1.5},
@@ -506,7 +510,9 @@ Reply MockServer::built_in(const RecordedRequest& request) {
         return {.status = http_ok, .body = endpoints_body(path)};
     }
     if (path == "/key") {
-        return {.status = http_ok, .body = json{{"data", key_data()}}.dump()};
+        json data = key_data();
+        data["is_management_key"] = request.authorization == "Bearer " + management_key();
+        return {.status = http_ok, .body = json{{"data", data}}.dump()};
     }
     if (path == generation_path) {
         int status = http_ok;

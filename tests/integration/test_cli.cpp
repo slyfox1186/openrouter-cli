@@ -29,6 +29,7 @@
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <sstream>
 #include <stop_token>
 #include <string>
@@ -96,7 +97,7 @@ std::string inference_key() {
 }
 
 std::string management_key() {
-    return mock::fake_key('2');
+    return mock::management_key();
 }
 
 std::string bearer(std::string_view key) {
@@ -1767,7 +1768,7 @@ TEST_CASE("auth set stores an API key only when /key says is_management_key is f
     }
 }
 
-TEST_CASE("auth set --management verifies with /credits and never touches inference endpoints") {
+TEST_CASE("auth set --management checks the key type with /key and calls nothing else") {
     MockServer server;
     Sandbox sandbox(server.port());
 
@@ -1775,10 +1776,57 @@ TEST_CASE("auth set --management verifies with /credits and never touches infere
 
     CHECK(file_exists(sandbox.management_credential()));
     CHECK_FALSE(file_exists(sandbox.api_credential()));
-    const std::vector<RecordedRequest> checks = server.requests_to("/credits");
-    REQUIRE(checks.size() == 1U);
-    CHECK(checks.front().authorization == bearer(management_key()));
-    CHECK(server.requests_to("/key").empty());
+    const std::vector<RecordedRequest> requests = server.requests();
+    REQUIRE(requests.size() == 1U);
+    CHECK(requests.front().path == "/key");
+    CHECK(requests.front().authorization == bearer(management_key()));
+}
+
+TEST_CASE("auth set --management refuses an API key and keeps the stored Management key") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_management_key();
+    const std::string original = read_text(sandbox.management_credential());
+
+    const RunResult refused = sandbox.auth_set(inference_key(), {"--management", "--replace"});
+
+    CHECK(refused.code == exit_usage);
+    CHECK(refused.err.contains("not a Management key"));
+    CHECK(refused.err.contains("openrouter-cli auth set"));
+    CHECK(read_text(sandbox.management_credential()) == original);
+    CHECK_FALSE(file_exists(sandbox.api_credential()));
+}
+
+TEST_CASE("auth set --management shows OpenRouter's reason and follows the real HTTP status") {
+    struct Case {
+        int status;
+        const char* body;
+        const char* shown;
+    };
+    const std::vector<Case> cases{
+        {.status = http_unauthorized,
+         .body = R"({"error":{"code":403,"message":"API key expired"}})",
+         .shown = "rejected this Management key (HTTP 401: API key expired)"},
+        {.status = http_forbidden,
+         .body = R"({"error":{"code":401,"message":"Forbidden here"}})",
+         .shown = "answered HTTP 403: Forbidden here while checking the Management key"},
+        {.status = http_forbidden, .body = "", .shown = "answered HTTP 403 while checking"},
+    };
+    for (const Case& entry : cases) {
+        INFO("HTTP ", entry.status, " body ", entry.body);
+        MockServer server;
+        server.set_route("/key", [entry](const RecordedRequest&) {
+            return Reply{.status = entry.status, .body = entry.body};
+        });
+        Sandbox sandbox(server.port());
+
+        const RunResult result = sandbox.auth_set(management_key(), {"--management"});
+
+        CHECK(result.code == exit_api);
+        CHECK(result.err.contains(entry.shown));
+        CHECK(result.err.contains("nothing was stored"));
+        CHECK_FALSE(file_exists(sandbox.management_credential()));
+    }
 }
 
 TEST_CASE("login exchanges the pasted code without an Authorization header") {
@@ -1961,6 +2009,8 @@ TEST_CASE("the management key never reaches an inference endpoint") {
     Sandbox sandbox(server.port());
     sandbox.store_api_key();
     sandbox.store_management_key();
+    // Storing the Management key checks it with /key; the commands below never send it there.
+    const std::size_t setup_requests = server.requests().size();
 
     REQUIRE(sandbox.run(ask("question")).code == exit_ok);
     CHECK(sandbox.run({"status"}).code == exit_ok);
@@ -1972,7 +2022,10 @@ TEST_CASE("the management key never reaches an inference endpoint") {
     const std::vector<std::string_view> inference_paths{"/chat/completions", "/key", "/generation"};
     const std::vector<std::string_view> management_paths{"/keys", "/credits", "/activity",
                                                          "/organization/members"};
-    for (const RecordedRequest& request : server.requests()) {
+    const std::vector<RecordedRequest> requests = server.requests();
+    REQUIRE(requests.size() > setup_requests);
+    for (const RecordedRequest& request :
+         std::views::drop(requests, static_cast<std::ptrdiff_t>(setup_requests))) {
         INFO(request.method, " ", request.path);
         if (std::ranges::contains(inference_paths, std::string_view(request.path))) {
             CHECK(request.authorization == bearer(inference_key()));
@@ -2222,14 +2275,14 @@ TEST_CASE("status stops at the members page cap and reports the lookup as failed
 
 TEST_CASE("status skips the members lookup without a creator id but still shows credits") {
     MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.store_management_key();
     server.set_route("/key", [](const RecordedRequest&) {
         json data = mock::key_data();
         data["creator_user_id"] = nullptr;
         return data_reply(data);
     });
-    Sandbox sandbox(server.port());
-    sandbox.store_api_key();
-    sandbox.store_management_key();
 
     const RunResult status = sandbox.run({"status"});
 
@@ -2242,6 +2295,9 @@ TEST_CASE("status skips the members lookup without a creator id but still shows 
 
 TEST_CASE("status shows null organization, workspace and member names as absent") {
     MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    sandbox.store_management_key();
     server.set_route("/key", [](const RecordedRequest&) {
         json data = mock::key_data();
         data["organization_id"] = nullptr;
@@ -2257,9 +2313,6 @@ TEST_CASE("status shows null organization, workspace and member names as absent"
         creator["last_name"] = nullptr;
         return data_reply(json::array({creator}));
     });
-    Sandbox sandbox(server.port());
-    sandbox.store_api_key();
-    sandbox.store_management_key();
 
     const RunResult status = sandbox.run({"status"});
 
@@ -2392,6 +2445,77 @@ TEST_CASE("account keys prints nothing partial when a later page fails") {
 
     CHECK(keys.code == exit_api);
     CHECK_FALSE(keys.out.contains("first-page-key"));
+}
+
+TEST_CASE("account commands report OpenRouter's reason and follow the real HTTP status") {
+    struct Case {
+        std::vector<std::string> args;
+        std::string path;
+        int status;
+        const char* body;
+        std::vector<const char*> shown;
+    };
+    const std::vector<Case> cases{
+        {.args = {"account", "activity"},
+         .path = "/activity",
+         .status = http_forbidden,
+         .body =
+             R"({"error":{"code":401,"message":"Only management keys can perform this operation"}})",
+         .shown = {"refused the stored Management key for GET /activity (HTTP 403: Only "
+                   "management keys can perform this operation)",
+                   "https://openrouter.ai/settings/management-keys",
+                   "openrouter-cli auth set --management --replace"}},
+        {.args = {"account", "activity"},
+         .path = "/activity",
+         .status = http_forbidden,
+         .body = "",
+         .shown = {"for GET /activity (HTTP 403).", "auth set --management --replace"}},
+        {.args = {"account", "keys"},
+         .path = "/keys",
+         .status = http_unauthorized,
+         .body = R"({"error":{"code":403,"message":"User not found."}})",
+         .shown = {"rejected the stored Management key for GET /keys (HTTP 401: User not found.)",
+                   "auth set --management --replace"}},
+        {.args = {"account", "credits"},
+         .path = "/credits",
+         .status = http_server_error,
+         .body = R"({"error":{"code":500,"message":"Internal Server Error"}})",
+         .shown = {"GET /credits failed (HTTP 500: Internal Server Error)"}},
+    };
+    for (const Case& entry : cases) {
+        INFO(entry.path, " HTTP ", entry.status, " body ", entry.body);
+        MockServer server;
+        Sandbox sandbox(server.port());
+        sandbox.store_management_key();
+        server.set_route(entry.path, [entry](const RecordedRequest&) {
+            return Reply{.status = entry.status, .body = entry.body};
+        });
+
+        const RunResult result = sandbox.run(entry.args);
+
+        CHECK(result.code == exit_api);
+        for (const char* text : entry.shown) {
+            CHECK(result.err.contains(text));
+        }
+        CHECK(result.out.empty());
+    }
+}
+
+TEST_CASE("an account error message from OpenRouter is shown as one clean line") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_management_key();
+    server.set_route("/activity", [](const RecordedRequest&) {
+        return Reply{.status = http_forbidden,
+                     .body = R"({"error":{"message":"denied\u001b[31m\nspoof"}})"};
+    });
+
+    const RunResult result = sandbox.run({"account", "activity"});
+
+    CHECK(result.code == exit_api);
+    CHECK(result.err.contains("denied"));
+    CHECK_FALSE(result.err.contains('\033'));
+    CHECK_FALSE(result.err.contains("\nspoof"));
 }
 
 TEST_CASE("account activity sums endpoint rows and filters --days by completed UTC days") {

@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <expected>
 #include <format>
+#include <optional>
 #include <print>
 #include <string>
 #include <string_view>
@@ -62,22 +63,24 @@ void trim_in_place(std::string& text) {
     text.erase(0, text.find_first_not_of(blank_chars));
 }
 
-// The status says what failed without the body, which may echo request details.
 Result<std::string> verified_body(const Result<HttpResponse>& response, KeyKind kind) {
     if (!response) {
         return std::unexpected(response.error());
     }
+    if (http_success(response->status)) {
+        return response->body;
+    }
+    const std::optional<std::string> reason = provider_reason(response->body);
+    const std::string status = reason.has_value()
+                                   ? std::format("HTTP {}: {}", response->status, *reason)
+                                   : std::format("HTTP {}", response->status);
     if (response->status == http_unauthorized) {
-        return fail(Exit::api, std::format("OpenRouter rejected this {} (HTTP 401); nothing was "
-                                           "stored",
-                                           kind_label(kind)));
+        return fail(Exit::api, std::format("OpenRouter rejected this {} ({}); nothing was stored",
+                                           kind_label(kind), status));
     }
-    if (!http_success(response->status)) {
-        return fail(Exit::api, std::format("OpenRouter answered HTTP {} while checking the {}; "
-                                           "nothing was stored",
-                                           response->status, kind_label(kind)));
-    }
-    return response->body;
+    return fail(Exit::api,
+                std::format("OpenRouter answered {} while checking the {}; nothing was stored",
+                            status, kind_label(kind)));
 }
 
 Result<void> verify_inference_key(const Config& config, const SecretString& key) {
@@ -98,16 +101,21 @@ Result<void> verify_inference_key(const Config& config, const SecretString& key)
     return {};
 }
 
+// A readable /credits reply does not prove the key type, so the key's own record decides.
 Result<void> verify_management_key(const Config& config, const SecretString& key) {
     const Http http(config, HttpKeys{.inference = SecretString(), .management = key.clone()});
-    const auto body = verified_body(http.fetch("/credits", GetOptions{.auth = Auth::management}),
+    const auto body = verified_body(http.fetch("/key", GetOptions{.auth = Auth::management}),
                                     KeyKind::management);
     if (!body) {
         return std::unexpected(body.error());
     }
-    const auto credits = parse_credits(*body);
-    if (!credits) {
-        return std::unexpected(credits.error());
+    const auto status = parse_key_status(*body);
+    if (!status) {
+        return std::unexpected(status.error());
+    }
+    if (!status->is_management_key) {
+        return fail(Exit::usage, "this is an API key, not a Management key; store it with "
+                                 "`openrouter-cli auth set`");
     }
     return {};
 }

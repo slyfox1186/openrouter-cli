@@ -34,6 +34,7 @@ constexpr std::size_t date_length = 10; // YYYY-MM-DD
 constexpr std::string_view login_replace_hint = "openrouter-cli login --replace";
 constexpr std::string_view management_replace_hint =
     "openrouter-cli auth set --management --replace";
+constexpr std::string_view management_keys_url = "https://openrouter.ai/settings/management-keys";
 constexpr std::string_view seen_by_organization = " (as seen by the Management key's organization)";
 constexpr std::string_view not_available = "n/a";
 
@@ -49,23 +50,38 @@ GetOptions with_auth(Auth auth) {
     return GetOptions{.auth = auth, .retry_404_for = std::chrono::seconds{0}};
 }
 
-// GET for the account commands: the 2xx body, or Exit::api with the fix for a rejected key.
+// GET for the account commands: the 2xx body, or Exit::api naming the endpoint, the status and
+// OpenRouter's reason, with the fix for a refused key.
 Result<std::string> fetch_body(const Http& http, std::string_view path, Auth auth) {
     const auto response = http.fetch(path, with_auth(auth));
     if (!response) {
         return std::unexpected(response.error());
     }
+    if (http_success(response->status)) {
+        return response->body;
+    }
+    const std::string_view endpoint = path.substr(0, path.find('?'));
+    const std::optional<std::string> reason = provider_reason(response->body);
+    const std::string status = reason.has_value()
+                                   ? std::format("HTTP {}: {}", response->status, *reason)
+                                   : std::format("HTTP {}", response->status);
+    const bool management = auth == Auth::management;
     if (response->status == http_unauthorized) {
-        const bool management = auth == Auth::management;
         return fail(Exit::api,
-                    std::format("OpenRouter rejected the stored {} (HTTP 401); run `{}`",
-                                management ? "Management key" : "API key",
+                    std::format("OpenRouter rejected the stored {} for GET {} ({}); run `{}`",
+                                management ? "Management key" : "API key", endpoint, status,
                                 management ? management_replace_hint : login_replace_hint));
     }
-    if (!http_success(response->status)) {
-        return fail(Exit::api, std::format("GET {} failed with HTTP {}", path, response->status));
+    // OpenRouter's docs disagree on whether Management keys can be workspace-scoped, so the
+    // advice covers both causes instead of declaring the key wrong.
+    if (response->status == http_forbidden && management) {
+        return fail(Exit::api,
+                    std::format("OpenRouter refused the stored Management key for GET {} ({}). If "
+                                "it is not a Management key, or is a workspace key without this "
+                                "permission, store an account Management key from {} with `{}`",
+                                endpoint, status, management_keys_url, management_replace_hint));
     }
-    return response->body;
+    return fail(Exit::api, std::format("GET {} failed ({})", endpoint, status));
 }
 
 // Every page of GET /keys. Nothing is returned unless the listing ended with an empty page, so

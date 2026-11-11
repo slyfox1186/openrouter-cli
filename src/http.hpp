@@ -35,8 +35,9 @@ private:
 
 // Which stored key a request carries. The mapping lives at each call site in main.cpp:
 // none for public metadata and the PKCE exchange, inference for completions, /generation and
-// /key, management for /keys, /credits and /activity. A management key is never sent to an
-// inference endpoint because each request names its kind and Http holds both separately.
+// /key, management for /keys, /credits, /activity and the /key check of a Management key. A
+// management key is never sent to a completion or /generation request because each request
+// names its kind and Http holds both separately.
 enum class Auth : std::uint8_t {
     none,
     inference,

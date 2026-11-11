@@ -50,6 +50,8 @@ std::string fake_api_key();
 std::string fake_key(char digit);
 // The key POST /auth/keys hands out by default.
 std::string login_key();
+// The Management key: GET /key answers with is_management_key true when it is the bearer.
+std::string management_key();
 
 // The `data` object GET /key returns by default: a valid inference key owned by an
 // organization. Tests edit a copy to build other replies.

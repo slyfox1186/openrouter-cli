@@ -50,7 +50,8 @@ usage() {
     printf '%s\n' "With no options it builds release, runs offline tests and checks linkage," \
         "then installs the binary. --check adds sanitizer and static checks."
     printf '\n%s\n' "${header}OPTIONS${reset}"
-    help_row "" --check "" "Add formatting, debug sanitizers and static analysis"
+    help_row "" --check "" "Add formatting, debug sanitizers and static analysis," \
+        "and treat compiler warnings as errors"
     help_row "" --portable "" "Build for any x86-64 CPU instead of this machine's"
     help_row "" --quick "" "Build and check linkage only; no tests or installation"
     help_row "" --force "" "Replace or remove an unrecognized file or symlink"
@@ -298,11 +299,13 @@ launcher_for() {
 }
 
 # Every value is passed on each run, so a setting cached by an earlier run never carries over.
+# Warnings fail only the --check builds, so a newer compiler cannot block a normal install.
 set_common_args() {
-    local native=ON
+    local native=ON werror=OFF
     if [[ "$PORTABLE" == 1 ]]; then native=OFF; fi
+    if [[ "$CHECK" == 1 ]]; then werror=ON; fi
     COMMON_ARGS=("-DCMAKE_C_COMPILER=$CC_PATH" "-DCMAKE_CXX_COMPILER=$CXX_PATH"
-        "-DCMAKE_LINKER_TYPE=$LINKER_TYPE" "-DORCLI_NATIVE=$native"
+        "-DCMAKE_LINKER_TYPE=$LINKER_TYPE" "-DORCLI_NATIVE=$native" "-DORCLI_WERROR=$werror"
         "-DCMAKE_C_COMPILER_LAUNCHER=$(launcher_for "$CC_PATH")"
         "-DCMAKE_CXX_COMPILER_LAUNCHER=$(launcher_for "$CXX_PATH")")
     if [[ "$FRESH" == 1 ]]; then COMMON_ARGS+=(--fresh); fi
@@ -352,8 +355,9 @@ cppcheck_check() {
         return 1
     fi
     # uninitMemberVarNoCtor flags aggregates such as Error, whose fields have no default values
-    # on purpose: with -Wextra -Werror, clang then rejects any designated initializer that omits
-    # one, and clang-tidy's cppcoreguidelines-pro-type-member-init rejects uninitialized use.
+    # on purpose: with -Wextra and --check's warnings as errors, clang then rejects any
+    # designated initializer that omits one, and clang-tidy's
+    # cppcoreguidelines-pro-type-member-init rejects uninitialized use.
     "$CPPCHECK" --project="$DEBUG_DIR/compile_commands.json" --file-filter="$ROOT/src/*" \
         --enable=warning,performance,portability --suppress=uninitMemberVarNoCtor \
         --error-exitcode=1 --quiet -j "$JOBS"
@@ -540,10 +544,23 @@ run_install() {
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then echo "note: $BIN_DIR is not on PATH"; fi
 }
 
+# Only compiler diagnostics (file:line:column: warning:) count; driver and linker warnings and
+# this script's own messages do not.
+warning_note() {
+    local count
+    count="$(sed 's/\x1b\[[0-9;]*[A-Za-z]//g' -- "$LOG" | grep -cE '^[^:]+:[0-9]+:[0-9]+: warning: ')"
+    if [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]; then
+        echo "note: $count compiler warnings in this build (see the log);" \
+            "--check fails on warnings in this project's own code"
+    fi
+    return 0
+}
+
 complete_run() {
     if ! run_logged run_checks; then
         echo "build.sh: checks or logging failed; nothing installed" >&2; return 1
     fi
+    if [[ "$CHECK" == 0 ]]; then run_logged warning_note || return 1; fi
     if [[ "$INSTALL" == 1 ]]; then run_logged run_install || return 1; fi
 }
 

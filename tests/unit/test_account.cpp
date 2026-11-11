@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 #include <nlohmann/json.hpp>
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -373,4 +374,36 @@ TEST_CASE("format_activity reports an empty window with a zero total") {
     CHECK(text.contains("No activity in this range.\n"));
     CHECK(text.ends_with("Total: 0 requests; 0 prompt, 0 completion and 0 reasoning tokens; "
                          "$0.0000\n"));
+}
+
+TEST_CASE("api_error_message reads only a non-empty error.message string") {
+    CHECK(orcli::api_error_message(R"({"error":{"code":403,"message":"Only management keys"}})") ==
+          "Only management keys");
+    CHECK(orcli::api_error_message(R"({"error":{"code":401,"message":"x"}})") == "x");
+    for (const std::string_view body :
+         {"", "not json", "[]", R"({"message":"top level"})", R"({"error":"text"})",
+          R"({"error":{"code":403}})", R"({"error":{"message":""}})",
+          R"({"error":{"message":403}})", R"({"error":{"message":null}})"}) {
+        INFO(body);
+        CHECK_FALSE(orcli::api_error_message(body).has_value());
+    }
+}
+
+TEST_CASE("provider_reason gives one terminal-safe line of at most 400 characters") {
+    const std::optional<std::string> clean =
+        orcli::provider_reason(R"({"error":{"message":"denied\u001b[31m\nnext\tline"}})");
+    REQUIRE(clean.has_value());
+    CHECK(clean->starts_with("denied"));
+    CHECK_FALSE(clean->contains('\033'));
+    CHECK_FALSE(clean->contains('\n'));
+    CHECK_FALSE(clean->contains('\t'));
+
+    const std::string long_message(1000, 'a');
+    const std::optional<std::string> cut =
+        orcli::provider_reason(nlohmann::json{{"error", {{"message", long_message}}}}.dump());
+    REQUIRE(cut.has_value());
+    CHECK(cut->size() == 403U);
+    CHECK(cut->ends_with("..."));
+
+    CHECK_FALSE(orcli::provider_reason("not json").has_value());
 }

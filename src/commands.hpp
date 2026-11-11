@@ -62,8 +62,8 @@ bool warn_plaintext_keys(const Config& config);
 int cmd_login(const Config& config, bool replace);
 
 // Reads a key from a hidden terminal prompt or from piped stdin, checks the sk-or- prefix,
-// verifies it (inference: GET /key with is_management_key false; management: GET /credits)
-// and stores it with store_key().
+// verifies it with GET /key (is_management_key must be false for an API key and true for a
+// Management key) and stores it with store_key().
 int cmd_auth_set(const Config& config, bool management, bool replace);
 
 // Deletes the stored credentials (only the Management key when management_only). Never

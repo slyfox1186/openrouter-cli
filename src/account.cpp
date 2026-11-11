@@ -50,6 +50,7 @@ constexpr std::size_t digits_per_group = 3;
 constexpr std::size_t date_length = 10; // YYYY-MM-DD
 constexpr std::size_t column_gap = 2;
 constexpr std::size_t label_width = 20;
+constexpr std::size_t max_reason_chars = 400;
 
 // Response text is never quoted: an error body can echo what was sent.
 std::unexpected<Error> malformed(std::string_view path) {
@@ -614,6 +615,34 @@ std::string format_activity(const std::vector<ActivityRow>& rows, int days,
                         with_commas(total.completion_tokens), with_commas(total.reasoning_tokens),
                         format_usd(total.usage));
     return text;
+}
+
+std::optional<std::string> api_error_message(std::string_view body) {
+    const json document = json::parse(body, nullptr, false);
+    if (!document.is_object()) {
+        return std::nullopt;
+    }
+    const auto error = document.find("error");
+    if (error == document.end() || !error->is_object()) {
+        return std::nullopt;
+    }
+    const auto message = error->find("message");
+    if (message == error->end() || !message->is_string()) {
+        return std::nullopt;
+    }
+    std::string text = message->get<std::string>();
+    if (text.empty()) {
+        return std::nullopt;
+    }
+    return text;
+}
+
+std::optional<std::string> provider_reason(std::string_view body) {
+    const std::optional<std::string> message = api_error_message(body);
+    if (!message.has_value()) {
+        return std::nullopt;
+    }
+    return sanitize_for_display(display_metadata(*message), max_reason_chars);
 }
 
 } // namespace orcli
