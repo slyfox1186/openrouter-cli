@@ -170,7 +170,7 @@ int cmd_models_show(const Config& config, const Http& http, const std::string& n
     if (!model) {
         return report(model.error());
     }
-    std::print("{}", format_model(*model, catalog->fetched_at));
+    std::print("{}", format_model(*model, catalog->fetched_at, config.max_output_tokens));
     const auto endpoints = endpoints_for(http, model->id);
     if (!endpoints) {
         return report(endpoints.error());
@@ -902,16 +902,11 @@ struct Verdict {
     std::string message;
 };
 
-std::string incomplete_reason(const StreamOutcome& outcome, long long max_tokens) {
+std::string incomplete_reason(const StreamOutcome& outcome, long long max_tokens,
+                              std::optional<long long> model_limit) {
     const auto& reason = outcome.finish_reason;
     if (reason == "length") {
-        const auto reasoning = outcome.usage.reasoning_tokens;
-        return std::format("the {} token output budget ran out{}; retry with a lower --effort "
-                           "or a higher --max-output-tokens",
-                           max_tokens,
-                           reasoning.has_value()
-                               ? std::format(" after {} reasoning tokens", *reasoning)
-                               : std::string());
+        return length_stop_reason(max_tokens, model_limit, outcome.usage);
     }
     if (reason == "content_filter") {
         return "the provider's content filter stopped the answer";
@@ -925,7 +920,7 @@ std::string incomplete_reason(const StreamOutcome& outcome, long long max_tokens
     return "the provider stopped the answer with an unsupported finish reason";
 }
 
-Verdict judge(const StreamRun& run, long long max_tokens) {
+Verdict judge(const StreamRun& run, long long max_tokens, std::optional<long long> model_limit) {
     if (run.transfer.interrupted) {
         return {
             .outcome = "interrupted",
@@ -985,7 +980,7 @@ Verdict judge(const StreamRun& run, long long max_tokens) {
         return {
             .outcome = "incomplete",
             .exit = Exit::incomplete,
-            .message = incomplete_reason(outcome, max_tokens),
+            .message = incomplete_reason(outcome, max_tokens, model_limit),
         };
     }
     return {.outcome = "complete", .exit = Exit::ok, .message = ""};
@@ -1187,7 +1182,8 @@ int cmd_ask(const AskArgs& args, const Config& config, const Http& http) {
     const StreamRun run = run_stream(http, *prepared, *sink, cost_log, call_id, status);
     sink->finish(answer_path);
     status.answer_finished();
-    const Verdict verdict = judge(run, prepared->request.max_tokens);
+    const Verdict verdict =
+        judge(run, prepared->request.max_tokens, prepared->model.max_completion_tokens);
     Aftermath after = record_outcome(http, cost_log, call_id, run, verdict);
 
     if (verdict.exit == Exit::ok && prepared->session.has_value()) {
@@ -1270,7 +1266,9 @@ void add_ask_options(CLI::App& app, AskArgs& ask) {
                    "Reasoning effort: max, xhigh, high, medium, low, minimal, none")
         ->option_text("LEVEL");
     app.add_option("--max-output-tokens", ask.max_output_tokens,
-                   "Output budget including reasoning")
+                   std::format("Output budget including reasoning (built-in default {}; `show "
+                               "MODEL` prints the configured budget)",
+                               default_max_output_tokens))
         ->check(CLI::PositiveNumber)
         ->option_text("N");
     app.add_option("-p,--provider", ask.providers,

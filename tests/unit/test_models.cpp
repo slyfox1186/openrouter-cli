@@ -79,6 +79,8 @@ constexpr std::ptrdiff_t endpoint_table_lines = 4;
 constexpr std::size_t catalog_size = 6;
 constexpr long long argon_context = 1'048'576;
 constexpr long long argon_max_output = 65'536;
+constexpr long long default_budget = 64'000;
+constexpr long long budget_above_argon = 100'000;
 constexpr std::chrono::hours day{24};
 constexpr std::string_view stale_time = "2000-01-01T00:00:00Z";
 constexpr std::size_t utc_length = 20;
@@ -199,7 +201,7 @@ TEST_CASE("forced refresh and interruption never silently use a cached catalog")
 TEST_CASE("model metadata preserves Unicode but cannot emit terminal controls") {
     auto model = priced("0");
     model.name = "Café\033[31m\nspoof";
-    const auto text = orcli::format_model(model, "today");
+    const auto text = orcli::format_model(model, "today", default_budget);
     CHECK(text.find("Café") != std::string::npos);
     CHECK(text.find('\033') == std::string::npos);
     CHECK(text.find("\nspoof") == std::string::npos);
@@ -373,7 +375,7 @@ TEST_CASE("format_candidates prints one line per model with n/a for absent value
 
 TEST_CASE("format_model shows limits, reasoning and catalog prices") {
     const ModelInfo argon = model_named(test_catalog(), "google/gemini-4-argon");
-    const std::string text = orcli::format_model(argon, "2026-11-09T00:00:00Z");
+    const std::string text = orcli::format_model(argon, "2026-11-09T00:00:00Z", default_budget);
     CHECK(text.contains("1,048,576 tokens"));
     CHECK(text.contains("65,536"));
     CHECK(text.contains("mandatory; efforts high, low; default high"));
@@ -382,11 +384,36 @@ TEST_CASE("format_model shows limits, reasoning and catalog prices") {
                         "serving provider's rate can differ."));
 }
 
+TEST_CASE("capped_output_tokens lowers a request to the model's listed maximum") {
+    const std::vector<ModelInfo> catalog = test_catalog();
+    const ModelInfo argon = model_named(catalog, "google/gemini-4-argon");
+    const ModelInfo luna = model_named(catalog, "openai/gpt-6-luna");
+    CHECK(orcli::capped_output_tokens(argon, default_budget) == default_budget);
+    CHECK(orcli::capped_output_tokens(argon, budget_above_argon) == argon_max_output);
+    CHECK(orcli::capped_output_tokens(luna, budget_above_argon) == budget_above_argon);
+}
+
+TEST_CASE("format_model shows the output budget a call sends by default") {
+    const std::vector<ModelInfo> catalog = test_catalog();
+    const ModelInfo argon = model_named(catalog, "google/gemini-4-argon");
+    const ModelInfo luna = model_named(catalog, "openai/gpt-6-luna");
+    CHECK(orcli::format_model(argon, "t", default_budget)
+              .contains("Output budget:      64,000 tokens per answer by default, reasoning "
+                        "included\n"));
+    CHECK(orcli::format_model(argon, "t", budget_above_argon)
+              .contains("Output budget:      65,536 tokens per answer by default, reasoning "
+                        "included\n"));
+    CHECK(orcli::format_model(luna, "t", budget_above_argon)
+              .contains("Output budget:      100,000 tokens per answer by default, reasoning "
+                        "included\n"));
+}
+
 TEST_CASE("format_model notes overrides, absent prices and expiration") {
     const std::vector<ModelInfo> catalog = test_catalog();
     const std::string argon =
-        orcli::format_model(model_named(catalog, "google/gemini-4-argon"), "t");
-    const std::string sol = orcli::format_model(model_named(catalog, "openai/gpt-6-sol"), "t");
+        orcli::format_model(model_named(catalog, "google/gemini-4-argon"), "t", default_budget);
+    const std::string sol =
+        orcli::format_model(model_named(catalog, "openai/gpt-6-sol"), "t", default_budget);
     CHECK(argon.contains("different catalog rates"));
     CHECK_FALSE(sol.contains("different catalog rates"));
     CHECK(sol.contains("n/a"));

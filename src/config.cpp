@@ -71,7 +71,7 @@ constexpr TextSetting privacy_setting{.key = "OPENROUTER_CLI_PRIVACY", .fallback
 
 constexpr NumberSetting<long long> max_output_tokens_setting{
     .key = "OPENROUTER_CLI_MAX_OUTPUT_TOKENS",
-    .fallback = 64000,
+    .fallback = default_max_output_tokens,
 };
 constexpr NumberSetting<int> catalog_ttl_setting{
     .key = "OPENROUTER_CLI_CATALOG_TTL_HOURS",

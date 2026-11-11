@@ -114,13 +114,20 @@ Result<std::optional<std::string>> choose_effort(const ModelInfo& model,
 }
 
 Result<long long> output_budget(const ModelInfo& model, long long requested) {
-    const long long budget = std::min(requested, model.max_completion_tokens.value_or(requested));
+    const long long budget = capped_output_tokens(model, requested);
     if (budget < 1) {
         return fail(Exit::usage,
                     std::format("output token budget for {} is {}; it must be at least 1", model.id,
                                 budget));
     }
     return budget;
+}
+
+std::optional<long long> nonnegative(const std::optional<long long>& count) {
+    if (count.has_value() && *count >= 0) {
+        return count;
+    }
+    return std::nullopt;
 }
 
 nlohmann::json messages_json(const RequestInput& input) {
@@ -209,6 +216,46 @@ Result<BuiltRequest> build_request(const RequestInput& input) {
         body.emplace("session_id", *input.session_id);
     }
     return built;
+}
+
+std::string length_stop_reason(long long budget, std::optional<long long> model_limit,
+                               const Usage& usage) {
+    const std::optional<long long> completion = nonnegative(usage.completion_tokens);
+    const std::optional<long long> reasoning = nonnegative(usage.reasoning_tokens);
+    std::string counts;
+    if (reasoning.has_value()) {
+        counts += std::format(" after {} reasoning tokens", *reasoning);
+    }
+    // Both counts are nonnegative here, so the difference cannot overflow.
+    if (completion.has_value() && reasoning.has_value() && *completion >= *reasoning) {
+        counts += std::format(", with {} answer tokens", *completion - *reasoning);
+    }
+    const bool budget_can_grow = !model_limit.has_value() || budget < *model_limit;
+    if (!completion.has_value()) {
+        if (!budget_can_grow) {
+            return std::format("the answer stopped at an output limit (budget {} tokens, the "
+                               "model's listed maximum){}; retry with a lower --effort or less "
+                               "input",
+                               budget, counts);
+        }
+        return std::format("the answer stopped at an output limit (budget {} tokens){}; retry "
+                           "with a lower --effort or a higher --max-output-tokens",
+                           budget, counts);
+    }
+    if (*completion >= budget) {
+        if (!budget_can_grow) {
+            return std::format("the answer used the whole {} token output budget (the model's "
+                               "listed maximum){}; retry with a lower --effort or less input",
+                               budget, counts);
+        }
+        return std::format("the answer used the whole {} token output budget{}; retry with a "
+                           "higher --max-output-tokens or a lower --effort",
+                           budget, counts);
+    }
+    return std::format("the answer stopped at {} output tokens, below the {} token budget, at a "
+                       "provider or context limit{}; a higher --max-output-tokens will not help; "
+                       "retry with a lower --effort or less input",
+                       *completion, budget, counts);
 }
 
 } // namespace orcli

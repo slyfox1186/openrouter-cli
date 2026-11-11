@@ -199,6 +199,7 @@ TEST_CASE("config: defaults with an empty .env") {
     CHECK(config.app_title == "openrouter-cli");
     CHECK(config.app_categories == "cli-agent");
     CHECK(config.default_effort == "high");
+    CHECK(orcli::default_max_output_tokens == default_max_output_tokens);
     CHECK(config.max_output_tokens == default_max_output_tokens);
     CHECK(config.privacy == orcli::Privacy::zdr);
     CHECK(config.catalog_ttl_hours == default_catalog_ttl_hours);

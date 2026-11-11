@@ -83,7 +83,11 @@ std::vector<ModelInfo> search(std::string_view query, const std::vector<ModelInf
 Resolution resolve(std::string_view name, const std::vector<ModelInfo>& catalog,
                    const std::map<std::string, AliasEntry>& aliases);
 std::string format_candidates(const std::vector<ModelInfo>& models);
-std::string format_model(const ModelInfo& model, std::string_view catalog_fetched_at);
+// The output budget a request sends: requested, lowered to the model's listed maximum.
+long long capped_output_tokens(const ModelInfo& model, long long requested);
+// default_output_tokens is the configured budget used when --max-output-tokens is not given.
+std::string format_model(const ModelInfo& model, std::string_view catalog_fetched_at,
+                         long long default_output_tokens);
 
 // Persistence under state_dir: catalog.json (with fetch time) and models.json (aliases).
 using FetchText = std::function<Result<std::string>()>;

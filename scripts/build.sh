@@ -449,10 +449,11 @@ linkage_check() {
 
 run_checks() {
     FAILED=()
-    local debug_built=0 release_built=0
+    local debug_configured=0 debug_built=0 release_built=0
     if [[ "$CHECK" == 1 ]]; then
         step "format check" format_check
         if step "configure debug" cmake --preset debug -B "$DEBUG_DIR" "${COMMON_ARGS[@]}"; then
+            debug_configured=1
             if step "build debug" cmake --build "$DEBUG_DIR" -j "$JOBS"; then debug_built=1; fi
         fi
         if [[ "$debug_built" == 1 ]]; then
@@ -460,8 +461,15 @@ run_checks() {
         else
             skipped "debug tests" "debug build failed"
         fi
-        step "clang-tidy (src)" tidy_check
-        step "cppcheck (src)" cppcheck_check
+        # A failed configure leaves the previous compile_commands.json in place, whose flags and
+        # file list may no longer match the project. A failed compile still has a current one.
+        if [[ "$debug_configured" == 1 ]]; then
+            step "clang-tidy (src)" tidy_check
+            step "cppcheck (src)" cppcheck_check
+        else
+            skipped "clang-tidy (src)" "debug configure failed"
+            skipped "cppcheck (src)" "debug configure failed"
+        fi
     fi
     if step "configure release" cmake --preset release -B "$RELEASE_DIR" "${COMMON_ARGS[@]}" "-DBUILD_TESTING=$([[ "$QUICK" == 1 ]] && echo OFF || echo ON)"; then
         if step "build release" cmake --build "$RELEASE_DIR" -j "$JOBS"; then release_built=1; fi

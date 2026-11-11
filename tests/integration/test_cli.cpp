@@ -88,6 +88,8 @@ constexpr std::chrono::seconds drip_hold{3};
 constexpr std::chrono::seconds heartbeat_hold{11};
 
 constexpr std::string_view alpha = "test/alpha-1";
+constexpr long long configured_budget = 5000;
+constexpr long long lowered_budget = 4000;
 
 std::string inference_key() {
     return mock::fake_key('1');
@@ -593,6 +595,20 @@ void log_unpriced_call(const Sandbox& sandbox, const std::string& call_id,
     REQUIRE(ledger.append(orcli::result_record(result)).has_value());
 }
 
+// Help descriptions wrap at the terminal width; joining the lines lets a check match a phrase
+// wherever the wrap falls.
+std::string single_spaced(std::string_view text) {
+    std::string spaced;
+    for (const char character : text) {
+        if (character != ' ' && character != '\n') {
+            spaced += character;
+        } else if (!spaced.empty() && spaced.back() != ' ') {
+            spaced += ' ';
+        }
+    }
+    return spaced;
+}
+
 // Removes the SGR color sequences the help pages use.
 std::string strip_escapes(std::string_view text) {
     std::string plain;
@@ -860,11 +876,65 @@ TEST_CASE("an output budget spent on reasoning is explained") {
     const RunResult result = sandbox.run(ask("question"));
 
     CHECK(result.code == exit_incomplete);
-    CHECK(result.err.contains("output budget ran out"));
-    CHECK(result.err.contains("8000 reasoning tokens"));
+    CHECK(result.err.contains("used the whole 8000 token output budget (the model's listed "
+                              "maximum) after 8000 reasoning tokens, with 0 answer tokens; retry "
+                              "with a lower --effort or less input"));
     CHECK(result.out.empty());
     CHECK(server.post_count() == 1);
     CHECK(result_outcome(sandbox) == "incomplete");
+}
+
+TEST_CASE("a length stop names the clamped budget that was sent, not the one asked for") {
+    MockServer server;
+    server.set_scenario(Scenario::length_empty);
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    const RunResult result =
+        sandbox.run({"-m", std::string(alpha), "--max-output-tokens", "100000", "question"});
+
+    CHECK(result.code == exit_incomplete);
+    CHECK(server.last_post().at("max_tokens").get<long long>() == alpha_max_tokens);
+    CHECK(result.err.contains("used the whole 8000 token output budget (the model's listed "
+                              "maximum)"));
+    CHECK_FALSE(result.err.contains("100000"));
+}
+
+TEST_CASE("a length stop below the model's maximum advises a higher budget") {
+    MockServer server;
+    server.set_scenario(Scenario::length_empty);
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    const RunResult result =
+        sandbox.run({"-m", std::string(alpha), "--max-output-tokens", "4000", "question"});
+
+    CHECK(result.code == exit_incomplete);
+    CHECK(server.last_post().at("max_tokens").get<long long>() == lowered_budget);
+    CHECK(result.err.contains("used the whole 4000 token output budget after 8000 reasoning "
+                              "tokens, with 0 answer tokens; retry with a higher "
+                              "--max-output-tokens or a lower --effort"));
+}
+
+TEST_CASE("show prints the output budget a call sends by default") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+
+    const RunResult capped = sandbox.run({"show", std::string(alpha)});
+    CHECK(capped.code == exit_ok);
+    CHECK(capped.out.contains(
+        "\nOutput budget:      8,000 tokens per answer by default, reasoning included\n"));
+
+    sandbox.write_env("OPENROUTER_CLI_MAX_OUTPUT_TOKENS=5000\n");
+    const RunResult configured = sandbox.run({"show", std::string(alpha)});
+    CHECK(configured.code == exit_ok);
+    CHECK(configured.out.contains(
+        "\nOutput budget:      5,000 tokens per answer by default, reasoning included\n"));
+
+    sandbox.store_api_key();
+    const RunResult asked = sandbox.run(ask("question"));
+    CHECK(asked.code == exit_ok);
+    CHECK(server.last_post().at("max_tokens").get<long long>() == configured_budget);
 }
 
 TEST_CASE("a secret in an attached file stops the call before anything is sent") {
@@ -1335,6 +1405,8 @@ TEST_CASE("help is shown for -h and --help on every command") {
     CHECK(line_starting(root, "  -h, --help ").ends_with("Show this help and exit"));
     CHECK(line_starting(root, "      --version ").ends_with("Show the version and exit"));
     CHECK(line_starting(root, "  -m, --model MODEL ").ends_with("~author/family-latest, or name"));
+    CHECK(single_spaced(root).contains("Output budget including reasoning (built-in default "
+                                       "64000; `show MODEL` prints the configured budget)"));
     CHECK(root.find("HELP") == std::string::npos);
     CHECK(root.find("VERSION") == std::string::npos);
     CHECK(root.find("\nEXAMPLES\n") != std::string::npos);

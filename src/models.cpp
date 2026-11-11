@@ -786,7 +786,12 @@ std::string format_endpoints(const std::vector<Endpoint>& endpoints) {
                                 "--provider to use only those endpoints.\n";
 }
 
-std::string format_model(const ModelInfo& model, std::string_view catalog_fetched_at) {
+long long capped_output_tokens(const ModelInfo& model, long long requested) {
+    return std::min(requested, model.max_completion_tokens.value_or(requested));
+}
+
+std::string format_model(const ModelInfo& model, std::string_view catalog_fetched_at,
+                         long long default_output_tokens) {
     std::vector<Field> fields;
     fields.push_back({.label = "ID", .value = model.id});
     fields.push_back({.label = "Name", .value = model.name});
@@ -800,6 +805,11 @@ std::string format_model(const ModelInfo& model, std::string_view catalog_fetche
     fields.push_back(
         {.label = "Context", .value = std::format("{} tokens", with_commas(model.context_length))});
     fields.push_back({.label = "Max output", .value = optional_count(model.max_completion_tokens)});
+    fields.push_back({
+        .label = "Output budget",
+        .value = std::format("{} tokens per answer by default, reasoning included",
+                             with_commas(capped_output_tokens(model, default_output_tokens))),
+    });
     fields.push_back({.label = "Reasoning", .value = describe_reasoning(model)});
     fields.push_back({.label = "Input", .value = per_million(model.pricing.prompt)});
     fields.push_back(

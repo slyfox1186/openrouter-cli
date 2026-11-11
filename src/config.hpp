@@ -12,6 +12,12 @@
 
 namespace orcli {
 
+// Output budget, reasoning included, when neither OPENROUTER_CLI_MAX_OUTPUT_TOKENS nor
+// --max-output-tokens is given. Fixed rather than each model's catalog maximum: that figure is
+// often a placeholder, and a budget above a provider's per-request limit can switch it into
+// continuation modes this client does not drive.
+inline constexpr long long default_max_output_tokens = 64000;
+
 // A non-empty OPENROUTER_API_KEY or OPENROUTER_MANAGEMENT_KEY assignment found in .env. Keys
 // are stored encrypted (credentials.hpp); this records where a plaintext one still sits so the
 // command can refuse to run. Never holds the value.

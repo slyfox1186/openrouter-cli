@@ -7,6 +7,9 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <format>
+#include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -274,4 +277,104 @@ TEST_CASE("request: user message appends packed files after a blank line") {
     CHECK(orcli::user_message("check this", "") == "check this");
     CHECK(orcli::user_message("check this", "## a.cpp\n```\n1 | x\n```\n") ==
           "check this\n\n## a.cpp\n```\n1 | x\n```\n");
+}
+
+namespace {
+
+constexpr long long incident_budget = 24000;
+constexpr long long incident_reasoning = 17465;
+constexpr long long below_budget_completion = 9000;
+constexpr long long below_budget_reasoning = 8465;
+constexpr long long reported_completion = 14998;
+constexpr long long reported_reasoning = 15806;
+constexpr long long lowest = std::numeric_limits<long long>::min();
+constexpr long long highest = std::numeric_limits<long long>::max();
+
+orcli::Usage usage_of(std::optional<long long> completion, std::optional<long long> reasoning) {
+    orcli::Usage usage;
+    usage.completion_tokens = completion;
+    usage.reasoning_tokens = reasoning;
+    return usage;
+}
+
+std::string stop_reason(long long sent, std::optional<long long> completion,
+                        std::optional<long long> reasoning) {
+    return orcli::length_stop_reason(sent, std::nullopt, usage_of(completion, reasoning));
+}
+
+std::string stop_reason_with_limit(long long sent, long long model_limit,
+                                   std::optional<long long> completion,
+                                   std::optional<long long> reasoning) {
+    return orcli::length_stop_reason(sent, model_limit, usage_of(completion, reasoning));
+}
+
+} // namespace
+
+TEST_CASE("length stop: the whole sent budget used reports reasoning and answer tokens") {
+    CHECK(stop_reason(incident_budget, incident_budget, incident_reasoning) ==
+          "the answer used the whole 24000 token output budget after 17465 reasoning tokens, "
+          "with 6535 answer tokens; retry with a higher --max-output-tokens or a lower --effort");
+    CHECK(stop_reason(incident_budget, incident_budget + 2, incident_reasoning) ==
+          "the answer used the whole 24000 token output budget after 17465 reasoning tokens, "
+          "with 6537 answer tokens; retry with a higher --max-output-tokens or a lower --effort");
+    CHECK(stop_reason(incident_budget, incident_budget, incident_budget) ==
+          "the answer used the whole 24000 token output budget after 24000 reasoning tokens, "
+          "with 0 answer tokens; retry with a higher --max-output-tokens or a lower --effort");
+    CHECK(stop_reason(incident_budget, incident_budget, std::nullopt) ==
+          "the answer used the whole 24000 token output budget; retry with a higher "
+          "--max-output-tokens or a lower --effort");
+}
+
+TEST_CASE("length stop: below the sent budget says a higher budget will not help") {
+    CHECK(stop_reason(budget, below_budget_completion, below_budget_reasoning) ==
+          "the answer stopped at 9000 output tokens, below the 64000 token budget, at a provider "
+          "or context limit after 8465 reasoning tokens, with 535 answer tokens; a higher "
+          "--max-output-tokens will not help; retry with a lower --effort or less input");
+    CHECK(stop_reason(budget, reported_completion, reported_reasoning) ==
+          "the answer stopped at 14998 output tokens, below the 64000 token budget, at a "
+          "provider or context limit after 15806 reasoning tokens; a higher --max-output-tokens "
+          "will not help; retry with a lower --effort or less input");
+}
+
+TEST_CASE("length stop: unknown completion gives the general advice") {
+    CHECK(stop_reason(incident_budget, std::nullopt, std::nullopt) ==
+          "the answer stopped at an output limit (budget 24000 tokens); retry with a lower "
+          "--effort or a higher --max-output-tokens");
+    CHECK(stop_reason(incident_budget, std::nullopt, incident_reasoning) ==
+          "the answer stopped at an output limit (budget 24000 tokens) after 17465 reasoning "
+          "tokens; retry with a lower --effort or a higher --max-output-tokens");
+    CHECK(stop_reason(incident_budget, lowest, incident_reasoning) ==
+          "the answer stopped at an output limit (budget 24000 tokens) after 17465 reasoning "
+          "tokens; retry with a lower --effort or a higher --max-output-tokens");
+}
+
+TEST_CASE("length stop: negative and extreme counts never reach the subtraction") {
+    CHECK(stop_reason(incident_budget, incident_budget, -1) ==
+          "the answer used the whole 24000 token output budget; retry with a higher "
+          "--max-output-tokens or a lower --effort");
+    CHECK(stop_reason(incident_budget, incident_budget, lowest) ==
+          "the answer used the whole 24000 token output budget; retry with a higher "
+          "--max-output-tokens or a lower --effort");
+    CHECK(stop_reason(incident_budget, highest, 0) ==
+          std::format("the answer used the whole 24000 token output budget after 0 reasoning "
+                      "tokens, with {} answer tokens; retry with a higher --max-output-tokens "
+                      "or a lower --effort",
+                      highest));
+}
+
+TEST_CASE("length stop: a budget at the model's listed maximum is not advised to grow") {
+    CHECK(stop_reason_with_limit(incident_budget, incident_budget, incident_budget,
+                                 incident_reasoning) ==
+          "the answer used the whole 24000 token output budget (the model's listed maximum) "
+          "after 17465 reasoning tokens, with 6535 answer tokens; retry with a lower --effort or "
+          "less input");
+    CHECK(stop_reason_with_limit(incident_budget, incident_budget, std::nullopt, std::nullopt) ==
+          "the answer stopped at an output limit (budget 24000 tokens, the model's listed "
+          "maximum); retry with a lower --effort or less input");
+    CHECK(stop_reason_with_limit(incident_budget, budget, incident_budget, incident_reasoning) ==
+          stop_reason(incident_budget, incident_budget, incident_reasoning));
+    CHECK(stop_reason_with_limit(incident_budget, budget, std::nullopt, std::nullopt) ==
+          stop_reason(incident_budget, std::nullopt, std::nullopt));
+    CHECK(stop_reason_with_limit(budget, budget, below_budget_completion, below_budget_reasoning) ==
+          stop_reason(budget, below_budget_completion, below_budget_reasoning));
 }

@@ -336,7 +336,7 @@ When a command fails, it prints a short message and ends with an *exit code*. Yo
 | **3** | Stopped before sending. A key or password was found, the input was too big, the session was busy, or the cost log could not be written. ![Nothing was sent or charged](https://img.shields.io/badge/Nothing%20was%20sent%20or%20charged-1a7f37?style=flat-square) | Remove the flagged text, send less, or wait for the other question in that session to finish. |
 | **4** | The model name was not found, or it matched more than one model. | Pick one of the printed choices, or use the exact ID. |
 | **5** | OpenRouter or the network had a problem, the key was rejected, or no provider matched your model, provider and privacy choices. | Read the message. For "no provider", check the tags with `show`. Trying again is another paid question. |
-| **6** | The answer was cut short, for example because it ran out of room. | Any partial answer is kept in the answer file named in the message, unless the message says saving failed. Try a lower `-e` or a higher `--max-output-tokens`. Trying again is another paid question. |
+| **6** | The answer was cut short, for example because it ran out of room. | Any partial answer is kept in the answer file named in the message, unless the message says saving failed. When it ran out of room, the message says how much went to thinking and to the answer when OpenRouter reports those counts, and whether a higher `--max-output-tokens` can help or only a lower `-e` or less input. Trying again is another paid question. |
 | **7** | A setup problem, such as no key stored, a key that cannot be decrypted, a key found in the settings file, or a bad setting. | Run `openrouter-cli status` and follow what it says. |
 | **8** | You interrupted it (for example with <kbd>Ctrl</kbd>+<kbd>C</kbd>), while the answer was arriving or while the cost was being looked up. | Any partial answer is kept in the answer file named in the message, unless the message says saving failed. |
 | **9** | The answer arrived, but saving the answer, cost or session failed. ![You may have been charged](https://img.shields.io/badge/You%20may%20have%20been%20charged-9a6700?style=flat-square) | Use the answer shown on screen. **Do not just run it again.** |
@@ -377,7 +377,7 @@ Everything below is optional detail. Click a heading to open it.
 | --- | --- |
 | `openrouter-cli [OPTIONS] QUERY` | Ask a question. `-` as the query reads it from standard input. |
 | `find [--refresh] WORDS` | List models matching the words. `--refresh` downloads a fresh model list first. |
-| `show MODEL` | Prices, context and output limits, reasoning efforts and provider tags. |
+| `show MODEL` | Prices, context and output limits, the default output budget, reasoning efforts and provider tags. |
 | `save ALIAS MODEL_ID` | Save a nickname for an exact model ID. A model has one nickname, so a new one replaces the old. |
 | `remove ALIAS` | Delete a saved nickname. |
 | `list` | List saved nicknames. |
@@ -411,7 +411,7 @@ Everything below is optional detail. Click a heading to open it.
 | `--role ROLE` | `plain` (default) sends your question as written. `review` asks for a structured review. |
 | `-s`, `--system-prompt TEXT` | Extra instructions for the model, sent as its system prompt. `-s @FILE` reads them from a file. |
 | `-e`, `--effort LEVEL` | How hard the model thinks: `max`, `xhigh`, `high`, `medium`, `low`, `minimal` or `none`. Models that cannot choose ignore it. |
-| `--max-output-tokens N` | Most tokens the model may write, thinking included, up to the model's own limit. |
+| `--max-output-tokens N` | Most tokens the model may write, thinking included, up to the model's own limit. Leave it out to use the default (`OPENROUTER_CLI_MAX_OUTPUT_TOKENS`); a smaller number can cut the answer off while its thinking is still billed. |
 | `-p`, `--provider TAG` | Use only this provider. Copy tags from `show`. Repeat for more. |
 | `--privacy MODE` | `zdr` (default) or `no-training`. See [Privacy and safety](#privacy-and-safety). |
 | `--session NAME` | Keep the conversation under this name for follow-ups. |
@@ -435,7 +435,7 @@ A session remembers its first model and instructions, and only complete answers 
 | `--with-skills` | Also link the optional assistant skill. |
 | `--bin-dir DIR` | Install the program into DIR instead of `~/.local/bin`. |
 | `--force` | Replace or remove a file the script cannot confirm it installed. Look at the file first. |
-| `--fresh` | Throw away earlier build settings. Needed once when upgrading from an older build that used static OpenSSL. |
+| `--fresh` | Throw away earlier build settings. Needed once when upgrading from an older build that used static OpenSSL, in a `--check` run as well, because only `--check` sets up the debug build. |
 | `--jobs N` | Number of parallel build jobs (default: number of CPUs). |
 | `--list-compilers` | Show the Clang versions found and which one would be used. |
 | `--uninstall` | Remove the program and skill links without building. |
@@ -471,7 +471,7 @@ Then edit the file. Exported environment variables with the same names do **not*
 | `OPENROUTER_CLI_APP_TITLE` | `openrouter-cli` | App name shown in your OpenRouter activity. |
 | `OPENROUTER_CLI_APP_CATEGORIES` | `cli-agent` | App category sent to OpenRouter. |
 | `OPENROUTER_CLI_DEFAULT_EFFORT` | `high` | Effort used when `-e` is not given. |
-| `OPENROUTER_CLI_MAX_OUTPUT_TOKENS` | `64000` | Output budget, thinking included, capped at each model's limit. |
+| `OPENROUTER_CLI_MAX_OUTPUT_TOKENS` | `64000` | Output budget, thinking included, capped at each model's limit. It is a fixed number because a model's listed maximum is often a placeholder, and some models switch to a multi-part reply mode above their real per-answer limit. `show` prints the budget a model gets. |
 | `OPENROUTER_CLI_PRIVACY` | `zdr` | Default privacy mode. |
 | `OPENROUTER_CLI_CATALOG_TTL_HOURS` | `24` | Hours before the cached model list is refreshed. |
 | `OPENROUTER_CLI_IDLE_TIMEOUT_SECONDS` | `300` | Give up when no data is sent or received for this long. |

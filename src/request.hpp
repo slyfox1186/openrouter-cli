@@ -46,6 +46,14 @@ struct BuiltRequest {
 // name or "none" on a model whose reasoning is mandatory.
 Result<BuiltRequest> build_request(const RequestInput& input);
 
+// Why an answer with finish_reason "length" stopped, for the exit-6 message. budget is the
+// max_tokens that was sent and model_limit the model's listed maximum, which caps any higher
+// --max-output-tokens. A stop below the budget came from a provider or context limit, which a
+// higher budget cannot lift. Negative counts are left out, and the answer count is left out when
+// the reported reasoning exceeds the completion.
+std::string length_stop_reason(long long budget, std::optional<long long> model_limit,
+                               const Usage& usage);
+
 } // namespace orcli
 
 #endif // ORCLI_REQUEST_HPP

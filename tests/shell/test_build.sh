@@ -95,6 +95,35 @@ LOG="$SCRATCH/check.log"
 check 'failed command remains failed through logging' reject run_logged false
 check 'successful command and log succeed' run_logged printf 'saved\n'
 
+# Static analysis reads the debug compile database, so it must not run on one a failed configure
+# left behind. cmake, ctest and the checks are stubs; nothing is built.
+analyzer_marker="$SCRATCH/analyzers-called"
+fail_debug_step=""
+cmake() {
+    if [[ "$1" == --preset && "$2" == debug && "$fail_debug_step" == configure ]]; then return 1; fi
+    if [[ "$1" == --build && "$2" == "$DEBUG_DIR" && "$fail_debug_step" == build ]]; then return 1; fi
+    return 0
+}
+ctest() { return 0; }
+format_check() { return 0; }
+linkage_check() { return 0; }
+tidy_check() { printf 'tidy\n' >> "$analyzer_marker"; }
+cppcheck_check() { printf 'cppcheck\n' >> "$analyzer_marker"; }
+quiet_checks() { run_checks > /dev/null; }
+CHECK=1 QUICK=0 JOBS=1 DEBUG_DIR="$SCRATCH/debug" RELEASE_DIR="$SCRATCH/release-dir"
+COMMON_ARGS=()
+fail_debug_step=configure
+check 'failed debug configure fails the checks' reject quiet_checks
+check 'failed debug configure skips static analysis' test ! -e "$analyzer_marker"
+fail_debug_step=build
+check 'failed debug build fails the checks' reject quiet_checks
+check 'failed debug build still runs both analyzers' test "$(wc -l < "$analyzer_marker")" -eq 2
+rm -f -- "$analyzer_marker"
+fail_debug_step=""
+check 'passing stub checks pass' quiet_checks
+check 'passing checks run both analyzers' test "$(wc -l < "$analyzer_marker")" -eq 2
+unset -f cmake ctest format_check linkage_check tidy_check cppcheck_check quiet_checks
+
 # Exercise the production check-to-install boundary without invoking builds.
 install_marker="$SCRATCH/install-called"
 run_install() { printf 'installed\n' > "$install_marker"; }

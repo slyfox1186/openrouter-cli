@@ -16,7 +16,13 @@ Every question is a billed call. Before one:
 1. Resolve the model and read its prices with `openrouter-cli show <model>` (free).
 2. Tell the user the model id, any provider you will pin with `-p`, how many calls you will
    make, and the published input, cached input and output prices per million tokens from that
-   output (the endpoint row's prices when you pin a provider).
+   output (the endpoint row's prices when you pin a provider). For a worst-case cost, take the
+   highest `INPUT` and `OUTPUT` among the endpoint rows (only the pinned rows when you pin a
+   provider). Price the prompt at that input rate and the output budget the call sends (the
+   `Output budget` line, or the `--max-output-tokens` value you pass, capped at `Max output`) at
+   that output rate or the model's `Internal reasoning` price, whichever is higher, then add any
+   `Request` fee. When `show` says some requests are billed at different catalog rates, no worst
+   case can be computed from it; say so.
 3. Wait for approval, unless the user already approved that exact call in this turn.
 
 After the call, report the final `cost` line from stderr to the user. These commands are free
@@ -91,7 +97,10 @@ openrouter-cli -m google/gemini-4-argon --role review -f src/http.cpp -f src/htt
 - `-s TEXT` or `-s @FILE` (long form `--system-prompt`) adds system prompt text.
 - `-e EFFORT` sets reasoning effort (`max`, `xhigh`, `high`, `medium`, `low`, `minimal`, `none`);
   the default comes from the user's `config.env` (or legacy `.env`). Models that cannot select effort ignore it.
-- `--max-output-tokens N` sets the output budget, reasoning included.
+- `--max-output-tokens N` sets the output budget, reasoning included. Leave it unset: the default
+  (the `Output budget` line of `show`) leaves room for long reasoning, and a smaller cap can cut
+  the answer off after the call is billed. Pass it only when the user asks, or higher after an
+  exit `6` whose message advises a higher `--max-output-tokens`.
 
 ## Follow-up rounds
 
@@ -135,7 +144,7 @@ the `openrouter-cli:` lines.
 | `3` | Refused before sending: secret found, input too large, session busy, credential file, cost log not writable | Nothing was sent or billed. Remove the flagged content, shrink the input, wait until the other call on that session ends, or report the cost log problem. |
 | `4` | Unknown or ambiguous model | Choose from the printed candidates or ask the user. |
 | `5` | API or network failure, rejected key, or no endpoint matching the model, providers and privacy | Report the message. For no endpoint, check tags with `show`. A retry is another billed call; ask first. |
-| `6` | Incomplete answer (budget ran out, stream ended early, content filter) | The partial answer is in the answer file and the session is unchanged. Retry with a lower `--effort` or a higher `--max-output-tokens` only after telling the user it costs another call. |
+| `6` | Incomplete answer (output limit reached, stream ended early, content filter) | The partial answer is in the answer file and the session is unchanged. For an output limit the message gives the reasoning and answer token counts when usage allows, and says whether a higher `--max-output-tokens` can help. Retry as it advises only after telling the user it costs another call. |
 | `7` | Configuration problem: no stored key, key cannot be decrypted, plaintext key in settings, invalid settings | Follow Keys and sign-in above. Never read or print `config.env` or `.env`. |
 | `8` | Interrupted, during the answer or during the cost lookup after it | The partial answer was kept; report the cost line. |
 | `9` | The call finished and may have been billed, but saving failed (answer file, cost record or session) | Use the answer from stdout, report the message and cost line, and never retry automatically. |
