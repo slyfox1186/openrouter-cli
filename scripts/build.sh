@@ -51,6 +51,7 @@ usage() {
         "then installs the binary. --check adds sanitizer and static checks."
     printf '\n%s\n' "${header}OPTIONS${reset}"
     help_row "" --check "" "Add formatting, debug sanitizers and static analysis"
+    help_row "" --portable "" "Build for any x86-64 CPU instead of this machine's"
     help_row "" --quick "" "Build and check linkage only; no tests or installation"
     help_row "" --force "" "Replace or remove an unrecognized file or symlink"
     help_row "" --bin-dir DIR "Binary directory (default ~/.local/bin)"
@@ -73,7 +74,7 @@ usage_error() {
 
 parse_options() {
     FORCE=0 BIN_DIR="${HOME:-}/.local/bin" INSTALL_SKILL=0 REMOVE_SKILL=1
-    INSTALL=1 QUICK=0 CHECK=0 FRESH=0 JOBS="" LIST_ONLY=0 UNINSTALL=0 HELP=0
+    INSTALL=1 QUICK=0 CHECK=0 FRESH=0 PORTABLE=0 JOBS="" LIST_ONLY=0 UNINSTALL=0 HELP=0
     local build_option="" no_skill=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -93,6 +94,7 @@ parse_options() {
         --quick) QUICK=1; build_option="$1" ;;
         --check) CHECK=1; build_option="$1" ;;
         --fresh) FRESH=1; build_option="$1" ;;
+        --portable) PORTABLE=1; build_option="$1" ;;
         --jobs)
             [[ $# -ge 2 ]] || { usage_error "--jobs needs a number"; return 2; }
             JOBS="$2"; build_option="$1"; shift ;;
@@ -286,6 +288,26 @@ find_tool() {
     return 1
 }
 
+# launcher_for COMPILER: prints ccache when it is installed and COMPILER is not already one of
+# its PATH wrappers, so a newer unwrapped clang-N is cached too and nothing is cached twice.
+launcher_for() {
+    local ccache
+    ccache="$(find_tool ccache)" || return 0
+    [[ "$(readlink -f -- "$1")" == "$(readlink -f -- "$ccache")" ]] && return 0
+    printf '%s\n' "$ccache"
+}
+
+# Every value is passed on each run, so a setting cached by an earlier run never carries over.
+set_common_args() {
+    local native=ON
+    if [[ "$PORTABLE" == 1 ]]; then native=OFF; fi
+    COMMON_ARGS=("-DCMAKE_C_COMPILER=$CC_PATH" "-DCMAKE_CXX_COMPILER=$CXX_PATH"
+        "-DCMAKE_LINKER_TYPE=$LINKER_TYPE" "-DORCLI_NATIVE=$native"
+        "-DCMAKE_C_COMPILER_LAUNCHER=$(launcher_for "$CC_PATH")"
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=$(launcher_for "$CXX_PATH")")
+    if [[ "$FRESH" == 1 ]]; then COMMON_ARGS+=(--fresh); fi
+}
+
 format_check() {
     if [[ -z "$CLANG_FORMAT" ]]; then
         echo "clang-format not found"
@@ -405,6 +427,25 @@ run_logged() {
     return "${statuses[0]}"
 }
 
+# The CET compatibility property (IBT and SHSTK) is kept only when every linked object has it.
+# It marks the binary as compatible; the CPU, kernel and loader decide whether CET is enforced.
+cet_check() {
+    local notes line features
+    notes="$(LC_ALL=C readelf -nW -- "$BINARY")" || { echo "readelf -n failed on $BINARY"; return 1; }
+    while IFS= read -r line; do
+        [[ "$line" == *'x86 feature: '* ]] || continue
+        features="${line#*x86 feature: }"
+        features="${features%%, x86 *}"
+        if [[ ", $features," == *', IBT,'* && ", $features," == *', SHSTK,'* ]]; then
+            echo "CET property: $features"
+            return 0
+        fi
+    done <<< "$notes"
+    echo "the binary lacks the CET property (IBT and SHSTK): an object was built without"
+    echo "-fcf-protection; link with -Wl,-z,cet-report=warning to name it"
+    return 1
+}
+
 linkage_check() {
     local deps dynamic line entry resolved expected needed ssl=0 crypto=0
     local -a selected
@@ -448,6 +489,7 @@ linkage_check() {
         }
     done <<< "$deps"
     [[ "$ssl" == 1 && "$crypto" == 1 ]] || { echo "shared OpenSSL 3 or 4 is missing"; return 1; }
+    cet_check || return 1
     "$BINARY" --version
 }
 
@@ -536,8 +578,7 @@ main() {
     CLANG_TIDY="$(find_tool "clang-tidy-$CLANG_MAJOR" clang-tidy || true)"
     CPPCHECK="$(find_tool cppcheck || true)"
     [[ -n "$JOBS" ]] || JOBS="$(nproc)"
-    COMMON_ARGS=("-DCMAKE_C_COMPILER=$CC_PATH" "-DCMAKE_CXX_COMPILER=$CXX_PATH" "-DCMAKE_LINKER_TYPE=$LINKER_TYPE")
-    if [[ "$FRESH" == 1 ]]; then COMMON_ARGS+=(--fresh); fi
+    set_common_args
     DEBUG_DIR="build/debug-clang-$CC_VERSION"
     RELEASE_DIR="build/release-clang-$CC_VERSION"
     BINARY="$RELEASE_DIR/openrouter-cli"

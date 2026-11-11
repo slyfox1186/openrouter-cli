@@ -429,6 +429,7 @@ A session remembers its first model and instructions, and only complete answers 
 | Option | What it does |
 | --- | --- |
 | `--check` | Also run formatting checks, debug tests with memory and undefined-behavior sanitizers, `clang-tidy` and `cppcheck`. Needs those tools installed; versioned Clang tools (such as `clang-tidy-23`) are preferred. |
+| `--portable` | Build code that runs on any x86-64 processor. Without it, the program is tuned to the processor of the computer that builds it and may not start on an older one. |
 | `--no-install` | Build and test without installing. |
 | `--quick` | Build and check library linking only. No tests, no install. Cannot be combined with `--check`. |
 | `--with-skills` | Also link the optional assistant skill. |
@@ -544,7 +545,7 @@ Help text and the sign-in steps use your terminal's colors. Set `NO_COLOR` to an
 
 `openrouter-cli` is written in C++26 and builds with Clang only. Configuration checks that your compiler and standard library have the C++26 features the code uses (including `std::expected`, `std::print`, `std::format`, `std::flat_map`, `std::ranges::to`, `std::views::enumerate`, saturation arithmetic and `std::jthread`) before anything is downloaded. Building also needs Bash, GNU coreutils, `find`, `sort`, `readelf` and `ldd`.
 
-Release builds produce portable x86-64 code. For code tuned to your own processor, set the CMake option `ORCLI_NATIVE=ON`. Link-time optimization is used when the toolchain supports it. libcurl's threaded DNS resolver is kept on. libcurl and the C++ runtime are linked in statically, while OpenSSL 3 or 4 and glibc come from your system; static OpenSSL is not supported. The build refuses binaries with an embedded RPATH or RUNPATH and checks that the system's normal library loader finds the right OpenSSL.
+Release builds are tuned to the processor of the computer that builds them (`-march=native`), so a program built on one computer may not start on an older one; `--portable` builds for any x86-64 processor instead. Release builds use `-O2` and link-time optimization (ThinLTO) when the toolchain supports it, including for the bundled libcurl. All compiled code, the bundled libcurl included, uses the hardening options of the OpenSSF compiler hardening guide, plus frame pointers so profilers and debuggers can follow the call stack. The build checks that the program carries the Intel CET compatibility marking (IBT and shadow stack); whether CET is actually enforced depends on the processor, kernel and system libraries. The program needs glibc 2.36 or later. If `ccache` is installed, the build uses it. libcurl's threaded DNS resolver is kept on. libcurl and the C++ runtime are linked in statically, while OpenSSL 3 or 4 and glibc come from your system; static OpenSSL is not supported. The build refuses binaries with an embedded RPATH or RUNPATH and checks that the system's normal library loader finds the right OpenSSL.
 
 At run time, the commands that use a key also need `systemd-creds` on your `PATH` and a working systemd user credential service. A recent systemd version alone does not guarantee that, for example inside a container.
 

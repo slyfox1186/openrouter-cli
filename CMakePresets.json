@@ -21,6 +21,8 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS_DEBUG": "-O1 -g",
+        "CMAKE_CXX_FLAGS_DEBUG": "-O1 -g",
         "ORCLI_SANITIZE": "ON",
         "BUILD_TESTING": "ON"
       }

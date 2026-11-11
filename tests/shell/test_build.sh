@@ -44,6 +44,52 @@ check 'uninstall accepts force' parse_options --uninstall --force --no-skill
 check 'uninstall binary only' test "$REMOVE_SKILL" = 0
 check 'skills option parses' parse_options --with-skills
 check 'skills enabled explicitly' test "$INSTALL_SKILL" = 1
+check 'portable option parses' parse_options --portable
+check 'portable selected' test "$PORTABLE" = 1
+check 'next parse returns to native' parse_options
+check 'native is the default' test "$PORTABLE" = 0
+check 'portable conflicts with uninstall' reject parse_options --uninstall --portable
+
+# CMake arguments: native or portable code, and ccache as launcher only for unwrapped compilers.
+has_arg() {
+    local wanted="$1" arg
+    for arg in "${COMMON_ARGS[@]}"; do [[ "$arg" == "$wanted" ]] && return 0; done
+    return 1
+}
+tools="$SCRATCH/tools"
+mkdir -p "$tools/wrappers" || exit 1
+printf '#!/bin/sh\n' > "$tools/ccache" && chmod +x "$tools/ccache"
+printf '#!/bin/sh\n' > "$tools/clang-99" && chmod +x "$tools/clang-99"
+ln -s ../ccache "$tools/wrappers/clang"
+saved_path="$PATH"
+LINKER_TYPE=DEFAULT FRESH=0
+PORTABLE=0 CC_PATH="$tools/clang-99" CXX_PATH="$tools/wrappers/clang"
+PATH="$tools:$saved_path" set_common_args
+check 'native code by default' has_arg -DORCLI_NATIVE=ON
+check 'unwrapped compiler gets ccache' has_arg "-DCMAKE_C_COMPILER_LAUNCHER=$tools/ccache"
+check 'ccache wrapper is not wrapped again' has_arg -DCMAKE_CXX_COMPILER_LAUNCHER=
+PORTABLE=1
+find_tool() { return 1; }
+set_common_args
+check 'portable turns native off' has_arg -DORCLI_NATIVE=OFF
+check 'no ccache leaves the launcher empty' has_arg -DCMAKE_C_COMPILER_LAUNCHER=
+check 'fresh is off unless asked' reject has_arg --fresh
+unset -f find_tool has_arg
+source "$SOURCE_ROOT/scripts/build.sh"
+
+# CET property check against stubbed readelf output.
+readelf_output="" readelf_status=0
+readelf() { printf '%s\n' "$readelf_output"; return "$readelf_status"; }
+quiet_cet() { cet_check > /dev/null; }
+readelf_output='      Properties: x86 feature: IBT, SHSTK, x86 ISA needed: x86-64-v4, x86 feature used: x86'
+check 'CET property accepted' quiet_cet
+readelf_output='      Properties: x86 feature: IBT, x86 ISA needed: x86-64-baseline'
+check 'missing SHSTK rejected' reject quiet_cet
+readelf_output='      Properties: x86 ISA needed: x86-64-baseline, x86 feature used: x86, IBT, SHSTK'
+check 'feature-used list is not the CET property' reject quiet_cet
+readelf_output='      Properties: x86 feature: IBT, SHSTK' readelf_status=1
+check 'readelf failure rejected' reject quiet_cet
+unset -f readelf quiet_cet
 
 parse_options --bin-dir "$SCRATCH/bin"
 check 'first binary install' install_binary

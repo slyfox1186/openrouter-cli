@@ -4,12 +4,14 @@ project(openrouter_cli VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# No source uses C++ modules; without this, C++26 targets get a dependency scan per file.
+set(CMAKE_CXX_SCAN_FOR_MODULES 0)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 include(CheckPIESupported)
 check_pie_supported()
 
 option(ORCLI_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
-option(ORCLI_NATIVE "Optimize release builds for the CPU of the building machine" OFF)
+option(ORCLI_NATIVE "Optimize release builds for the CPU of the building machine" ON)
 include(CTest)
 include(FetchContent)
 
@@ -164,32 +166,51 @@ set(CURL_DISABLE_SMTP ON)
 set(CURL_DISABLE_TELNET ON)
 set(CURL_DISABLE_TFTP ON)
 set(CURL_DISABLE_WEBSOCKETS ON)
+# The hardening below is applied to libcurl_static, which compiles curl's sources itself only
+# while curl does not share one object library between its static and shared builds.
+set(SHARE_LIB_OBJECT OFF)
 FetchContent_MakeAvailable(curl)
 
 set(BUILD_TESTING ${_orcli_build_testing})
 
 # ---------------------------------------------------------------------------------------------
-# Flags for first-party code: OpenSSF "Compiler Options Hardening Guide for C and C++"
-# (TL;DR set, plus the x86_64 and production-code additions), warnings as errors.
+# Code generation: OpenSSF "Compiler Options Hardening Guide for C and C++" (TL;DR set, plus the
+# x86_64 and production-code additions), frame pointers and -fno-plt as in the Arch and Ubuntu
+# distribution build flags, and -march=native unless ORCLI_NATIVE is off. The production-code
+# flags and _FORTIFY_SOURCE stay out of sanitizer builds: -fno-strict-overflow removes UBSan's
+# signed-overflow checks, and the guide rules out fortification under AddressSanitizer.
 # ---------------------------------------------------------------------------------------------
 
+set(ORCLI_CODEGEN_FLAGS
+    -fstack-clash-protection -fstack-protector-strong
+    -fcf-protection=full -fzero-call-used-regs=used-gpr
+    -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -fno-plt
+    $<$<NOT:$<BOOL:${ORCLI_SANITIZE}>>:-fno-delete-null-pointer-checks -fno-strict-overflow
+        -fno-strict-aliasing -ftrivial-auto-var-init=zero>
+    $<$<AND:$<CONFIG:Release>,$<NOT:$<BOOL:${ORCLI_SANITIZE}>>>:-U_FORTIFY_SOURCE
+        -D_FORTIFY_SOURCE=3>
+    $<$<BOOL:${ORCLI_SANITIZE}>:-U_FORTIFY_SOURCE>
+    $<$<AND:$<CONFIG:Release>,$<BOOL:${ORCLI_NATIVE}>>:-march=native>)
+
+# Hardening only covers code compiled with it, and a single object without -fcf-protection
+# clears the CET (IBT, SHSTK) property from the whole executable. -fexceptions is the guide's
+# rule for threaded C (curl's threaded resolver). -fstrict-flex-arrays=3 stays off because curl
+# ends several structs in [1] arrays that it allocates past (lib/headers.h, lib/hash.h).
+target_compile_options(libcurl_static PRIVATE ${ORCLI_CODEGEN_FLAGS} -fexceptions)
+
+# First-party code also gets warnings as errors, strict flexible arrays and libstdc++ assertions.
 add_library(orcli_flags INTERFACE)
 target_compile_options(orcli_flags INTERFACE
     -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat -Wformat=2
     -Wimplicit-fallthrough -Werror=format-security -Werror
-    -fstrict-flex-arrays=3 -fstack-clash-protection -fstack-protector-strong
-    -fcf-protection=full -fzero-call-used-regs=used-gpr
-    -fno-delete-null-pointer-checks -fno-strict-overflow -fno-strict-aliasing
-    -ftrivial-auto-var-init=zero
-    $<$<CONFIG:Release>:-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3>
-    $<$<AND:$<CONFIG:Release>,$<BOOL:${ORCLI_NATIVE}>>:-march=native>)
+    -fstrict-flex-arrays=3 ${ORCLI_CODEGEN_FLAGS})
 target_compile_definitions(orcli_flags INTERFACE _GLIBCXX_ASSERTIONS)
 target_link_options(orcli_flags INTERFACE
     -Wl,-z,nodlopen -Wl,-z,noexecstack -Wl,-z,relro -Wl,-z,now
-    -Wl,--as-needed -Wl,--no-copy-dt-needed-entries)
+    -Wl,--as-needed -Wl,--no-copy-dt-needed-entries -Wl,-z,pack-relative-relocs)
 if(ORCLI_SANITIZE)
     target_compile_options(orcli_flags INTERFACE
-        -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
+        -fsanitize=address,undefined -fno-sanitize-recover=all -fno-optimize-sibling-calls)
     target_link_options(orcli_flags INTERFACE -fsanitize=address,undefined)
 endif()
 
@@ -227,9 +248,9 @@ target_link_options(openrouter-cli PRIVATE -static-libstdc++ -static-libgcc)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     include(CheckIPOSupported)
-    check_ipo_supported(RESULT ORCLI_IPO_SUPPORTED OUTPUT ORCLI_IPO_ERROR LANGUAGES CXX)
+    check_ipo_supported(RESULT ORCLI_IPO_SUPPORTED OUTPUT ORCLI_IPO_ERROR LANGUAGES C CXX)
     if(ORCLI_IPO_SUPPORTED)
-        set_property(TARGET orcli_core orcli_help openrouter-cli
+        set_property(TARGET libcurl_static orcli_core orcli_help openrouter-cli
             PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
     else()
         message(STATUS "Link-time optimization unavailable; building without it: ${ORCLI_IPO_ERROR}")
