@@ -329,8 +329,12 @@ cppcheck_check() {
         echo "no compile_commands.json in $DEBUG_DIR"
         return 1
     fi
+    # uninitMemberVarNoCtor flags aggregates such as Error, whose fields have no default values
+    # on purpose: with -Wextra -Werror, clang then rejects any designated initializer that omits
+    # one, and clang-tidy's cppcoreguidelines-pro-type-member-init rejects uninitialized use.
     "$CPPCHECK" --project="$DEBUG_DIR/compile_commands.json" --file-filter="$ROOT/src/*" \
-        --enable=warning,performance,portability --error-exitcode=1 --quiet -j "$JOBS"
+        --enable=warning,performance,portability --suppress=uninitMemberVarNoCtor \
+        --error-exitcode=1 --quiet -j "$JOBS"
 }
 
 link() {
