@@ -8,21 +8,71 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using orcli::ActivityRow;
 using orcli::Exit;
+using namespace std::string_view_literals;
+
+// One /activity row as OpenRouter sends it, with every field the parser reads.
+nlohmann::json wire_activity_row(std::string_view date, long long requests = 1) {
+    return {{"date", date},          {"model", "a/b"},     {"provider_name", "p"},
+            {"requests", requests},  {"prompt_tokens", 0}, {"completion_tokens", 0},
+            {"reasoning_tokens", 0}, {"usage", 0}};
+}
+
+// A vector, because a one-element braced list converted straight to json is a copy of that
+// element rather than an array holding it.
+std::string activity_body(const std::vector<nlohmann::json>& rows) {
+    return nlohmann::json{{"data", rows}}.dump();
+}
 
 TEST_CASE("activity dates are validated before records enter summaries") {
-    for (const std::string_view date : {"2026-02-30", "2026-11-09junk", "bad"}) {
-        const nlohmann::json row{{"date", date},          {"model", "a/b"},
-                                 {"provider_name", "p"},  {"requests", 1},
-                                 {"prompt_tokens", 0},    {"completion_tokens", 0},
-                                 {"reasoning_tokens", 0}, {"usage", 0}};
-        CHECK_FALSE(orcli::parse_activity(nlohmann::json{{"data", {row}}}.dump()).has_value());
+    // Chrono parsing alone accepts several of these: its field widths are maxima, a format
+    // space matches any whitespace, and libstdc++'s %T takes minute 60.
+    for (const std::string_view date :
+         {"2026-02-30", "2026-11-09junk", "bad", "2026-11-08T00:00:00", "2026-11-08 24:00:00",
+          "2026-11-08 00:60:00", "2026-11-08 23:60:00", "2026-11-08 00:00:60", "2026-11-08 0:0:0",
+          "2026-11-08\t00:00:00", "2026-11-0800:00:00", "2026-11-8  00:00:00",
+          "2026-11-08 00:00:00Z", "2026-11-08 00:00:00.000", "2026-11-08 00:00:00 ",
+          "2026-11-08 00:00", "2026-02-30 00:00:00", "+026-11-08", "2026-11-08 +0:00:00"}) {
+        CAPTURE(date);
+        const auto parsed = orcli::parse_activity(activity_body({wire_activity_row(date)}));
+        REQUIRE_FALSE(parsed.has_value());
+        CHECK(parsed.error().message ==
+              "unexpected response from GET /activity: row 1: field date is not a YYYY-MM-DD "
+              "date");
     }
+}
+
+TEST_CASE("activity dates in either OpenRouter form become the UTC day") {
+    // The API reference documents YYYY-MM-DD; the live API sends YYYY-MM-DD HH:MM:SS.
+    for (const auto& [date, day] : {std::pair{"2026-11-08"sv, "2026-11-08"sv},
+                                    std::pair{"2026-11-08 00:00:00"sv, "2026-11-08"sv},
+                                    std::pair{"2026-11-08 23:59:59"sv, "2026-11-08"sv},
+                                    std::pair{"2024-02-29 12:30:00"sv, "2024-02-29"sv}}) {
+        CAPTURE(date);
+        const auto rows = orcli::parse_activity(activity_body({wire_activity_row(date)}));
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK(rows->front().date == day);
+    }
+}
+
+TEST_CASE("activity rows of one day merge whichever date form they arrived in") {
+    constexpr long long first_requests = 2;
+    constexpr long long second_requests = 3;
+    const auto rows = orcli::parse_activity(
+        activity_body({wire_activity_row("2026-11-08", first_requests),
+                       wire_activity_row("2026-11-08 13:45:09", second_requests)}));
+    REQUIRE(rows.has_value());
+    const std::vector<ActivityRow> summary = orcli::summarize_activity(*rows, 1, "2026-11-09");
+    REQUIRE(summary.size() == 1);
+    CHECK(summary.front().date == "2026-11-08");
+    CHECK(summary.front().requests == first_requests + second_requests);
 }
 
 TEST_CASE("tiny nonzero charges never display as zero") {
@@ -64,7 +114,11 @@ constexpr std::string_view activity_json = R"json({"data": [
   {"date": "2026-11-08", "model": "openai/gpt-6-sol", "model_permaslug": "openai/gpt-6-sol-1",
    "endpoint_id": "e1", "provider_name": "OpenAI", "usage": 0.015, "byok_usage_inference": 0,
    "requests": 5, "prompt_tokens": 50, "completion_tokens": 125, "reasoning_tokens": 25,
-   "cached_tokens": 10}
+   "cached_tokens": 10},
+  {"date": "2026-11-07 13:45:09", "model": "openai/gpt-6-sol",
+   "model_permaslug": "openai/gpt-6-sol-1", "endpoint_id": "e2", "provider_name": "Azure",
+   "usage": 0, "byok_usage_inference": 0, "requests": 1, "prompt_tokens": 7,
+   "completion_tokens": 3, "reasoning_tokens": 0, "cached_tokens": 0, "byok_requests": 0}
 ]})json";
 
 constexpr std::string_view members_json = R"json({"data": [
@@ -109,7 +163,8 @@ std::vector<ActivityRow> window_rows() {
 
 void check_api_error(const orcli::Error& error, std::string_view path) {
     CHECK(error.code == Exit::api);
-    CHECK(error.message == std::string("unexpected response from GET ") + std::string(path));
+    CHECK(error.message.starts_with(std::string("unexpected response from GET ") +
+                                    std::string(path) + ": "));
 }
 
 } // namespace
@@ -297,13 +352,77 @@ TEST_CASE("parse_credits rejects missing, null and wrong-typed totals") {
 
 TEST_CASE("parse_activity reads rows and keeps reasoning tokens separate") {
     const std::vector<ActivityRow> rows = orcli::parse_activity(activity_json).value();
-    REQUIRE(rows.size() == 1);
+    REQUIRE(rows.size() == 2);
     const ActivityRow& row = rows.front();
     CHECK(row.date == "2026-11-08");
     CHECK(row.provider == "OpenAI");
     CHECK(row.requests == activity_requests);
     CHECK(row.completion_tokens == activity_completion);
     CHECK(row.reasoning_tokens == activity_reasoning);
+    CHECK(rows.back().date == "2026-11-07");
+    CHECK(rows.back().provider == "Azure");
+    CHECK(rows.back().usage == doctest::Approx(0.0));
+}
+
+TEST_CASE("parse errors name the row, field and JSON type but never a value") {
+    const auto detail = [](std::string_view body) {
+        const auto parsed = orcli::parse_activity(body);
+        REQUIRE_FALSE(parsed.has_value());
+        CHECK(parsed.error().code == Exit::api);
+        const std::string_view prefix = "unexpected response from GET /activity: ";
+        REQUIRE(parsed.error().message.starts_with(prefix));
+        return parsed.error().message.substr(prefix.size());
+    };
+    const auto with = [](std::string_view key, const nlohmann::json& value) {
+        nlohmann::json row = wire_activity_row("2026-11-08");
+        row[std::string(key)] = value;
+        return activity_body({wire_activity_row("2026-11-07"), row});
+    };
+    constexpr double fractional = 1.5;
+    constexpr unsigned long long largest = 9'223'372'036'854'775'807ULL;
+    CHECK(detail(with("usage", "secret-value")) ==
+          "row 2: field usage is string, expected a number");
+    CHECK(detail(with("requests", fractional)) ==
+          "row 2: field requests is number, expected a whole number");
+    CHECK(detail(with("requests", largest + 1)) == "row 2: field requests is out of range");
+    CHECK(detail(with("model", nullptr)) == "row 2: field model is null or missing");
+    CHECK(detail(with("provider_name", nlohmann::json::array())) ==
+          "row 2: field provider_name is array, expected a string");
+    CHECK(detail("not json") == "the reply is not a JSON object with a data member");
+    CHECK(detail("[]") == "the reply is not a JSON object with a data member");
+    CHECK(detail(R"({"error": {}})") == "the reply is not a JSON object with a data member");
+    CHECK(detail(R"({"data": null})") == "data is null, expected an array");
+    CHECK(detail(R"({"data": {}})") == "data is object, expected an array");
+    CHECK(detail(R"({"data": [{}, 1]})") == "row 1: field date is null or missing");
+    CHECK(detail(activity_body({wire_activity_row("2026-11-08"), 1})) == "row 2 is not an object");
+
+    nlohmann::json missing = wire_activity_row("2026-11-08");
+    missing.erase("usage");
+    CHECK(detail(activity_body({missing})) == "row 1: field usage is null or missing");
+
+    const auto at_limit = orcli::parse_activity(with("requests", largest));
+    REQUIRE(at_limit.has_value());
+    CHECK(at_limit->back().requests == static_cast<long long>(largest));
+
+    const std::string leaked = orcli::parse_activity(with("usage", "secret-value")).error().message;
+    CHECK_FALSE(leaked.contains("secret-value"));
+}
+
+TEST_CASE("object replies name the field and a data member of the wrong type") {
+    const auto credits =
+        orcli::parse_credits(R"({"data": {"total_credits": "1", "total_usage": 0}})");
+    REQUIRE_FALSE(credits.has_value());
+    CHECK(
+        credits.error().message ==
+        "unexpected response from GET /credits: field total_credits is string, expected a number");
+    const auto credits_list = orcli::parse_credits(R"({"data": []})");
+    REQUIRE_FALSE(credits_list.has_value());
+    CHECK(credits_list.error().message ==
+          "unexpected response from GET /credits: data is array, expected an object");
+    const auto key = orcli::parse_key_status(R"({"data": "x"})");
+    REQUIRE_FALSE(key.has_value());
+    CHECK(key.error().message ==
+          "unexpected response from GET /key: data is string, expected an object");
 }
 
 TEST_CASE("parse_activity accepts empty data and rejects malformed numbers") {

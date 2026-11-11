@@ -2518,6 +2518,30 @@ TEST_CASE("an account error message from OpenRouter is shown as one clean line")
     CHECK_FALSE(result.err.contains("\nspoof"));
 }
 
+TEST_CASE("an unreadable activity reply names the row and field without quoting it") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_management_key();
+    server.set_route("/activity", [](const RecordedRequest&) {
+        const auto row = [](std::string_view date) {
+            return json{{"date", date},          {"model", "m"},       {"provider_name", "p"},
+                        {"requests", 1},         {"prompt_tokens", 0}, {"completion_tokens", 0},
+                        {"reasoning_tokens", 0}, {"usage", 0}};
+        };
+        return Reply{.status = http_ok,
+                     .body =
+                         json{{"data", {row("2026-11-08 00:00:00"), row("08/11/2026")}}}.dump()};
+    });
+
+    const RunResult result = sandbox.run({"account", "activity"});
+
+    CHECK(result.code == exit_api);
+    CHECK(result.err.contains(
+        "unexpected response from GET /activity: row 2: field date is not a YYYY-MM-DD date"));
+    CHECK_FALSE(result.err.contains("08/11/2026"));
+    CHECK(result.out.empty());
+}
+
 TEST_CASE("account activity sums endpoint rows and filters --days by completed UTC days") {
     MockServer server;
     Sandbox sandbox(server.port());

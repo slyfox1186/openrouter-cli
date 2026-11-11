@@ -293,9 +293,11 @@ std::string keys_page(int offset) {
     return std::string(empty_page);
 }
 
+// The live API's row shape (2026-11-11): the date carries a time, and cached_tokens and
+// byok_requests are present.
 json activity_row(const std::string& date, std::string_view model, std::string_view endpoint_id,
                   long long requests, long long prompt_tokens, double usage) {
-    return {{"date", date},
+    return {{"date", date + " 00:00:00"},
             {"model", std::string(model)},
             {"model_permaslug", std::string(model)},
             {"endpoint_id", std::string(endpoint_id)},
@@ -305,7 +307,9 @@ json activity_row(const std::string& date, std::string_view model, std::string_v
             {"requests", requests},
             {"prompt_tokens", prompt_tokens},
             {"completion_tokens", 50},
-            {"reasoning_tokens", 10}};
+            {"reasoning_tokens", 10},
+            {"cached_tokens", 0},
+            {"byok_requests", 0}};
 }
 
 // Yesterday has two endpoint rows for one model and provider (requests 30 + 12 = 42, prompt

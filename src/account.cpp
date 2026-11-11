@@ -48,36 +48,53 @@ constexpr double smallest_four_decimal_amount = 0.0001;
 constexpr std::size_t money_buffer_bytes = 384;
 constexpr std::size_t digits_per_group = 3;
 constexpr std::size_t date_length = 10; // YYYY-MM-DD
+constexpr std::string_view date_pattern = "9999-99-99";
+constexpr std::string_view timestamp_pattern = "9999-99-99 99:99:99";
+constexpr std::size_t hour_offset = 11;
+constexpr std::size_t minute_offset = 14;
+constexpr std::size_t second_offset = 17;
+constexpr int max_hour = 23;
+constexpr int max_minute = 59;
+constexpr int max_second = 59;
 constexpr std::size_t column_gap = 2;
 constexpr std::size_t label_width = 20;
 constexpr std::size_t max_reason_chars = 400;
 
-// Response text is never quoted: an error body can echo what was sent.
-std::unexpected<Error> malformed(std::string_view path) {
-    return fail(Exit::api, std::format("unexpected response from GET {}", path));
+// Response text is never quoted: an error body can echo what was sent. `detail` names only
+// fields, JSON types and row numbers.
+std::unexpected<Error> malformed(std::string_view path, std::string_view detail) {
+    return fail(Exit::api, std::format("unexpected response from GET {}: {}", path, detail));
 }
 
-// The response's `data` member, owned so callers can keep references into it.
-std::optional<json> response_data(std::string_view json_text) {
+// The response's `data` member, owned so callers can keep references into it; it must have the
+// JSON type `type` (an object or an array). `path` names the request in the error.
+Result<json> response_data(std::string_view json_text, json::value_t type, std::string_view path) {
     json document = json::parse(json_text, nullptr, false);
     if (!document.is_object()) {
-        return std::nullopt;
+        return malformed(path, "the reply is not a JSON object with a data member");
     }
     const auto found = document.find("data");
     if (found == document.end()) {
-        return std::nullopt;
+        return malformed(path, "the reply is not a JSON object with a data member");
+    }
+    if (found->type() != type) {
+        return malformed(path,
+                         std::format("data is {}, expected {}", found->type_name(),
+                                     type == json::value_t::array ? "an array" : "an object"));
     }
     return std::move(*found);
 }
 
 // Reads typed fields from one JSON object. Absent and null fields are std::nullopt; a present
 // field of the wrong type, or a missing required field, marks the object invalid so the caller
-// rejects the whole response instead of showing a guessed value.
+// rejects the whole response instead of showing a guessed value. The first such problem is kept
+// for the error message.
 class FieldReader {
 public:
     explicit FieldReader(const json& object) : object_(&object) {}
 
-    [[nodiscard]] bool valid() const { return valid_; }
+    [[nodiscard]] bool valid() const { return !problem_.has_value(); }
+    [[nodiscard]] std::string problem() const { return problem_.value_or(""); }
 
     std::optional<std::string> optional_text(std::string_view key) {
         const json* value = lookup(key);
@@ -85,7 +102,7 @@ public:
             return std::nullopt;
         }
         if (!value->is_string()) {
-            valid_ = false;
+            wrong_type(key, *value, "a string");
             return std::nullopt;
         }
         return value->get<std::string>();
@@ -97,7 +114,7 @@ public:
             return std::nullopt;
         }
         if (!value->is_number()) {
-            valid_ = false;
+            wrong_type(key, *value, "a number");
             return std::nullopt;
         }
         return value->get<double>();
@@ -108,13 +125,17 @@ public:
         if (value == nullptr) {
             return std::nullopt;
         }
-        if (value->is_number_unsigned() && std::in_range<long long>(value->get<std::uint64_t>())) {
-            return static_cast<long long>(value->get<std::uint64_t>());
+        if (value->is_number_unsigned()) {
+            if (std::in_range<long long>(value->get<std::uint64_t>())) {
+                return static_cast<long long>(value->get<std::uint64_t>());
+            }
+            note(std::format("field {} is out of range", key));
+            return std::nullopt;
         }
-        if (value->is_number_integer() && !value->is_number_unsigned()) {
+        if (value->is_number_integer()) {
             return value->get<long long>();
         }
-        valid_ = false;
+        wrong_type(key, *value, "a whole number");
         return std::nullopt;
     }
 
@@ -124,16 +145,16 @@ public:
             return std::nullopt;
         }
         if (!value->is_boolean()) {
-            valid_ = false;
+            wrong_type(key, *value, "a boolean");
             return std::nullopt;
         }
         return value->get<bool>();
     }
 
-    std::string text(std::string_view key) { return required(optional_text(key)); }
-    double number(std::string_view key) { return required(optional_number(key)); }
-    long long count(std::string_view key) { return required(optional_count(key)); }
-    bool flag(std::string_view key) { return required(optional_flag(key)); }
+    std::string text(std::string_view key) { return required(key, optional_text(key)); }
+    double number(std::string_view key) { return required(key, optional_number(key)); }
+    long long count(std::string_view key) { return required(key, optional_count(key)); }
+    bool flag(std::string_view key) { return required(key, optional_flag(key)); }
 
 private:
     [[nodiscard]] const json* lookup(std::string_view key) const {
@@ -144,16 +165,27 @@ private:
         return &*found;
     }
 
-    template <class T> T required(std::optional<T> value) {
+    // A wrong type found by the optional_ reader is kept over this later "missing".
+    template <class T> T required(std::string_view key, std::optional<T> value) {
         if (!value.has_value()) {
-            valid_ = false;
+            note(std::format("field {} is null or missing", key));
             return T{};
         }
         return std::move(*value);
     }
 
+    void wrong_type(std::string_view key, const json& value, std::string_view expected) {
+        note(std::format("field {} is {}, expected {}", key, value.type_name(), expected));
+    }
+
+    void note(std::string problem) {
+        if (!problem_.has_value()) {
+            problem_ = std::move(problem);
+        }
+    }
+
     const json* object_;
-    bool valid_ = true;
+    std::optional<std::string> problem_;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -266,13 +298,88 @@ std::string render_fields(const std::vector<Field>& fields) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Parsing of list rows.
+// Dates.
 // ---------------------------------------------------------------------------------------------
 
-std::optional<KeyEntry> parse_key_entry(const json& item) {
-    if (!item.is_object()) {
+// Rejects trailing text so "2026-11-08junk" is not read as a date.
+std::optional<std::chrono::sys_days> parse_date(std::string_view text) {
+    std::istringstream input{std::string(text)};
+    std::chrono::sys_days day{};
+    input >> std::chrono::parse("%F", day);
+    if (input.fail() || input.peek() != std::istringstream::traits_type::eof()) {
         return std::nullopt;
     }
+    return day;
+}
+
+// '9' stands for one ASCII digit; every other character must match exactly. std::chrono::parse
+// alone cannot enforce the shape: its field widths are maxima ("2026-11-08 0:0:0" parses) and a
+// space in the format matches any run of whitespace, including none.
+bool matches_pattern(std::string_view text, std::string_view pattern) {
+    return text.size() == pattern.size() &&
+           std::ranges::equal(text, pattern, [](char got, char want) {
+               return want == '9' ? (got >= '0' && got <= '9') : got == want;
+           });
+}
+
+// The two digits at `first` read as a number no greater than `max`.
+bool two_digits_within(std::string_view text, std::size_t first, int max) {
+    const std::string_view digits = text.substr(first, 2);
+    const char* const digits_end = std::to_address(digits.end());
+    int value = 0;
+    const auto parsed = std::from_chars(std::to_address(digits.begin()), digits_end, value);
+    return parsed.ec == std::errc{} && parsed.ptr == digits_end && value <= max;
+}
+
+// The UTC day of an activity row. OpenRouter's API reference gives `date` as YYYY-MM-DD, but the
+// live API (seen 2026-11-11) sends YYYY-MM-DD HH:MM:SS; both are accepted. Rows are totals per
+// UTC day, so the day is the date part whatever the time. The time is checked by hand because
+// libstdc++ 16's %T accepts minute 60 and carries 23:60:00 into the next day.
+std::optional<std::string> activity_day(std::string_view text) {
+    if (matches_pattern(text, timestamp_pattern)) {
+        if (!two_digits_within(text, hour_offset, max_hour) ||
+            !two_digits_within(text, minute_offset, max_minute) ||
+            !two_digits_within(text, second_offset, max_second)) {
+            return std::nullopt;
+        }
+        text = text.substr(0, date_length);
+    }
+    if (!matches_pattern(text, date_pattern) || !parse_date(text).has_value()) {
+        return std::nullopt;
+    }
+    return std::string(text);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Parsing of list rows. Each parser gets a JSON object and returns the row or the problem, which
+// names a field but never quotes a value.
+// ---------------------------------------------------------------------------------------------
+
+template <class Row>
+Result<std::vector<Row>> parse_rows(std::string_view json_text, std::string_view path,
+                                    std::expected<Row, std::string> (*parse_row)(const json&)) {
+    const auto data = response_data(json_text, json::value_t::array, path);
+    if (!data) {
+        return std::unexpected(data.error());
+    }
+    std::vector<Row> rows;
+    rows.reserve(data->size());
+    std::size_t number = 0;
+    for (const json& item : *data) {
+        ++number;
+        if (!item.is_object()) {
+            return malformed(path, std::format("row {} is not an object", number));
+        }
+        auto row = parse_row(item);
+        if (!row) {
+            return malformed(path, std::format("row {}: {}", number, row.error()));
+        }
+        rows.push_back(std::move(*row));
+    }
+    return rows;
+}
+
+std::expected<KeyEntry, std::string> parse_key_entry(const json& item) {
     FieldReader fields(item);
     KeyEntry key;
     key.hash = fields.text("hash");
@@ -290,15 +397,12 @@ std::optional<KeyEntry> parse_key_entry(const json& item) {
     key.limit_remaining = fields.optional_number("limit_remaining");
     key.limit_reset = fields.optional_text("limit_reset");
     if (!fields.valid()) {
-        return std::nullopt;
+        return std::unexpected(fields.problem());
     }
     return key;
 }
 
-std::optional<MemberEntry> parse_member(const json& item) {
-    if (!item.is_object()) {
-        return std::nullopt;
-    }
+std::expected<MemberEntry, std::string> parse_member(const json& item) {
     FieldReader fields(item);
     MemberEntry member{
         .id = fields.text("id"),
@@ -308,15 +412,12 @@ std::optional<MemberEntry> parse_member(const json& item) {
         .role = fields.text("role"),
     };
     if (!fields.valid()) {
-        return std::nullopt;
+        return std::unexpected(fields.problem());
     }
     return member;
 }
 
-std::optional<ActivityRow> parse_activity_row(const json& item) {
-    if (!item.is_object()) {
-        return std::nullopt;
-    }
+std::expected<ActivityRow, std::string> parse_activity_row(const json& item) {
     FieldReader fields(item);
     ActivityRow row{
         .date = fields.text("date"),
@@ -329,25 +430,19 @@ std::optional<ActivityRow> parse_activity_row(const json& item) {
         .usage = fields.number("usage"),
     };
     if (!fields.valid()) {
-        return std::nullopt;
+        return std::unexpected(fields.problem());
     }
+    std::optional<std::string> day = activity_day(row.date);
+    if (!day.has_value()) {
+        return std::unexpected<std::string>("field date is not a YYYY-MM-DD date");
+    }
+    row.date = std::move(*day);
     return row;
 }
 
 // ---------------------------------------------------------------------------------------------
 // Activity window.
 // ---------------------------------------------------------------------------------------------
-
-// Rejects trailing text so "2026-11-08junk" is not read as a date.
-std::optional<std::chrono::sys_days> parse_date(std::string_view text) {
-    std::istringstream input{std::string(text)};
-    std::chrono::sys_days day{};
-    input >> std::chrono::parse("%F", day);
-    if (input.fail() || input.peek() != std::istringstream::traits_type::eof()) {
-        return std::nullopt;
-    }
-    return day;
-}
 
 // The CLI validates --days; clamping keeps a bad value from widening or emptying the window
 // silently in other callers.
@@ -406,9 +501,9 @@ std::string format_usd(double amount) {
 }
 
 Result<KeyStatus> parse_key_status(std::string_view json_text) {
-    const std::optional<json> data = response_data(json_text);
-    if (!data.has_value() || !data->is_object()) {
-        return malformed(key_path);
+    const auto data = response_data(json_text, json::value_t::object, key_path);
+    if (!data) {
+        return std::unexpected(data.error());
     }
     FieldReader fields(*data);
     KeyStatus status;
@@ -427,7 +522,7 @@ Result<KeyStatus> parse_key_status(std::string_view json_text) {
     status.workspace_id = fields.optional_text("workspace_id");
     status.is_management_key = fields.flag("is_management_key");
     if (!fields.valid()) {
-        return malformed(key_path);
+        return malformed(key_path, fields.problem());
     }
     return status;
 }
@@ -450,20 +545,7 @@ std::string format_key_status(const KeyStatus& status) {
 }
 
 Result<std::vector<KeyEntry>> parse_keys_page(std::string_view json_text) {
-    const std::optional<json> data = response_data(json_text);
-    if (!data.has_value() || !data->is_array()) {
-        return malformed(keys_path);
-    }
-    std::vector<KeyEntry> keys;
-    keys.reserve(data->size());
-    for (const json& item : *data) {
-        auto key = parse_key_entry(item);
-        if (!key.has_value()) {
-            return malformed(keys_path);
-        }
-        keys.push_back(std::move(*key));
-    }
-    return keys;
+    return parse_rows(json_text, keys_path, parse_key_entry);
 }
 
 std::string format_keys(const std::vector<KeyEntry>& keys) {
@@ -507,26 +589,13 @@ std::string format_keys(const std::vector<KeyEntry>& keys) {
 }
 
 Result<std::vector<MemberEntry>> parse_members_page(std::string_view json_text) {
-    const std::optional<json> data = response_data(json_text);
-    if (!data.has_value() || !data->is_array()) {
-        return malformed(members_path);
-    }
-    std::vector<MemberEntry> members;
-    members.reserve(data->size());
-    for (const json& item : *data) {
-        auto member = parse_member(item);
-        if (!member.has_value()) {
-            return malformed(members_path);
-        }
-        members.push_back(std::move(*member));
-    }
-    return members;
+    return parse_rows(json_text, members_path, parse_member);
 }
 
 Result<Credits> parse_credits(std::string_view json_text) {
-    const std::optional<json> data = response_data(json_text);
-    if (!data.has_value() || !data->is_object()) {
-        return malformed(credits_path);
+    const auto data = response_data(json_text, json::value_t::object, credits_path);
+    if (!data) {
+        return std::unexpected(data.error());
     }
     FieldReader fields(*data);
     const Credits credits{
@@ -534,7 +603,7 @@ Result<Credits> parse_credits(std::string_view json_text) {
         .total_usage = fields.number("total_usage"),
     };
     if (!fields.valid()) {
-        return malformed(credits_path);
+        return malformed(credits_path, fields.problem());
     }
     return credits;
 }
@@ -549,21 +618,7 @@ std::string format_credits(const Credits& credits) {
 }
 
 Result<std::vector<ActivityRow>> parse_activity(std::string_view json_text) {
-    const std::optional<json> data = response_data(json_text);
-    if (!data.has_value() || !data->is_array()) {
-        return malformed(activity_path);
-    }
-    std::vector<ActivityRow> rows;
-    rows.reserve(data->size());
-    for (const json& item : *data) {
-        auto row = parse_activity_row(item);
-        if (!row.has_value() || row->date.size() != date_length ||
-            !parse_date(row->date).has_value()) {
-            return malformed(activity_path);
-        }
-        rows.push_back(std::move(*row));
-    }
-    return rows;
+    return parse_rows(json_text, activity_path, parse_activity_row);
 }
 
 std::vector<ActivityRow> summarize_activity(const std::vector<ActivityRow>& rows, int days,

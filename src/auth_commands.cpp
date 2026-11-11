@@ -182,8 +182,8 @@ Result<void> read_bounded(std::string& text, ReadUntil until) {
 }
 
 Result<void> read_hidden_line(KeyKind kind, std::string& text) {
-    if (!write_stderr(std::format("Paste the OpenRouter {} (input is hidden): ",
-                                  kind == KeyKind::management ? "Management" : "API"))) {
+    if (!write_stderr(
+            std::format("Paste the OpenRouter {} (input is hidden): ", kind_label(kind)))) {
         return fail(Exit::config, "cannot write the key prompt");
     }
     const HiddenTerminal hidden(STDIN_FILENO);
