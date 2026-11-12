@@ -175,7 +175,8 @@ reviewers group"):
    long call. `-g` cannot be combined with `-m` or `-p`; the other question options apply to every
    member, and `--any-provider` is refused when a member has its own `:TAG`.
 5. stdout holds one block per member, each starting with a line
-   `===== MEMBER (CONCRETE_ID) =====` and printed when that member finishes. Every stderr line
+   `===== MEMBER (CONCRETE_ID) =====` (only `===== MEMBER =====` when the member is that exact
+   id) and printed when that member finishes. Every stderr line
    from a member starts with `[MEMBER]`, and the last lines summarize each member (complete,
    incomplete, failed with its exit code, interrupted, never started). Judge each answer on its
    own and report every member's `cost` line.

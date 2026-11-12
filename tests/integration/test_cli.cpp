@@ -3055,9 +3055,11 @@ TEST_CASE("a session keeps its model, not a provider given in one round") {
 
 namespace {
 
-// The block a group prints for one member.
+// The block a group prints for one member; the id is shown only when it differs from the text
+// the member was typed as.
 std::string member_block(std::string_view typed, std::string_view id) {
-    return std::format("===== {} ({}) =====\n", typed, id);
+    return typed == id ? std::format("===== {} =====\n", typed)
+                       : std::format("===== {} ({}) =====\n", typed, id);
 }
 
 std::vector<std::string> posted_models(const MockServer& server) {
@@ -3147,6 +3149,7 @@ TEST_CASE("-g asks every member at once, each with its own model and provider") 
     CHECK(asked.err.contains("[Beta 2] openrouter-cli: cost "));
     CHECK(asked.err.contains("[test/alpha-1:mockcloud] openrouter-cli: asking test/alpha-1"));
     CHECK(asked.err.contains("group coding: Beta 2 (test/beta-2): complete\n"));
+    CHECK(asked.err.contains("group coding: test/alpha-1:mockcloud: complete\n"));
     CHECK(asked.err.ends_with("group coding: 2 complete, 0 incomplete, 0 failed\n"));
     CHECK(sandbox.records_of("pending").size() == 2U);
     CHECK(sandbox.answer_files().size() == 2U);
@@ -3180,9 +3183,10 @@ TEST_CASE("one member failing leaves the others' answers and sets the exit code"
 
     const RunResult asked = sandbox.run({"-g", "g", "q"});
     CHECK(asked.code == exit_api);
-    CHECK(asked.out.contains(member_block("test/alpha-1", "test/alpha-1") + "Hello world\n"));
-    CHECK(asked.err.contains("group g: test/beta-2 (test/beta-2): failed (exit 5)"));
-    CHECK(asked.err.contains("group g: test/beta-3 (test/beta-3): incomplete (exit 6"));
+    CHECK(asked.out.contains("===== test/alpha-1 =====\nHello world\n"));
+    CHECK_FALSE(asked.out.contains("(test/alpha-1)"));
+    CHECK(asked.err.contains("group g: test/beta-2: failed (exit 5)"));
+    CHECK(asked.err.contains("group g: test/beta-3: incomplete (exit 6"));
     CHECK(asked.err.contains("group g: 1 complete, 1 incomplete, 1 failed"));
     CHECK(server.post_count() == 3);
     const RunResult spend = sandbox.run({"spend"});

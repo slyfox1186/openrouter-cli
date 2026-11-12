@@ -265,7 +265,7 @@ openrouter-cli group add coding "google/gemini-4-carbon,moonshotai/kimi-k3.1-pro
 openrouter-cli -g coding --role review -f plan.md "Review this plan."
 ```
 
-Every member is asked at the same time, and **each one is a separate paid question**. Before anything is sent, every member is checked (its model, its provider, your options and any session), so a mistake stops the whole group for free. Each answer is printed under a `===== MEMBER (MODEL) =====` line as it finishes, the progress lines of each member start with `[MEMBER]`, and a summary at the end says which members completed. A member can carry its own provider (`AUTHOR/MODEL:TAG`), and a provider saved with `pin` applies to its model as usual. `-g` cannot be combined with `-m` or `-p`.
+Every member is asked at the same time, and **each one is a separate paid question**. Before anything is sent, every member is checked (its model, its provider, your options and any session), so a mistake stops the whole group for free. Each answer is printed under a `===== MEMBER (MODEL) =====` line as it finishes (just `===== MODEL =====` when the member is written as that exact id), the progress lines of each member start with `[MEMBER]`, and a summary at the end says which members completed. A member can carry its own provider (`AUTHOR/MODEL:TAG`), and a provider saved with `pin` applies to its model as usual. `-g` cannot be combined with `-m` or `-p`.
 
 ```bash
 openrouter-cli group list                              # every group and its members

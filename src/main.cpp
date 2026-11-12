@@ -1794,9 +1794,18 @@ Result<void> mark_new_group_session(const Config& config, const AskArgs& args,
     return mark_group_session(config.state_dir, args.session, ids, group);
 }
 
+// A member typed as its exact id would repeat itself, so the resolved form is added only when
+// it differs from what the user typed.
+std::string member_label(std::string_view typed, std::string_view resolved) {
+    if (typed == resolved) {
+        return display_metadata(typed);
+    }
+    return std::format("{} ({})", display_metadata(typed), display_metadata(resolved));
+}
+
 void print_member_answer(const GroupMember& member, const ChildResult& result) {
-    std::string block = std::format("===== {} ({}) =====\n{}", display_metadata(member.typed),
-                                    display_metadata(member.model_id), result.out);
+    std::string block =
+        std::format("===== {} =====\n{}", member_label(member.typed, member.model_id), result.out);
     if (!block.ends_with('\n')) {
         block += '\n';
     }
@@ -1824,9 +1833,8 @@ int summarize_group(std::string_view name, const std::vector<GroupMember>& membe
         const MemberOutcome outcome = outcome_of(results.at(index));
         complete += outcome.state == MemberState::complete ? 1 : 0;
         incomplete += outcome.state == MemberState::incomplete ? 1 : 0;
-        diagnostic("openrouter-cli: group {}: {} ({}): {}", name,
-                   display_metadata(members.at(index).typed),
-                   display_metadata(member_selector(members.at(index))),
+        diagnostic("openrouter-cli: group {}: {}: {}", name,
+                   member_label(members.at(index).typed, member_selector(members.at(index))),
                    outcome_text(outcome, results.at(index)));
         outcomes.push_back(outcome);
     }
