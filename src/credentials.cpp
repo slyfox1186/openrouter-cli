@@ -9,6 +9,7 @@ extern "C" {
 #include "common.hpp"
 #include "fsutil.hpp"
 #include "http.hpp"
+#include "posix.hpp"
 
 #include <openssl/crypto.h>
 
@@ -62,26 +63,6 @@ constexpr std::size_t input_slot = 1;
 constexpr unsigned int poll_closed_bits = POLLERR | POLLHUP;
 constexpr unsigned int poll_readable_bits = POLLIN | POLLHUP | POLLERR;
 
-std::unexpected<Error> sys_fail_code(std::string_view action, int error_number) {
-    return fail(Exit::config,
-                std::format("cannot {}: {}", action,
-                            std::error_code(error_number, std::system_category()).message()));
-}
-
-// Reads errno first, before any other call can overwrite it.
-std::unexpected<Error> sys_fail(std::string_view action) {
-    return sys_fail_code(action, errno);
-}
-
-template <class Call> auto retry_eintr(Call call) {
-    for (;;) {
-        const auto value = call();
-        if (value != -1 || errno != EINTR) {
-            return value;
-        }
-    }
-}
-
 std::string_view key_noun(KeyKind kind) {
     return kind == KeyKind::management ? "Management key" : "API key";
 }
@@ -96,41 +77,14 @@ std::string_view store_hint(KeyKind kind) {
                : "run `openrouter-cli login` (or `openrouter-cli auth set`)";
 }
 
-class Descriptor {
-public:
-    explicit Descriptor(int value) noexcept : value_(value) {}
-    Descriptor(Descriptor&& other) noexcept : value_(std::exchange(other.value_, -1)) {}
-    Descriptor& operator=(Descriptor&&) = delete;
-    Descriptor(const Descriptor&) = delete;
-    Descriptor& operator=(const Descriptor&) = delete;
-    ~Descriptor() { reset(); }
+using posix::Descriptor;
+using posix::Pipe;
+using posix::retry_eintr;
+using posix::sys_fail;
+using posix::sys_fail_code;
 
-    [[nodiscard]] int get() const noexcept { return value_; }
-    [[nodiscard]] bool valid() const noexcept { return value_ >= 0; }
-
-    // close(2) is not retried on EINTR: on Linux the descriptor is released either way.
-    void reset() noexcept {
-        if (value_ >= 0) {
-            ::close(std::exchange(value_, -1));
-        }
-    }
-
-private:
-    int value_;
-};
-
-struct Pipe {
-    Descriptor read_end;
-    Descriptor write_end;
-};
-
-// O_CLOEXEC keeps every pipe end out of the child except the two placed on its stdin and stdout.
 Result<Pipe> make_pipe() {
-    std::array<int, 2> ends{};
-    if (::pipe2(ends.data(), O_CLOEXEC) != 0) {
-        return sys_fail("create a pipe for systemd-creds");
-    }
-    return Pipe{.read_end = Descriptor(ends.at(0)), .write_end = Descriptor(ends.at(1))};
+    return posix::make_pipe("systemd-creds");
 }
 
 // Descriptors the child receives as its stdin and stdout.

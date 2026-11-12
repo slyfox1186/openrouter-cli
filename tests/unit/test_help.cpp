@@ -254,3 +254,23 @@ TEST_CASE("a null app renders nothing") {
     const HelpFormatter formatter(HelpContent{}, HelpStyle{});
     CHECK(formatter.make_help(nullptr, "prog", CLI::AppFormatMode::Normal).empty());
 }
+
+TEST_CASE("a positional's display text replaces its name in usage and arguments") {
+    CLI::App app{"A test program.", "prog"};
+    app.formatter(
+        std::make_shared<HelpFormatter>(HelpContent{}, HelpStyle{.color = false, .width = kWide}));
+    std::string model;
+    std::vector<std::string> tags;
+    std::string members;
+    auto* pin = app.add_subcommand("pin", "Save a provider");
+    pin->add_option("model", model, "The model")->required();
+    pin->add_option("tags", tags, "Tags")->required()->option_text("TAG...");
+    auto* remove = app.add_subcommand("remove", "Remove members");
+    remove->add_option("models", members, "Members")->option_text("[MODELS]");
+
+    const std::string page = pin->help("prog");
+    CHECK(has(page, "USAGE\n  prog pin MODEL TAG...\n"));
+    CHECK(has(page, "\nARGUMENTS\n"));
+    CHECK(has(page, "  TAG... "));
+    CHECK(has(remove->help("prog"), "USAGE\n  prog remove [MODELS]\n"));
+}

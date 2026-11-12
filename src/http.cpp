@@ -8,6 +8,7 @@ extern "C" {
 #include "common.hpp"
 #include "config.hpp"
 #include "credentials.hpp"
+#include "posix.hpp"
 
 #include <curl/curl.h>
 #include <curl/easy.h>
@@ -632,6 +633,10 @@ void install_signal_handlers() {
     for (const int signal_number : {SIGINT, SIGTERM, SIGHUP}) {
         sigaction(signal_number, &stop_action, nullptr);
     }
+    // A group parent starts its members with these blocked, so one that arrives before the
+    // handlers exist stays pending and is handled here instead of killing the process.
+    const auto stop_signals = posix::stop_signals();
+    pthread_sigmask(SIG_UNBLOCK, &stop_signals, nullptr);
 }
 
 bool interrupt_requested() {

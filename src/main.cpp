@@ -7,10 +7,12 @@
 #include "credentials.hpp"
 #include "display.hpp"
 #include "fsutil.hpp"
+#include "group.hpp"
 #include "help.hpp"
 #include "http.hpp"
 #include "models.hpp"
 #include "progress.hpp"
+#include "registry.hpp"
 #include "request.hpp"
 #include "session.hpp"
 #include "sse.hpp"
@@ -78,8 +80,14 @@ struct AskArgs {
     long long max_output_tokens = 0;
     std::string privacy;
     std::vector<std::string> providers;
+    bool any_provider = false;
+    std::string group;
+    // Internal: a group member refuses to send unless -m resolves to exactly this id.
+    std::string expect_model_id;
     std::string session;
     std::string query;
+    // The query is the text itself even when it is "-" (a group member's buffered stdin).
+    bool query_is_text = false;
 };
 
 std::string join(const std::vector<std::string>& parts, std::string_view separator) {
@@ -169,7 +177,14 @@ int cmd_models_show(const Config& config, const Http& http, const std::string& n
     if (!model) {
         return report(model.error());
     }
-    std::print("{}", format_model(*model, catalog->fetched_at, config.max_output_tokens));
+    const auto saved = load_providers(config.state_dir);
+    if (!saved) {
+        return report(saved.error());
+    }
+    const auto pinned = saved->find(model->id);
+    std::print("{}", format_model(*model, catalog->fetched_at, config.max_output_tokens,
+                                  pinned == saved->end() ? std::vector<std::string>{}
+                                                         : pinned->second.tags));
     const auto endpoints = endpoints_for(http, model->id);
     if (!endpoints) {
         return report(endpoints.error());
@@ -243,14 +258,107 @@ int cmd_models_list(const Config& config) {
     if (!aliases) {
         return report(aliases.error());
     }
-    if (aliases->empty()) {
-        std::println("no saved aliases yet");
-        return code_of(Exit::ok);
+    const auto providers = load_providers(config.state_dir);
+    if (!providers) {
+        return report(providers.error());
+    }
+    const auto groups = load_groups(config.state_dir);
+    if (!groups) {
+        return report(groups.error());
+    }
+    std::string text;
+    if (aliases->empty() && providers->empty()) {
+        text = "no saved aliases or providers yet\n";
     }
     for (const auto& [alias, entry] : *aliases) {
-        std::println("{} -> {} (saved {})", display_metadata(alias),
-                     display_metadata(entry.model_id), display_metadata(entry.saved));
+        text += std::format("{} -> {} (saved {})\n", display_metadata(alias),
+                            display_metadata(entry.model_id), display_metadata(entry.saved));
     }
+    if (!providers->empty()) {
+        text += aliases->empty() ? "Saved providers:\n" : "\nSaved providers:\n";
+        for (const auto& [model_id, entry] : *providers) {
+            text += std::format("{}: {} (saved {})\n", display_metadata(model_id),
+                                display_metadata(join(entry.tags, ", ")),
+                                display_metadata(entry.saved));
+        }
+    }
+    if (!groups->empty()) {
+        text += "\nGroups: see openrouter-cli group list\n";
+    }
+    write_stdout(text);
+    return code_of(Exit::ok);
+}
+
+std::string tag_phrase(const std::vector<std::string>& tags) {
+    return std::format("{} {}", tags.size() == 1 ? "provider" : "providers",
+                       display_metadata(join(tags, ", ")));
+}
+
+// pin MODEL TAG...: saved for every later question to that model, replacing earlier tags.
+int cmd_models_pin(const Config& config, const Http& http, const std::string& name,
+                   const std::vector<std::string>& tags) {
+    std::vector<std::string> unique;
+    for (const std::string& tag : tags) {
+        if (auto checked = check_provider_tag(tag); !checked) {
+            return report(checked.error());
+        }
+        if (!std::ranges::contains(unique, tag)) {
+            unique.push_back(tag);
+        }
+    }
+    const auto catalog = catalog_for(config, http, false);
+    if (!catalog) {
+        return report(catalog.error());
+    }
+    const auto model = resolve_or_report(config, *catalog, name);
+    if (!model) {
+        return report(model.error());
+    }
+    const auto replaced = save_provider(config.state_dir, model->id, unique);
+    if (!replaced) {
+        return report(replaced.error());
+    }
+    std::string text =
+        std::format("saved {} for {}\n", tag_phrase(unique), display_metadata(model->id));
+    if (!replaced->empty()) {
+        text += std::format("replaced {}\n", display_metadata(join(*replaced, ", ")));
+    }
+    write_stdout(text);
+    return code_of(Exit::ok);
+}
+
+// unpin MODEL: an exact saved id is cleared without the catalog, so a retired model can be;
+// anything else resolves the way pin does, so pin X and unpin X reach the same model.
+int cmd_models_unpin(const Config& config, const Http& http, const std::string& name) {
+    const auto saved = load_providers(config.state_dir);
+    if (!saved) {
+        return report(saved.error());
+    }
+    std::string model_id = name;
+    if (!saved->contains(name)) {
+        const auto catalog = catalog_for(config, http, false);
+        if (!catalog) {
+            return report(catalog.error());
+        }
+        const auto model = resolve_or_report(config, *catalog, name);
+        if (!model) {
+            return report(model.error());
+        }
+        model_id = model->id;
+    }
+    const auto removed = remove_provider(config.state_dir, model_id);
+    if (!removed) {
+        return report(removed.error());
+    }
+    if (!removed->has_value()) {
+        return report(Error{
+            .code = Exit::model,
+            .message = std::format("no saved provider for {}; see `openrouter-cli list`",
+                                   display_metadata(name)),
+        });
+    }
+    write_stdout(std::format("removed saved {} for {}\n", tag_phrase((*removed)->tags),
+                             display_metadata(model_id)));
     return code_of(Exit::ok);
 }
 
@@ -399,10 +507,32 @@ int cmd_spend_resolve(const Config& config) {
 
 struct Prepared {
     ModelInfo model;
+    std::optional<std::string> tag; // from -m MODEL:TAG
     std::optional<Session> session;
     Message user_turn;
     BuiltRequest request;
+    std::vector<std::string> providers; // sent as provider.only
+    std::string provider_source;        // "from -m", "from -p", "saved", "any" or empty
 };
+
+// A -m value resolved to a catalog model, with the provider tag that followed its last colon.
+struct Choice {
+    ModelInfo model;
+    std::optional<std::string> tag;
+};
+
+Result<Choice> resolve_choice(const Config& config, const Catalog& catalog,
+                              const std::string& value) {
+    auto split = split_model_choice(value, catalog.models);
+    if (!split) {
+        return std::unexpected(split.error());
+    }
+    auto model = resolve_or_report(config, catalog, split->model);
+    if (!model) {
+        return std::unexpected(model.error());
+    }
+    return Choice{.model = std::move(*model), .tag = std::move(split->provider)};
+}
 
 Result<std::string> system_text(const AskArgs& args, const Config& config) {
     const auto role = args.role == "review" ? Role::review : Role::plain;
@@ -441,8 +571,8 @@ Result<std::vector<FileSnapshot>> read_files(const AskArgs& args, const FileLimi
     return files;
 }
 
-Result<ModelInfo> session_model(const Config& config, const Http& http, const AskArgs& args,
-                                const SessionData& data) {
+Result<Choice> session_model(const Config& config, const Http& http, const AskArgs& args,
+                             const SessionData& data) {
     auto catalog = catalog_for(config, http, false);
     if (!catalog) {
         return std::unexpected(catalog.error());
@@ -453,18 +583,20 @@ Result<ModelInfo> session_model(const Config& config, const Http& http, const As
                                              "start a new session",
                                              data.model_id));
     }
+    std::optional<std::string> tag;
     if (!args.model.empty()) {
-        auto requested = resolve_or_report(config, *catalog, args.model);
+        auto requested = resolve_choice(config, *catalog, args.model);
         if (!requested) {
             return std::unexpected(requested.error());
         }
-        if (requested->id != data.model_id) {
-            return fail(Exit::usage, std::format("session {} is pinned to {}; drop -m or use a "
+        if (requested->model.id != data.model_id) {
+            return fail(Exit::usage, std::format("session {} keeps model {}; drop -m or use a "
                                                  "new session name",
                                                  args.session, data.model_id));
         }
+        tag = std::move(requested->tag);
     }
-    return *found;
+    return Choice{.model = *found, .tag = std::move(tag)};
 }
 
 struct Conversation {
@@ -488,11 +620,12 @@ Result<Conversation> prepare_conversation(Prepared& prepared, const AskArgs& arg
             return fail(Exit::usage, "a session keeps the system text it was created with; "
                                      "drop -s and --role or use a new session name");
         }
-        auto model = session_model(config, http, args, prepared.session->data());
-        if (!model) {
-            return std::unexpected(model.error());
+        auto choice = session_model(config, http, args, prepared.session->data());
+        if (!choice) {
+            return std::unexpected(choice.error());
         }
-        prepared.model = std::move(*model);
+        prepared.model = std::move(choice->model);
+        prepared.tag = std::move(choice->tag);
         conversation.system = prepared.session->data().system_prompt;
         conversation.history = prepared.session->data().history;
     } else {
@@ -503,11 +636,12 @@ Result<Conversation> prepare_conversation(Prepared& prepared, const AskArgs& arg
         if (!catalog) {
             return std::unexpected(catalog.error());
         }
-        auto model = resolve_or_report(config, *catalog, args.model);
-        if (!model) {
-            return std::unexpected(model.error());
+        auto choice = resolve_choice(config, *catalog, args.model);
+        if (!choice) {
+            return std::unexpected(choice.error());
         }
-        prepared.model = std::move(*model);
+        prepared.model = std::move(choice->model);
+        prepared.tag = std::move(choice->tag);
         auto text = system_text(args, config);
         if (!text) {
             return std::unexpected(text.error());
@@ -526,7 +660,7 @@ Result<Conversation> prepare_conversation(Prepared& prepared, const AskArgs& arg
 
 // The query as given, or standard input for "-", read within what is left of the input budget.
 Result<std::string> query_text(const AskArgs& args, std::size_t remaining) {
-    if (args.query != "-") {
+    if (args.query_is_text || args.query != "-") {
         return args.query;
     }
     auto text = read_input(remaining, false);
@@ -535,6 +669,54 @@ Result<std::string> query_text(const AskArgs& args, std::size_t remaining) {
                     text.error().message);
     }
     return std::move(*text);
+}
+
+// A group member refuses to send when -m no longer resolves to the model the group checked.
+Result<void> check_expected_model(const Prepared& prepared, const AskArgs& args) {
+    if (!args.expect_model_id.empty() && prepared.model.id != args.expect_model_id) {
+        return fail(Exit::model, std::format("-m now resolves to {}, not {}; the catalog changed "
+                                             "since the group checked its members, so nothing "
+                                             "was sent",
+                                             prepared.model.id, args.expect_model_id));
+    }
+    return {};
+}
+
+// Provider precedence: --any-provider, then an explicit -m tag or -p list, then the provider
+// saved for this model. providers.json is read only in the last case, so a broken file never
+// blocks a question that names its own provider.
+Result<void> choose_providers(Prepared& prepared, const AskArgs& args, const Config& config) {
+    if (args.any_provider) {
+        if (!args.providers.empty() || prepared.tag.has_value()) {
+            return fail(Exit::usage, "--any-provider ignores a saved provider; it cannot be "
+                                     "combined with -p or -m MODEL:TAG");
+        }
+        prepared.provider_source = "any";
+        return {};
+    }
+    if (prepared.tag.has_value()) {
+        if (!args.providers.empty()) {
+            return fail(Exit::usage, "-m MODEL:TAG and -p cannot be combined; repeat -p for "
+                                     "several providers");
+        }
+        prepared.providers = {*prepared.tag};
+        prepared.provider_source = "from -m";
+        return {};
+    }
+    if (!args.providers.empty()) {
+        prepared.providers = args.providers;
+        prepared.provider_source = "from -p";
+        return {};
+    }
+    const auto saved = load_providers(config.state_dir);
+    if (!saved) {
+        return std::unexpected(saved.error());
+    }
+    if (const auto found = saved->find(prepared.model.id); found != saved->end()) {
+        prepared.providers = found->second.tags;
+        prepared.provider_source = "saved";
+    }
+    return {};
 }
 
 Privacy selected_privacy(const AskArgs& args, const Config& config) {
@@ -551,6 +733,12 @@ Result<Prepared> prepare(const AskArgs& args, const Config& config, const Http& 
         return std::unexpected(conversation.error());
     }
     auto& [system, history] = *conversation;
+    if (auto expected = check_expected_model(prepared, args); !expected) {
+        return std::unexpected(expected.error());
+    }
+    if (auto chosen = choose_providers(prepared, args, config); !chosen) {
+        return std::unexpected(chosen.error());
+    }
 
     std::size_t remaining = config.max_input_bytes;
     const auto consume = [&](std::size_t bytes) {
@@ -620,7 +808,7 @@ Result<Prepared> prepare(const AskArgs& args, const Config& config, const Http& 
     input.max_output_tokens =
         args.max_output_tokens > 0 ? args.max_output_tokens : config.max_output_tokens;
     input.privacy = selected_privacy(args, config);
-    input.providers = args.providers;
+    input.providers = prepared.providers;
     if (prepared.session.has_value()) {
         input.session_id = prepared.session->data().session_uuid;
     }
@@ -938,7 +1126,8 @@ Verdict judge(const StreamRun& run, long long max_tokens, std::optional<long lon
             text += "; the stored API key was rejected: run `openrouter-cli login --replace`";
         } else if (run.transfer.status == http_not_found ||
                    run.transfer.status == http_unavailable) {
-            text += "; check the -p tags with `openrouter-cli show MODEL`, and under "
+            text += "; check the provider tags with `openrouter-cli show MODEL` (a saved one is "
+                    "cleared with `unpin MODEL` or skipped with --any-provider), and under "
                     "--privacy zdr try --privacy no-training";
         }
         return {.outcome = "error", .exit = Exit::api, .message = text};
@@ -1103,6 +1292,18 @@ std::string_view role_label(const AskArgs& args, const Prepared& prepared) {
     return args.role == "review" ? "review" : "plain";
 }
 
+// ", providers A,B (saved)" for the progress line; empty when OpenRouter chooses unprompted.
+std::string provider_note(const Prepared& prepared) {
+    if (prepared.provider_source == "any") {
+        return ", providers any";
+    }
+    if (prepared.providers.empty()) {
+        return {};
+    }
+    return std::format(", providers {} ({})", display_metadata(join(prepared.providers, ",")),
+                       prepared.provider_source);
+}
+
 int cmd_ask(const AskArgs& args, const Config& config, const Http& http) {
     auto prepared = prepare(args, config, http);
     if (!prepared) {
@@ -1138,13 +1339,11 @@ int cmd_ask(const AskArgs& args, const Config& config, const Http& http) {
         });
     }
     StatusLines status(same_destination(STDOUT_FILENO, STDERR_FILENO), stream_color(STDERR_FILENO));
-    status.progress(std::format(
-        "asking {} (role {}, effort {}, up to {} output tokens, {}{})",
-        display_metadata(prepared->model.id), role_label(args, *prepared),
-        display_metadata(prepared->request.effort_sent.value_or("default")),
-        prepared->request.max_tokens, pending.privacy,
-        args.providers.empty() ? std::string()
-                               : ", providers " + display_metadata(join(args.providers, ","))));
+    status.progress(std::format("asking {} (role {}, effort {}, up to {} output tokens, {}{})",
+                                display_metadata(prepared->model.id), role_label(args, *prepared),
+                                display_metadata(prepared->request.effort_sent.value_or("default")),
+                                prepared->request.max_tokens, pending.privacy,
+                                provider_note(*prepared)));
 
     const StreamRun run = run_stream(http, *prepared, *sink, cost_log, call_id, status);
     sink->finish(answer_path);
@@ -1173,6 +1372,529 @@ int cmd_ask(const AskArgs& args, const Config& config, const Http& http) {
     return final_exit(verdict, after);
 }
 
+// ----- groups -----------------------------------------------------------------------------
+
+std::string group_name_of(const std::string& name) {
+    return normalize_alias(name);
+}
+
+Error no_group(std::string_view name) {
+    return Error{
+        .code = Exit::model,
+        .message = std::format("no group is named \"{}\"; see `openrouter-cli group list`",
+                               display_metadata(name)),
+    };
+}
+
+// The concrete ids of the members that still resolve; a retired member has none, so it can
+// neither duplicate another nor block an edit that removes it.
+std::vector<std::pair<std::string, std::string>>
+resolvable_ids(const Config& config, const Catalog& catalog,
+               const std::vector<std::string>& members) {
+    std::vector<std::pair<std::string, std::string>> ids;
+    for (const std::string& member : members) {
+        auto split = split_model_choice(member, catalog.models);
+        if (!split) {
+            continue;
+        }
+        auto aliases = load_aliases(config.state_dir);
+        if (!aliases) {
+            continue;
+        }
+        const Resolution resolution = resolve(split->model, catalog.models, *aliases);
+        if (resolution.kind == Resolution::Kind::found && resolution.model.has_value()) {
+            ids.emplace_back(member, resolution.model->id);
+        }
+    }
+    return ids;
+}
+
+Result<void> refuse_duplicate_models(const std::vector<std::pair<std::string, std::string>>& ids) {
+    for (std::size_t first = 0; first < ids.size(); ++first) {
+        for (std::size_t second = first + 1; second < ids.size(); ++second) {
+            if (ids.at(first).second == ids.at(second).second) {
+                return fail(Exit::usage,
+                            std::format("\"{}\" and \"{}\" are both {}; a group asks each model "
+                                        "once",
+                                        display_metadata(ids.at(first).first),
+                                        display_metadata(ids.at(second).first),
+                                        display_metadata(ids.at(first).second)));
+            }
+        }
+    }
+    return {};
+}
+
+std::string member_list_text(const Group& group) {
+    return display_metadata(join(group.members, ", "));
+}
+
+// The NAME and comma-separated MODELS of a group command.
+struct GroupEdit {
+    std::string name;
+    std::string list;
+};
+
+// group add NAME "MODEL[,MODEL...]": creates the group or appends; every new member must
+// resolve now, and the whole result is checked under the lock before it is written.
+int cmd_group_add(const Config& config, const Http& http, const GroupEdit& edit) {
+    const std::string name = group_name_of(edit.name);
+    if (name.empty()) {
+        return report(Error{
+            .code = Exit::usage,
+            .message = "the group name has no letters or digits",
+        });
+    }
+    const auto members = parse_model_list(edit.list);
+    if (!members) {
+        return report(members.error());
+    }
+    const auto catalog = catalog_for(config, http, false);
+    if (!catalog) {
+        return report(catalog.error());
+    }
+    for (const std::string& member : *members) {
+        if (auto choice = resolve_choice(config, *catalog, member); !choice) {
+            return report(choice.error());
+        }
+    }
+    const auto written = update_groups(config.state_dir, [&](Groups& groups) -> Result<void> {
+        Group& group = groups[name];
+        for (const std::string& member : *members) {
+            if (std::ranges::contains(group.members, member)) {
+                return fail(Exit::usage, std::format("\"{}\" is already in group {}",
+                                                     display_metadata(member), name));
+            }
+            group.members.push_back(member);
+        }
+        if (group.members.size() > max_group_members) {
+            return fail(Exit::usage, std::format("a group holds at most {} models; group {} "
+                                                 "would have {}",
+                                                 max_group_members, name, group.members.size()));
+        }
+        if (auto unique = refuse_duplicate_models(resolvable_ids(config, *catalog, group.members));
+            !unique) {
+            return unique;
+        }
+        group.saved = utc_now_iso();
+        return {};
+    });
+    if (!written) {
+        return report(written.error());
+    }
+    write_stdout(std::format("group {}: {}\n", name, member_list_text(written->at(name))));
+    return code_of(Exit::ok);
+}
+
+// group remove NAME [MODELS]: members match the stored text exactly, with no catalog lookup,
+// so a retired member is removable by what `group list` prints.
+int cmd_group_remove(const Config& config, const GroupEdit& edit) {
+    const std::string name = group_name_of(edit.name);
+    std::vector<std::string> members;
+    if (!edit.list.empty()) {
+        auto parsed = parse_model_list(edit.list);
+        if (!parsed) {
+            return report(parsed.error());
+        }
+        members = std::move(*parsed);
+    }
+    bool removed_group = false;
+    const auto written = update_groups(config.state_dir, [&](Groups& groups) -> Result<void> {
+        const auto found = groups.find(name);
+        if (found == groups.end()) {
+            return std::unexpected(no_group(edit.name));
+        }
+        if (members.empty()) {
+            groups.erase(found);
+            removed_group = true;
+            return {};
+        }
+        std::vector<std::string>& current = found->second.members;
+        for (const std::string& member : members) {
+            const auto position = std::ranges::find(current, member);
+            if (position == current.end()) {
+                return fail(Exit::model,
+                            std::format("\"{}\" is not in group {}; see `openrouter-cli group "
+                                        "list`",
+                                        display_metadata(member), name));
+            }
+            current.erase(position);
+        }
+        if (current.empty()) {
+            groups.erase(found);
+            removed_group = true;
+        } else {
+            found->second.saved = utc_now_iso();
+        }
+        return {};
+    });
+    if (!written) {
+        return report(written.error());
+    }
+    write_stdout(removed_group
+                     ? std::format("removed group {}\n", name)
+                     : std::format("group {}: {}\n", name, member_list_text(written->at(name))));
+    return code_of(Exit::ok);
+}
+
+int cmd_group_list(const Config& config) {
+    const auto groups = load_groups(config.state_dir);
+    if (!groups) {
+        return report(groups.error());
+    }
+    if (groups->empty()) {
+        write_stdout("no groups yet; create one with openrouter-cli group add NAME "
+                     "\"MODEL,MODEL\"\n");
+        return code_of(Exit::ok);
+    }
+    std::string text;
+    for (const auto& [name, group] : *groups) {
+        text += std::format("{}: {} (saved {})\n", display_metadata(name), member_list_text(group),
+                            display_metadata(group.saved));
+    }
+    write_stdout(text);
+    return code_of(Exit::ok);
+}
+
+// One member of the group being asked, resolved once in the parent.
+struct GroupMember {
+    std::string typed;    // as stored in the group
+    std::string model_id; // the concrete id the child must use
+    std::optional<std::string> tag;
+    std::string session; // its own session under --session, or empty
+};
+
+std::string member_selector(const GroupMember& member) {
+    return member.tag.has_value() ? member.model_id + ":" + *member.tag : member.model_id;
+}
+
+// Shared question options, passed on only when they were given: an omitted --role must not
+// become an explicit one, which an existing session would refuse.
+std::vector<std::string> child_argv(const AskArgs& args, const GroupMember& member) {
+    std::vector<std::string> argv{
+        "/proc/self/exe", "-m", member_selector(member), "--expect-model-id", member.model_id,
+    };
+    for (const std::string& file : args.files) {
+        argv.insert(argv.end(), {"-f", file});
+    }
+    if (args.role_given) {
+        argv.insert(argv.end(), {"--role", args.role});
+    }
+    if (!args.system.empty()) {
+        argv.insert(argv.end(), {"-s", args.system});
+    }
+    if (!args.effort.empty()) {
+        argv.insert(argv.end(), {"-e", args.effort});
+    }
+    if (args.max_output_tokens > 0) {
+        argv.insert(argv.end(), {"--max-output-tokens", std::to_string(args.max_output_tokens)});
+    }
+    if (!args.privacy.empty()) {
+        argv.insert(argv.end(), {"--privacy", args.privacy});
+    }
+    if (args.any_provider) {
+        argv.emplace_back("--any-provider");
+    }
+    if (!member.session.empty()) {
+        argv.insert(argv.end(), {"--session", member.session});
+    }
+    argv.insert(argv.end(), {"--", "-"});
+    return argv;
+}
+
+// The group conversation's rules: once its marker exists, every member asked must already
+// have history, so no member is ever asked a follow-up without the first round's
+// instructions.
+Result<void> check_group_session(const Config& config, const AskArgs& args,
+                                 const std::vector<GroupMember>& members, bool& started) {
+    auto marked = group_session_started(config.state_dir, args.session);
+    if (!marked) {
+        return std::unexpected(marked.error());
+    }
+    started = *marked;
+    if (!started) {
+        return {};
+    }
+    for (const GroupMember& member : members) {
+        auto session = Session::open(config.state_dir, member.session);
+        if (!session) {
+            return std::unexpected(session.error());
+        }
+        if (!session->exists() || session->data().history.empty()) {
+            return fail(Exit::usage, std::format("member {} has no history in session {}; start "
+                                                 "a new session name, or remove the member",
+                                                 display_metadata(member.typed), args.session));
+        }
+    }
+    return {};
+}
+
+Result<void> refuse_tagged_any(const AskArgs& args, const std::vector<GroupMember>& members) {
+    if (!args.any_provider) {
+        return {};
+    }
+    std::vector<std::string> tagged;
+    for (const GroupMember& member : members) {
+        if (member.tag.has_value()) {
+            tagged.push_back(member.typed);
+        }
+    }
+    if (tagged.empty()) {
+        return {};
+    }
+    return fail(Exit::usage, std::format("--any-provider cannot be used with members that name "
+                                         "their own provider: {}",
+                                         display_metadata(join(tagged, ", "))));
+}
+
+// Each member's own session under --session NAME; two that would share one are refused.
+Result<void> assign_sessions(const AskArgs& args, std::vector<GroupMember>& members) {
+    if (args.session.empty()) {
+        return {};
+    }
+    for (GroupMember& member : members) {
+        auto name = member_session_name(args.session, member.model_id);
+        if (!name) {
+            return std::unexpected(name.error());
+        }
+        member.session = std::move(*name);
+    }
+    for (std::size_t first = 0; first < members.size(); ++first) {
+        for (std::size_t second = first + 1; second < members.size(); ++second) {
+            if (members.at(first).session == members.at(second).session) {
+                return fail(Exit::usage,
+                            std::format("members {} and {} would share session {}; use a "
+                                        "shorter session name",
+                                        display_metadata(members.at(first).typed),
+                                        display_metadata(members.at(second).typed),
+                                        members.at(first).session));
+            }
+        }
+    }
+    return {};
+}
+
+Result<std::vector<GroupMember>> group_members(const Config& config, const Http& http,
+                                               const AskArgs& args, const Group& group) {
+    const auto catalog = catalog_for(config, http, false);
+    if (!catalog) {
+        return std::unexpected(catalog.error());
+    }
+    std::vector<GroupMember> members;
+    std::vector<std::pair<std::string, std::string>> ids;
+    for (const std::string& typed : group.members) {
+        auto choice = resolve_choice(config, *catalog, typed);
+        if (!choice) {
+            return fail(choice.error().code,
+                        std::format("group member {}: {}", display_metadata(typed),
+                                    choice.error().message));
+        }
+        ids.emplace_back(typed, choice->model.id);
+        members.push_back(GroupMember{
+            .typed = typed,
+            .model_id = choice->model.id,
+            .tag = std::move(choice->tag),
+            .session = {},
+        });
+    }
+    if (auto unique = refuse_duplicate_models(ids); !unique) {
+        return std::unexpected(unique.error());
+    }
+    if (auto tagged = refuse_tagged_any(args, members); !tagged) {
+        return std::unexpected(tagged.error());
+    }
+    if (auto sessions = assign_sessions(args, members); !sessions) {
+        return std::unexpected(sessions.error());
+    }
+    return members;
+}
+
+std::string outcome_text(const MemberOutcome& outcome, const ChildResult& result) {
+    switch (outcome.state) {
+    case MemberState::complete:
+        return "complete";
+    case MemberState::incomplete:
+        return "incomplete (exit 6, partial answer kept)";
+    case MemberState::interrupted:
+        return "interrupted (exit 8)";
+    case MemberState::crashed:
+        return result.term_signal != 0 ? std::format("crashed (signal {})", result.term_signal)
+                                       : std::format("crashed (exit {})", result.exit_code);
+    case MemberState::never_started:
+        return std::format("never started ({})", result.spawn_error.message.empty()
+                                                     ? "an earlier member could not be started"
+                                                     : result.spawn_error.message);
+    case MemberState::failed:
+        return std::format("failed (exit {})", outcome.code);
+    }
+    return "unknown";
+}
+
+// Runs prepare() for every member as its child will, with the buffered query, so effort,
+// input, file, session and saved-provider problems stop the group before anything is sent.
+// prepare() only reads, checks and builds a request: it sends and commits nothing.
+Result<void> dry_run_members(const AskArgs& args, const Config& config, const Http& http,
+                             const std::vector<GroupMember>& members, const std::string& query) {
+    for (const GroupMember& member : members) {
+        AskArgs dry = args;
+        dry.group.clear();
+        dry.model = member_selector(member);
+        dry.expect_model_id = member.model_id;
+        dry.session = member.session;
+        dry.query = query;
+        dry.query_is_text = true;
+        if (auto prepared = prepare(dry, config, http); !prepared) {
+            return fail(prepared.error().code,
+                        std::format("group member {}: {}", display_metadata(member.typed),
+                                    prepared.error().message));
+        }
+    }
+    return {};
+}
+
+// Holds the group conversation's lock and applies its rules. The marker is written before the
+// first member is asked, so a round that fails part-way still makes the next one insist on
+// history for every member.
+Result<std::optional<FileLock>> open_group_session(const Config& config, const AskArgs& args,
+                                                   const std::vector<GroupMember>& members) {
+    if (args.session.empty()) {
+        return std::optional<FileLock>{};
+    }
+    auto lock = lock_state_file(config.state_dir, "group-session-" + args.session + ".lock", false);
+    if (!lock) {
+        return std::unexpected(lock.error());
+    }
+    bool started = false;
+    if (auto checked = check_group_session(config, args, members, started); !checked) {
+        return std::unexpected(checked.error());
+    }
+    return std::optional<FileLock>{std::move(*lock)};
+}
+
+Result<void> mark_new_group_session(const Config& config, const AskArgs& args,
+                                    const std::vector<GroupMember>& members,
+                                    std::string_view group) {
+    if (args.session.empty()) {
+        return {};
+    }
+    auto started = group_session_started(config.state_dir, args.session);
+    if (!started) {
+        return std::unexpected(started.error());
+    }
+    if (*started) {
+        return {};
+    }
+    std::vector<std::string> ids;
+    ids.reserve(members.size());
+    for (const GroupMember& member : members) {
+        ids.push_back(member.model_id);
+    }
+    return mark_group_session(config.state_dir, args.session, ids, group);
+}
+
+void print_member_answer(const GroupMember& member, const ChildResult& result) {
+    std::string block = std::format("===== {} ({}) =====\n{}", display_metadata(member.typed),
+                                    display_metadata(member.model_id), result.out);
+    if (!block.ends_with('\n')) {
+        block += '\n';
+    }
+    write_stdout(block + "\n");
+}
+
+MemberOutcome outcome_of(const ChildResult& result) {
+    if (!result.started) {
+        // Every start failure is a local configuration problem (Exit::config).
+        return {.state = MemberState::never_started, .code = code_of(Exit::config)};
+    }
+    if (result.term_signal != 0) {
+        return {.state = MemberState::crashed, .code = result.term_signal};
+    }
+    return outcome_of_exit(result.exit_code);
+}
+
+// One line per member, then the totals; the exit code follows group_exit_code.
+int summarize_group(std::string_view name, const std::vector<GroupMember>& members,
+                    const std::vector<ChildResult>& results, bool cancelled) {
+    std::vector<MemberOutcome> outcomes;
+    std::size_t complete = 0;
+    std::size_t incomplete = 0;
+    for (std::size_t index = 0; index < results.size(); ++index) {
+        const MemberOutcome outcome = outcome_of(results.at(index));
+        complete += outcome.state == MemberState::complete ? 1 : 0;
+        incomplete += outcome.state == MemberState::incomplete ? 1 : 0;
+        diagnostic("openrouter-cli: group {}: {} ({}): {}", name,
+                   display_metadata(members.at(index).typed),
+                   display_metadata(member_selector(members.at(index))),
+                   outcome_text(outcome, results.at(index)));
+        outcomes.push_back(outcome);
+    }
+    diagnostic("openrouter-cli: group {}: {} complete, {} incomplete, {} failed", name, complete,
+               incomplete, results.size() - complete - incomplete);
+    return group_exit_code(outcomes, cancelled);
+}
+
+// -g NAME: every member is checked in this process first (resolution, duplicates, sessions and
+// a dry run), and only then asked, each by its own child process running the ordinary
+// single-model path.
+int cmd_group_ask(const AskArgs& args, const Config& config, const Http& http) {
+    if (!args.model.empty() || !args.providers.empty()) {
+        return report(Error{
+            .code = Exit::usage,
+            .message = "-g cannot be combined with -m or -p; members carry their own provider "
+                       "as MODEL:TAG or a saved pin",
+        });
+    }
+    const auto groups = load_groups(config.state_dir);
+    if (!groups) {
+        return report(groups.error());
+    }
+    const std::string name = group_name_of(args.group);
+    const auto found = groups->find(name);
+    if (found == groups->end()) {
+        return report(no_group(args.group));
+    }
+    const auto query = query_text(args, config.max_input_bytes);
+    if (!query) {
+        return report(query.error());
+    }
+    const auto members = group_members(config, http, args, found->second);
+    if (!members) {
+        return report(members.error());
+    }
+    const auto conversation_lock = open_group_session(config, args, *members);
+    if (!conversation_lock) {
+        return report(conversation_lock.error());
+    }
+    if (auto checked = dry_run_members(args, config, http, *members, *query); !checked) {
+        return report(checked.error());
+    }
+    if (auto marked = mark_new_group_session(config, args, *members, name); !marked) {
+        return report(marked.error());
+    }
+
+    std::vector<ChildSpec> children;
+    for (const GroupMember& member : *members) {
+        children.push_back(ChildSpec{.argv = child_argv(args, member)});
+    }
+    diagnostic("openrouter-cli: group {}: asking {} members (one billed call each)", name,
+               members->size());
+    const ChildEvents events{
+        .stderr_line =
+            [&members](std::size_t index, std::string_view line) {
+                write_stderr(
+                    std::format("[{}] {}\n", display_metadata(members->at(index).typed), line));
+            },
+        .finished =
+            [&members](std::size_t index, const ChildResult& result) {
+                print_member_answer(members->at(index), result);
+            },
+    };
+    bool cancelled = false;
+    const std::vector<ChildResult> results =
+        run_children(children, SuperviseOptions{.input = *query}, events, cancelled);
+    return summarize_group(name, *members, results, cancelled);
+}
+
 // ----- command line -----------------------------------------------------------------------
 
 // The model commands exist under two parents; both registrations fill the same Cli fields.
@@ -1182,6 +1904,8 @@ struct ModelCommands {
     CLI::App* save = nullptr;
     CLI::App* remove = nullptr;
     CLI::App* list = nullptr;
+    CLI::App* pin = nullptr;
+    CLI::App* unpin = nullptr;
 
     [[nodiscard]] static bool used(const CLI::App* command) {
         return command != nullptr && command->parsed();
@@ -1197,6 +1921,16 @@ struct Cli {
     std::string save_alias_name;
     std::string save_model_id;
     std::string remove_alias_name;
+    std::string pin_name;
+    std::vector<std::string> pin_tags;
+    std::string unpin_name;
+    std::string group_add_name;
+    std::string group_add_list;
+    std::string group_remove_name;
+    std::string group_remove_list;
+    CLI::App* group_add = nullptr;
+    CLI::App* group_remove = nullptr;
+    CLI::App* group_list = nullptr;
     std::string since = "all";
     bool resolve = false;
     bool login_replace = false;
@@ -1219,7 +1953,13 @@ struct Cli {
 };
 
 void add_ask_options(CLI::App& app, AskArgs& ask) {
-    app.add_option("-m,--model", ask.model, "Model alias, id, ~author/family-latest, or name");
+    app.add_option("-m,--model", ask.model,
+                   "Model alias, id, ~author/family-latest, or name; :TAG uses only that provider "
+                   "for this question")
+        ->option_text("MODEL[:TAG]");
+    app.add_option("-g,--group", ask.group,
+                   "Ask every model in a saved group at once; one billed call per member")
+        ->option_text("NAME");
     // One value per occurrence: CLI11 lets a vector option take every following argument by
     // default, which would swallow the query (CLI11 book, "Options": allow_extra_args).
     app.add_option("-f,--file", ask.files, "File to include, line-numbered (repeatable)")
@@ -1239,9 +1979,14 @@ void add_ask_options(CLI::App& app, AskArgs& ask) {
         ->check(CLI::PositiveNumber)
         ->option_text("N");
     app.add_option("-p,--provider", ask.providers,
-                   "Use only this provider (endpoint tag from `show`; repeatable)")
+                   "Use only this provider (endpoint tag from `show`; repeatable); replaces a "
+                   "saved provider for this question")
         ->allow_extra_args(false)
         ->option_text("TAG");
+    app.add_flag("--any-provider", ask.any_provider,
+                 "Ignore the saved provider for this question; privacy settings still apply");
+    // A group parent passes this to each member; an empty group keeps it out of help.
+    app.add_option("--expect-model-id", ask.expect_model_id, "")->group("");
     app.add_option("--privacy", ask.privacy, "zdr (default) or no-training")
         ->check(CLI::IsMember({"zdr", "no-training"}))
         ->option_text("MODE");
@@ -1262,8 +2007,41 @@ ModelCommands add_model_leaves(CLI::App& parent, Cli& cli) {
     commands.save->add_option("model_id", cli.save_model_id, "Exact model id")->required();
     commands.remove = parent.add_subcommand("remove", "Delete a saved alias");
     commands.remove->add_option("alias", cli.remove_alias_name, "Alias to delete")->required();
-    commands.list = parent.add_subcommand("list", "List saved aliases");
+    commands.list = parent.add_subcommand("list", "List saved aliases and providers");
+    commands.pin = parent.add_subcommand(
+        "pin", "Save a provider for a model: every later question to it uses only these tags "
+               "(replaces earlier tags)");
+    commands.pin->add_option("model", cli.pin_name, "Alias, id, or a name in quotes")->required();
+    commands.pin->add_option("tags", cli.pin_tags, "Provider tags from `show MODEL` (one or more)")
+        ->required()
+        ->option_text("TAG...");
+    commands.unpin = parent.add_subcommand(
+        "unpin", "Clear a model's saved provider (exit 4 when none is saved)");
+    commands.unpin->add_option("model", cli.unpin_name, "Alias, id, name, or an id from `list`")
+        ->required();
     return commands;
+}
+
+void add_group_commands(CLI::App& app, Cli& cli) {
+    auto* group = app.add_subcommand(
+        "group", "Save groups of models and ask them all with -g NAME (one billed call each)");
+    group->require_subcommand(1);
+    group->fallthrough(false);
+    cli.group_add = group->add_subcommand(
+        "add", "Create a group or add models to it: one argument, models separated by commas "
+               "(quote it when it has spaces); MODEL:TAG pins that member's provider; at most 8");
+    cli.group_add->add_option("name", cli.group_add_name, "Group name")->required();
+    cli.group_add
+        ->add_option("models", cli.group_add_list, "AUTHOR/A,AUTHOR/B (aliases and names work)")
+        ->required()
+        ->option_text("MODELS");
+    cli.group_remove = group->add_subcommand(
+        "remove", "Remove the listed members (as `group list` prints them), or the whole group "
+                  "when none are given");
+    cli.group_remove->add_option("name", cli.group_remove_name, "Group name")->required();
+    cli.group_remove->add_option("models", cli.group_remove_list, "Members separated by commas")
+        ->option_text("[MODELS]");
+    cli.group_list = group->add_subcommand("list", "Every group and its members (offline)");
 }
 
 void add_models_commands(CLI::App& app, Cli& cli) {
@@ -1375,6 +2153,24 @@ std::optional<int> dispatch_models(const Cli& cli, const Config& config) {
     if (ModelCommands::used(cli.short_models.list) || ModelCommands::used(cli.nested_models.list)) {
         return cmd_models_list(config);
     }
+    if (ModelCommands::used(cli.short_models.pin) || ModelCommands::used(cli.nested_models.pin)) {
+        return cmd_models_pin(config, public_http, cli.pin_name, cli.pin_tags);
+    }
+    if (ModelCommands::used(cli.short_models.unpin) ||
+        ModelCommands::used(cli.nested_models.unpin)) {
+        return cmd_models_unpin(config, public_http, cli.unpin_name);
+    }
+    if (cli.group_add->parsed()) {
+        return cmd_group_add(config, public_http,
+                             GroupEdit{.name = cli.group_add_name, .list = cli.group_add_list});
+    }
+    if (cli.group_remove->parsed()) {
+        return cmd_group_remove(
+            config, GroupEdit{.name = cli.group_remove_name, .list = cli.group_remove_list});
+    }
+    if (cli.group_list->parsed()) {
+        return cmd_group_list(config);
+    }
     return std::nullopt;
 }
 
@@ -1400,6 +2196,9 @@ int dispatch(const Cli& cli, const Config& config) {
         return report(key.error());
     }
     const Http http(config, HttpKeys{.inference = std::move(*key), .management = {}});
+    if (!cli.ask.group.empty()) {
+        return cmd_group_ask(cli.ask, config, http);
+    }
     return cmd_ask(cli.ask, config, http);
 }
 
@@ -1417,6 +2216,9 @@ std::optional<Error> check_grammar(const CLI::App& app, const AskArgs& ask) {
             "--max-output-tokens",
             "--privacy",
             "--provider",
+            "--any-provider",
+            "--group",
+            "--expect-model-id",
             "--session",
             "query",
         },
@@ -1469,12 +2271,48 @@ HelpContent root_help() {
                             R"(openrouter-cli --session plan "Is step 3 sound now?")",
                         },
                 },
+                HelpExample{
+                    .caption = "Use only one provider (a TAG from `show MODEL`)",
+                    .commands = {R"(openrouter-cli -m AUTHOR/MODEL:TAG "Question")"},
+                },
+                HelpExample{
+                    .caption = "Save a provider for a model; later questions to it use it",
+                    .commands = {"openrouter-cli pin AUTHOR/MODEL TAG"},
+                },
+                HelpExample{
+                    .caption = "See saved providers, skip one for a question, or clear it",
+                    .commands =
+                        {
+                            "openrouter-cli list",
+                            R"(openrouter-cli -m AUTHOR/MODEL --any-provider "Q")",
+                            "openrouter-cli unpin AUTHOR/MODEL",
+                        },
+                },
+                HelpExample{
+                    .caption = "Save a group of models, then ask them all at once",
+                    .commands =
+                        {
+                            R"(openrouter-cli group add NAME "AUTHOR/A,AUTHOR/B")",
+                            R"(openrouter-cli -g NAME --role review "Question")",
+                        },
+                },
             },
         .notes =
             {
                 "Options come first and the query comes last. Put -- before a query that starts "
                 "with - or matches a command name. Question options cannot be combined with a "
                 "command.",
+                "Providers: in -m MODEL:TAG the tag is the text after the last colon. "
+                "AUTHOR/MODEL:free works only as an exact catalog id; the variants :nitro, "
+                ":floor, :exacto, :online, :thinking, :extended and :batch are refused; any other "
+                "word after the last colon is read as a provider tag. A provider saved with pin "
+                "applies to every question to that model, session rounds included. -m MODEL:TAG "
+                "or -p replaces it for one question, --any-provider ignores it, and :TAG and -p "
+                "cannot be combined.",
+                "Groups: -g NAME asks every member at once, one billed call each, and prints each "
+                "answer under a ===== MEMBER ===== line as it finishes. With --session, each "
+                "member keeps its own history; a follow-up repeats -g and --session and drops "
+                "--role and -s.",
             },
     };
 }
@@ -1495,6 +2333,7 @@ int run(std::span<char* const> argv) {
     add_ask_options(app, cli.ask);
     app.option_defaults()->group("OPTIONS");
     add_models_commands(app, cli);
+    add_group_commands(app, cli);
     add_account_commands(app, cli);
 
     try {

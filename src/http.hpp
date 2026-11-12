@@ -14,7 +14,8 @@
 
 namespace orcli {
 
-// SIGPIPE is ignored; SIGINT, SIGTERM and SIGHUP set a flag that aborts transfers.
+// SIGPIPE is ignored; SIGINT, SIGTERM and SIGHUP set a flag that aborts transfers, and are
+// unblocked in case a parent started this process with them blocked.
 void install_signal_handlers();
 bool interrupt_requested();
 

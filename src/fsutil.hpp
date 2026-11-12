@@ -22,6 +22,13 @@ Result<void> ensure_private_dir(const std::filesystem::path& dir);
 // or other permissions. A missing file is fine.
 Result<void> check_private_file(const std::filesystem::path& file);
 
+// True when anything (even a broken symlink) is at the path; Exit::config when it cannot be
+// inspected.
+Result<bool> file_present(const std::filesystem::path& file);
+
+// check_private_file, then the whole file.
+Result<std::string> read_private_file(const std::filesystem::path& file);
+
 // flock(2) on a dedicated lock file that is never renamed or replaced.
 class FileLock {
 public:
@@ -40,6 +47,12 @@ private:
     explicit FileLock(int descriptor) : fd_(descriptor) {}
     int fd_ = -1;
 };
+
+// Lock on state_dir/locks/<lock_name>, creating both directories privately. Every
+// read-modify-write of a state registry (models.json, providers.json, groups.json) holds one.
+// blocking=false: Exit::refused when another process holds it.
+Result<FileLock> lock_state_file(const std::filesystem::path& state_dir, std::string_view lock_name,
+                                 bool blocking = true);
 
 // Lowercase hex of `bytes` random bytes from std::random_device (getrandom(2) on Linux); the
 // one helper for temp-file suffixes, session ids and call ids.

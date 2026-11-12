@@ -233,9 +233,11 @@ add_library(orcli_core STATIC
     src/costlog.cpp
     src/display.cpp
     src/fsutil.cpp
+    src/group.cpp
     src/http.cpp
     src/models.cpp
     src/progress.cpp
+    src/registry.cpp
     src/request.cpp
     src/session.cpp
     src/sse.cpp)

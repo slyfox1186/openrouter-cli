@@ -409,6 +409,15 @@ void MockServer::set_scenario(Scenario scenario) {
     scenario_ = scenario;
 }
 
+void MockServer::set_model_scenario(const std::string& model_id, Scenario scenario) {
+    const std::scoped_lock lock(mutex_);
+    model_scenarios_.insert_or_assign(model_id, scenario);
+}
+
+void MockServer::hold_until_posts(int count) {
+    hold_posts_ = count;
+}
+
 void MockServer::set_hold(std::chrono::milliseconds hold) {
     const std::scoped_lock lock(mutex_);
     hold_ = hold;
@@ -497,7 +506,7 @@ void MockServer::handle(const httplib::Request& request, httplib::Response& resp
         return;
     }
     if (recorded.method == "POST" && recorded.path == chat_path) {
-        handle_chat(response);
+        handle_chat(recorded, response);
         return;
     }
     const Reply reply = built_in(recorded);
@@ -550,14 +559,23 @@ Reply MockServer::built_in(const RecordedRequest& request) {
     return {.status = http_not_found, .body = std::string(not_found_body)};
 }
 
-void MockServer::handle_chat(httplib::Response& response) {
+void MockServer::handle_chat(const RecordedRequest& request, httplib::Response& response) {
     Scenario scenario = Scenario::success;
     std::chrono::milliseconds hold{0};
+    const json body = json::parse(request.body, nullptr, false);
+    const std::string model =
+        body.is_object() && body.contains("model") && body.at("model").is_string()
+            ? body.at("model").get<std::string>()
+            : std::string();
     {
         const std::scoped_lock lock(mutex_);
         scenario = scenario_;
         hold = hold_;
+        if (const auto found = model_scenarios_.find(model); found != model_scenarios_.end()) {
+            scenario = found->second;
+        }
     }
+    ++chat_posts_;
     if (scenario == Scenario::http_error) {
         response.status = http_payment_required;
         response.set_content(payment_error_body(), json_type);
@@ -580,6 +598,9 @@ void MockServer::handle_chat(httplib::Response& response) {
 // so "EOF without [DONE]" scenarios reach the client as a normal end of body.
 bool MockServer::stream(Scenario scenario, std::chrono::milliseconds hold,
                         httplib::DataSink& sink) const {
+    if (!wait_for_posts(sink)) {
+        return false;
+    }
     if (scenario == Scenario::drip && !drip(hold, sink)) {
         return false;
     }
@@ -600,6 +621,15 @@ bool MockServer::stream(Scenario scenario, std::chrono::milliseconds hold,
 bool MockServer::drip(std::chrono::milliseconds hold, httplib::DataSink& sink) const {
     const auto deadline = Clock::now() + hold;
     while (Clock::now() < deadline) {
+        if (!send_event(sink, processing) || !wait_while_connected(keepalive_interval, sink)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool MockServer::wait_for_posts(httplib::DataSink& sink) const {
+    while (chat_posts_.load() < hold_posts_.load()) {
         if (!send_event(sink, processing) || !wait_while_connected(keepalive_interval, sink)) {
             return false;
         }

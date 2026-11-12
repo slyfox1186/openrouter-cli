@@ -208,7 +208,11 @@ std::string placeholder(const CLI::Option& option) {
     return placeholder_name(option.get_name());
 }
 
+// Display text set with option_text() wins, so a positional can read "TAG..." or "[MODELS]".
 std::string positional_name(const CLI::Option& option) {
+    if (!option.get_option_text().empty()) {
+        return option.get_option_text();
+    }
     return placeholder_name(option.get_name(true));
 }
 
@@ -235,8 +239,9 @@ std::vector<const CLI::App*> listed_commands(const CLI::App& app) {
     });
 }
 
-// The command path, then [OPTIONS] and positional placeholders. Every positional in this
-// program is required in the form it belongs to, so none is bracketed.
+// The command path, then [OPTIONS] and positional placeholders. A positional is bracketed only
+// through its display text, since the question's own QUERY is optional to CLI11 but required to
+// ask.
 Line command_cell(const CLI::App& command, std::string_view path, bool color) {
     Line cell(color);
     cell.add(path, Tone::literal);

@@ -223,15 +223,16 @@ std::optional<Credits> credits_from(const HttpResponse& response) {
     return *parsed;
 }
 
-std::optional<std::vector<MemberEntry>> members_from(const HttpResponse& response) {
+// The page's members, or why the search cannot continue (another non-2xx status or a body that
+// does not parse).
+Result<std::vector<MemberEntry>> members_from(const HttpResponse& response) {
     if (!http_success(response.status)) {
-        return std::nullopt;
+        const std::optional<std::string> reason = provider_reason(response.body);
+        return fail(Exit::api, reason.has_value()
+                                   ? std::format("HTTP {}: {}", response.status, *reason)
+                                   : std::format("HTTP {}", response.status));
     }
-    auto parsed = parse_members_page(response.body);
-    if (!parsed) {
-        return std::nullopt;
-    }
-    return std::move(*parsed);
+    return parse_members_page(response.body);
 }
 
 int print_management_rejected() {
@@ -239,8 +240,8 @@ int print_management_rejected() {
     return exit_code(Exit::api);
 }
 
-int print_email_lookup_failed() {
-    std::println("email: lookup failed");
+int print_email_lookup_failed(std::string_view reason) {
+    std::println("email: lookup failed ({})", reason);
     return exit_code(Exit::api);
 }
 
@@ -257,7 +258,8 @@ int show_creator(const Http& http, const std::string& creator_id) {
             if (interrupted(response.error())) {
                 return exit_code(Exit::interrupted);
             }
-            return std::max(print_email_lookup_failed(), exit_code(response.error().code));
+            return std::max(print_email_lookup_failed(response.error().message),
+                            exit_code(response.error().code));
         }
         if (response->status == http_unauthorized) {
             return print_management_rejected();
@@ -266,9 +268,9 @@ int show_creator(const Http& http, const std::string& creator_id) {
             std::println("email: not available");
             return exit_code(Exit::ok);
         }
-        const std::optional<std::vector<MemberEntry>> members = members_from(*response);
-        if (!members.has_value()) {
-            return print_email_lookup_failed();
+        const auto members = members_from(*response);
+        if (!members) {
+            return print_email_lookup_failed(members.error().message);
         }
         if (members->empty()) {
             std::println("email: not available");
@@ -281,7 +283,8 @@ int show_creator(const Http& http, const std::string& creator_id) {
         }
         offset += members->size();
     }
-    return print_email_lookup_failed();
+    return print_email_lookup_failed(
+        std::format("no match in the first {} pages of GET /organization/members", max_pages));
 }
 
 int show_management(const Config& config, const std::optional<KeyStatus>& login) {

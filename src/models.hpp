@@ -74,8 +74,22 @@ struct Endpoint {
     int status = 0; // 0 normal; OpenRouter reports negative values for degraded endpoints
 };
 
+// `-m MODEL:TAG`: the model reference and the provider tag after its last colon.
+struct ModelChoice {
+    std::string model;
+    std::optional<std::string> provider;
+};
+
 // Pure functions.
 Result<std::vector<ModelInfo>> parse_catalog(std::string_view json_text);
+// Splits a -m value at its last colon unless the whole value is an exact catalog id (so
+// "author/model:free" stays whole). An OpenRouter variant word after the colon is refused
+// (Exit::model) rather than read as a tag; empty parts and malformed tags are Exit::usage.
+Result<ModelChoice> split_model_choice(std::string_view value,
+                                       const std::vector<ModelInfo>& catalog);
+// A provider tag as -m MODEL:TAG and pin accept it: non-empty, with no colon, whitespace or
+// control characters (Exit::usage).
+Result<void> check_provider_tag(std::string_view tag);
 Result<std::vector<Endpoint>> parse_endpoints(std::string_view json_text);
 std::string format_endpoints(const std::vector<Endpoint>& endpoints);
 std::string normalize_alias(std::string_view name);
@@ -85,9 +99,11 @@ Resolution resolve(std::string_view name, const std::vector<ModelInfo>& catalog,
 std::string format_candidates(const std::vector<ModelInfo>& models);
 // The output budget a request sends: requested, lowered to the model's listed maximum.
 long long capped_output_tokens(const ModelInfo& model, long long requested);
-// default_output_tokens is the configured budget used when --max-output-tokens is not given.
+// default_output_tokens is the configured budget used when --max-output-tokens is not given;
+// saved_provider holds the tags `pin` saved for this model (none when empty).
 std::string format_model(const ModelInfo& model, std::string_view catalog_fetched_at,
-                         long long default_output_tokens);
+                         long long default_output_tokens,
+                         const std::vector<std::string>& saved_provider = {});
 
 // Persistence under state_dir: catalog.json (with fetch time) and models.json (aliases).
 using FetchText = std::function<Result<std::string>()>;

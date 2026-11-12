@@ -592,7 +592,7 @@ TEST_CASE("parse_endpoints rejects a body without data.endpoints") {
     }
 }
 
-TEST_CASE("format_endpoints lists each endpoint and the --provider hint") {
+TEST_CASE("format_endpoints lists each endpoint and how to use a tag") {
     const std::string table =
         orcli::format_endpoints(orcli::parse_endpoints(endpoints_json).value());
     CHECK(table.contains("google-vertex/global"));
@@ -601,7 +601,8 @@ TEST_CASE("format_endpoints lists each endpoint and the --provider hint") {
     CHECK(table.contains("943,718"));
     CHECK(table.contains("flex; status -2"));
     CHECK(table.ends_with("Pass a tag (or its provider prefix, e.g. google-vertex) to "
-                          "--provider to use only those endpoints.\n"));
+                          "`pin MODEL TAG` to save it, to -m MODEL:TAG for one question, or "
+                          "to --provider.\n"));
 }
 
 TEST_CASE("format_endpoints shows status only when it is not zero") {
@@ -610,4 +611,71 @@ TEST_CASE("format_endpoints shows status only when it is not zero") {
     CHECK(std::ranges::count(table, '\n') == endpoint_table_lines);
     CHECK_FALSE(table.contains("status 0"));
     CHECK_FALSE(table.contains(" \n"));
+}
+
+namespace {
+
+std::vector<ModelInfo> colon_catalog() {
+    std::vector<ModelInfo> models;
+    for (const std::string_view id : {"a/b", "a/b:free", "x/y"}) {
+        ModelInfo model;
+        model.id = id;
+        models.push_back(model);
+    }
+    return models;
+}
+
+} // namespace
+
+TEST_CASE("split_model_choice reads a provider tag after the last colon") {
+    const std::vector<ModelInfo> catalog = colon_catalog();
+    const auto split = [&catalog](std::string_view value) {
+        return orcli::split_model_choice(value, catalog);
+    };
+    CHECK(split("a/b").value().model == "a/b");
+    CHECK_FALSE(split("a/b").value().provider.has_value());
+    CHECK(split("a/b:tag").value().model == "a/b");
+    CHECK(split("a/b:tag").value().provider == "tag");
+    CHECK(split("a/b:google-vertex/global").value().provider == "google-vertex/global");
+    CHECK(split("a/b:free").value().model == "a/b:free");
+    CHECK_FALSE(split("a/b:free").value().provider.has_value());
+    CHECK(split("a/b:free:tag").value().model == "a/b:free");
+    CHECK(split("a/b:free:tag").value().provider == "tag");
+    CHECK(split("gemini 4 carbon:google-ai-studio").value().model == "gemini 4 carbon");
+    // A saved alias is never matched against the whole colon value.
+    CHECK(split("foo:bar").value().model == "foo");
+    CHECK(split("a/b:futureword").value().provider == "futureword");
+}
+
+TEST_CASE("split_model_choice refuses empty parts, variants and malformed values") {
+    const std::vector<ModelInfo> catalog = colon_catalog();
+    for (const std::string_view value : {"a/b:", ":tag", ":free", ":"}) {
+        CAPTURE(value);
+        CHECK(orcli::split_model_choice(value, catalog).error().code == Exit::usage);
+    }
+    for (const std::string_view value :
+         {"a/b:nitro", "x/y:free", "a/b:batch", "a/b:exacto", "a/b::tag", "a/b:nitro:tag"}) {
+        CAPTURE(value);
+        CHECK(orcli::split_model_choice(value, catalog).error().code == Exit::model);
+    }
+    CHECK(orcli::split_model_choice("a/b:no such", catalog).error().code == Exit::usage);
+    CHECK(orcli::split_model_choice("a/b:nitro", catalog)
+              .error()
+              .message.contains("variants such as :nitro are not supported"));
+}
+
+TEST_CASE("check_provider_tag accepts slugs and refuses what OpenRouter never uses") {
+    CHECK(orcli::check_provider_tag("google-vertex/global/priority").has_value());
+    CHECK(orcli::check_provider_tag("Other-Cloud").has_value());
+    for (const std::string_view tag : {"", "a b", "a:b", "a\tb", "a\x01"}) {
+        CAPTURE(tag);
+        CHECK(orcli::check_provider_tag(tag).error().code == Exit::usage);
+    }
+}
+
+TEST_CASE("format_model shows the saved provider, or none") {
+    const ModelInfo argon = test_catalog().front();
+    CHECK(orcli::format_model(argon, "t", 1000).contains("Saved provider:     none\n"));
+    CHECK(orcli::format_model(argon, "t", 1000, {"google-vertex", "google-ai-studio"})
+              .contains("Saved provider:     google-vertex, google-ai-studio\n"));
 }

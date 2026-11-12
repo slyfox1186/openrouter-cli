@@ -239,11 +239,46 @@ openrouter-cli --session review -f plan.md "I fixed the second problem. Review t
 
 The session remembers the conversation and the role it started with, but **it does not reread your files**. Attach a changed file again with `-f`. *Each round resends the whole conversation*, so later rounds can cost more than earlier ones.
 
-**Choose a specific provider.** Copy a tag from the `TAG` column of `show`:
+**Choose a specific provider.** Copy a tag from the `TAG` column of `show MODEL` and put it after the model with a colon:
 
 ```bash
-openrouter-cli -m reviewer --role review -p TAG "Review this plan."
+openrouter-cli -m AUTHOR/MODEL:TAG "Review this plan."
 ```
+
+The tag is everything after the **last** colon, so a nickname works too (`-m reviewer:TAG`). `-p TAG` does the same and can be repeated to allow several providers, but `:TAG` and `-p` cannot be used together. A model whose exact ID already has a colon, such as `AUTHOR/MODEL:free`, is used whole, and `AUTHOR/MODEL:free:TAG` adds a tag to it. OpenRouter's variant words (`:nitro`, `:floor`, `:exacto`, `:online`, `:thinking`, `:extended`, `:batch`) are refused rather than treated as tags; any other word after the last colon is read as a tag, and the progress line shows it before the answer starts.
+
+**Save a provider for a model.** `pin` remembers the provider, so every later question to that model uses it, whether you name the model by ID, nickname or plain words, and in every round of a `--session`:
+
+```bash
+openrouter-cli pin AUTHOR/MODEL TAG          # one or more tags; replaces any saved before
+openrouter-cli list                          # nicknames, then every saved provider
+openrouter-cli -m AUTHOR/MODEL --any-provider "Q"   # ignore it for one question
+openrouter-cli unpin AUTHOR/MODEL            # forget it
+```
+
+A `:TAG` or `-p` on one question replaces the saved provider for that question only. `--any-provider` sends no provider list at all, so OpenRouter chooses; your privacy setting still applies. A saved provider belongs to the exact model ID it was saved for: it stays when you remove that model's nickname, and it does not move when a nickname or an `~author/family-latest` ID later points somewhere else. `show MODEL` shows the saved provider, if any. `unpin` also accepts the exact ID that `list` prints, which clears a provider saved for a model that has since left OpenRouter's list.
+
+**Ask a group of models at once.** Save a group once, with the models separated by commas, then ask every member with `-g`:
+
+```bash
+openrouter-cli group add coding "google/gemini-4-carbon,moonshotai/kimi-k3.1-pro"
+openrouter-cli -g coding --role review -f plan.md "Review this plan."
+```
+
+Every member is asked at the same time, and **each one is a separate paid question**. Before anything is sent, every member is checked (its model, its provider, your options and any session), so a mistake stops the whole group for free. Each answer is printed under a `===== MEMBER (MODEL) =====` line as it finishes, the progress lines of each member start with `[MEMBER]`, and a summary at the end says which members completed. A member can carry its own provider (`AUTHOR/MODEL:TAG`), and a provider saved with `pin` applies to its model as usual. `-g` cannot be combined with `-m` or `-p`.
+
+```bash
+openrouter-cli group list                              # every group and its members
+openrouter-cli group add coding "deepseek/deepseek-v4.1-flash-1017"   # add a member
+openrouter-cli group remove coding "moonshotai/kimi-k3.1-pro"         # remove a member
+openrouter-cli group remove coding                     # remove the whole group
+```
+
+A group has at most 8 members and asks each model once. Quote the list when it contains spaces. `group remove` matches members exactly as `group list` prints them.
+
+With `--session NAME`, each member keeps its own conversation. For the next round, repeat `-g` and `--session` and leave out `--role` and `-s`, just like a one-model session. Once a group conversation has started, every member it asks must already have history in it; after adding a member, start a new session name.
+
+If some members fail, the others' answers are still shown. **Never run the whole group again just because one member failed**: ask only that member again with `-m`, after checking `openrouter-cli spend`.
 
 **Ask a question that starts with a dash** or matches a command name. Put `--` in front of it:
 
@@ -257,7 +292,8 @@ openrouter-cli -m reviewer -- "--force: is this flag safe?"
 | --- | --- |
 | A question: `openrouter-cli -m MODEL "..."` | ![Usually paid](https://img.shields.io/badge/Usually%20paid-cf222e?style=flat-square) |
 | Each follow-up round in a `--session` | ![Usually paid](https://img.shields.io/badge/Usually%20paid-cf222e?style=flat-square) |
-| `find`, `show`, `save`, `remove`, `list` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
+| A group question: `openrouter-cli -g NAME "..."` | ![Usually paid](https://img.shields.io/badge/Usually%20paid-cf222e?style=flat-square), once per member |
+| `find`, `show`, `save`, `remove`, `list`, `pin`, `unpin`, `group add`, `group remove`, `group list` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
 | `status`, `account balance`, `account keys`, `account credits`, `account activity` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
 | `spend`, `spend --resolve` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
 | `login`, `logout`, `auth set`, `--help`, `--version` | ![Free](https://img.shields.io/badge/Free-1a7f37?style=flat-square) |
@@ -335,12 +371,14 @@ When a command fails, it prints a short message and ends with an *exit code*. Yo
 | **1** | Something unexpected went wrong inside the program. | Read the message. Report it if it repeats. |
 | **2** | The command was typed wrong. | Check `openrouter-cli --help`. Remember: options first, question last. |
 | **3** | Stopped before sending. The input was too big, the session was busy, or the cost log could not be written. ![Nothing was sent or charged](https://img.shields.io/badge/Nothing%20was%20sent%20or%20charged-1a7f37?style=flat-square) | Send less, or wait for the other question in that session to finish. |
-| **4** | The model name was not found, or it matched more than one model. | Pick one of the printed choices, or use the exact ID. |
-| **5** | OpenRouter or the network had a problem, the key was rejected, or no provider matched your model, provider and privacy choices. | Read the message. For "no provider", check the tags with `show`. Trying again is another paid question. |
+| **4** | The model name was not found or matched more than one model, the group or member was not found, or `unpin` found no saved provider. | Pick one of the printed choices, or use the exact ID. `list` and `group list` show what is saved. |
+| **5** | OpenRouter or the network had a problem, the key was rejected, or no provider matched your model, provider and privacy choices. | Read the message. For "no provider", check the tags with `show`; a saved provider is cleared with `unpin` or skipped with `--any-provider`. Trying again is another paid question. |
 | **6** | The answer was cut short, for example because it ran out of room. | Any partial answer is kept in the answer file named in the message, unless the message says saving failed. When it ran out of room, the message says how much went to thinking and to the answer when OpenRouter reports those counts, and whether a higher `--max-output-tokens` can help or only a lower `-e` or less input. Trying again is another paid question. |
-| **7** | A setup problem, such as no key stored, a key that cannot be decrypted, a key found in the settings file, or a bad setting. | Run `openrouter-cli status` and follow what it says. |
+| **7** | A setup problem, such as no key stored, a key that cannot be decrypted, a key found in the settings file, a bad setting, or a damaged `models.json`, `providers.json` or `groups.json`. | For a key problem, run `openrouter-cli status` and follow what it says. For a damaged file, the message names it: fix or remove that entry. While `providers.json` is damaged, `-p`, `:TAG` and `--any-provider` still work for one question. |
 | **8** | You interrupted it (for example with <kbd>Ctrl</kbd>+<kbd>C</kbd>), while the answer was arriving or while the cost was being looked up. | Any partial answer is kept in the answer file named in the message, unless the message says saving failed. |
 | **9** | The answer arrived, but saving the answer, cost or session failed. ![You may have been charged](https://img.shields.io/badge/You%20may%20have%20been%20charged-9a6700?style=flat-square) | Use the answer shown on screen. **Do not just run it again.** |
+
+For a group question (`-g`), the code is 8 when it was interrupted, 1 when a member ended unexpectedly, 0 when every member completed, and otherwise the code of the first member that did not complete. The summary lines show what happened to each member, and each member's cost line shows what it charged.
 
 After any failed paid question, look at the saved answer and at `openrouter-cli spend` *before* deciding to ask again. If an interruption, a network failure or a cut-short answer also had a saving problem, the program reports code 8, 5 or 6 rather than 9. If an interruption cuts short the final cost bookkeeping, the program waits at most two seconds for its log locks and tells you about any record it could not save.
 
@@ -381,7 +419,12 @@ Everything below is optional detail. Click a heading to open it.
 | `show MODEL` | Prices, context and output limits, the default output budget, reasoning efforts and provider tags. |
 | `save ALIAS MODEL_ID` | Save a nickname for an exact model ID. A model has one nickname, so a new one replaces the old. |
 | `remove ALIAS` | Delete a saved nickname. |
-| `list` | List saved nicknames. |
+| `list` | List saved nicknames, then every saved provider. |
+| `pin MODEL TAG...` | Save the providers every later question to that model uses. Replaces earlier tags. |
+| `unpin MODEL` | Forget a model's saved provider. Accepts the exact ID `list` prints. |
+| `group add NAME MODELS` | Create a group or add members. MODELS is one argument with commas, such as `"A/B,C/D:TAG"`. |
+| `group remove NAME [MODELS]` | Remove the listed members, or the whole group when none are given. |
+| `group list` | Every group and its members. |
 | `spend [--since PERIOD] [--resolve]` | Totals from the cost log. PERIOD is `today`, `7d`, `30d` or `all`. |
 | `login [--replace]` | Sign in with your browser and store a new key. |
 | `logout [--management]` | Delete stored keys from this computer. `--management` deletes only the Management key. |
@@ -392,7 +435,7 @@ Everything below is optional detail. Click a heading to open it.
 | `account credits` | Credits bought and used (Management key). |
 | `account activity [--days N]` | Usage per day, model and provider (Management key). |
 
-`find`, `show`, `save`, `remove` and `list` also work with `models` in front, for example `openrouter-cli models save ALIAS MODEL_ID`.
+`find`, `show`, `save`, `remove`, `list`, `pin` and `unpin` also work with `models` in front, for example `openrouter-cli models save ALIAS MODEL_ID`.
 
 `login` and `auth set` never overwrite a stored key unless you add `--replace`. Keys are checked with OpenRouter before they are stored. Deleting a key from this computer does not delete it at OpenRouter.
 
@@ -407,19 +450,21 @@ Everything below is optional detail. Click a heading to open it.
 
 | Option | What it does |
 | --- | --- |
-| `-m`, `--model MODEL` | The model: nickname, exact ID, `~author/family-latest` or plain words. |
+| `-m`, `--model MODEL[:TAG]` | The model: nickname, exact ID, `~author/family-latest` or plain words. `:TAG` after it uses only that provider for this question. |
+| `-g`, `--group NAME` | Ask every model in a saved group at once, one paid question per member. Not combined with `-m` or `-p`. |
 | `-f`, `--file FILE` | Attach a file, sent with line numbers. Repeat for more files. |
 | `--role ROLE` | `plain` (default) sends your question as written. `review` asks for a structured review. |
 | `-s`, `--system-prompt TEXT` | Extra instructions for the model, sent as its system prompt. `-s @FILE` reads them from a file. |
 | `-e`, `--effort LEVEL` | How hard the model thinks: `max`, `xhigh`, `high`, `medium`, `low`, `minimal` or `none`. Models that cannot choose ignore it. |
 | `--max-output-tokens N` | Most tokens the model may write, thinking included, up to the model's own limit. Leave it out to use the default (`OPENROUTER_CLI_MAX_OUTPUT_TOKENS`); a smaller number can cut the answer off while its thinking is still billed. |
-| `-p`, `--provider TAG` | Use only this provider. Copy tags from `show`. Repeat for more. |
+| `-p`, `--provider TAG` | Use only this provider for this question, replacing a saved one. Copy tags from `show`. Repeat for more. Not combined with `:TAG`. |
+| `--any-provider` | Ignore the saved provider for this question and let OpenRouter choose. Your privacy setting still applies. |
 | `--privacy MODE` | `zdr` (default) or `no-training`. See [Privacy and safety](#privacy-and-safety). |
 | `--session NAME` | Keep the conversation under this name for follow-ups. |
 | `-h`, `--help` | Show help. |
 | `--version` | Show the version. |
 
-A session remembers its first model and instructions, and only complete answers are added to it. Answers go to standard output and are saved as `answers/<call_id>.md` in the state folder. Progress lines and the final cost line go to standard error. If writing those messages fails, the answer and the cost record are still saved.
+A session remembers its first model and instructions, and only complete answers are added to it. It does not remember a `:TAG` or `-p`; use `pin` when every round should use one provider. Answers go to standard output and are saved as `answers/<call_id>.md` in the state folder. Progress lines and the final cost line go to standard error. If writing those messages fails, the answer and the cost record are still saved. A group question (`-g`) is the exception: standard output holds one block per member, each printed when that member finishes rather than as it is written.
 
 </details>
 
@@ -496,7 +541,7 @@ The API address must use HTTPS; plain HTTP is allowed only for exact local loopb
 | Everything else | `$XDG_STATE_HOME/openrouter-cli/`, or `~/.local/state/openrouter-cli/` |
 | Cost log | `costs.jsonl` inside that state folder |
 
-The state folder holds `catalog.json` (cached model list), `models.json` (nicknames), `credentials/` (encrypted keys), `answers/`, `sessions/` and `locks/`.
+The state folder holds `catalog.json` (cached model list), `models.json` (nicknames), `providers.json` (providers saved with `pin`), `groups.json` (groups), `credentials/` (encrypted keys), `answers/`, `sessions/`, `group-sessions/` (one marker per group conversation) and `locks/`. Builds older than `pin` and `group` leave `providers.json` and `groups.json` untouched but do not use them.
 
 Relative `XDG_*` values are ignored, and `HOME` must be an absolute path when it is needed. Reading settings never creates folders. Folders are private to you (mode 700) and files the program creates are too (mode 600).
 

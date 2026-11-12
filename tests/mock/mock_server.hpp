@@ -92,6 +92,11 @@ public:
     [[nodiscard]] int port() const { return port_; }
 
     void set_scenario(Scenario scenario);
+    // The scenario for chat requests naming model_id, overriding set_scenario for them.
+    void set_model_scenario(const std::string& model_id, Scenario scenario);
+    // Streams send only keepalives until this many chat requests have arrived, so a test proves
+    // the requests overlap without timing anything.
+    void hold_until_posts(int count);
     // How long `slow` stays silent after its first chunk and how long `drip` sends keepalives.
     void set_hold(std::chrono::milliseconds hold);
     // HTTP statuses for successive built-in GET /generation replies; `otherwise` answers every
@@ -113,8 +118,9 @@ public:
 private:
     void handle(const httplib::Request& request, httplib::Response& response);
     Reply built_in(const RecordedRequest& request);
-    void handle_chat(httplib::Response& response);
+    void handle_chat(const RecordedRequest& request, httplib::Response& response);
     bool stream(Scenario scenario, std::chrono::milliseconds hold, httplib::DataSink& sink) const;
+    bool wait_for_posts(httplib::DataSink& sink) const;
     bool drip(std::chrono::milliseconds hold, httplib::DataSink& sink) const;
     bool wait_for_gate(httplib::DataSink& sink) const;
     bool wait_while_connected(std::chrono::milliseconds duration, httplib::DataSink& sink) const;
@@ -126,6 +132,9 @@ private:
     int generation_otherwise_;
     int generation_served_ = 0;
     std::map<std::string, Responder> routes_;
+    std::map<std::string, Scenario> model_scenarios_;
+    std::atomic<int> chat_posts_{0};
+    std::atomic<int> hold_posts_{0};
     std::vector<RecordedRequest> requests_;
     // Let a provider waiting out a hold or a gate return as soon as it can.
     std::atomic<bool> gate_open_{false};

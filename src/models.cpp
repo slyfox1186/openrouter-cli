@@ -16,14 +16,12 @@
 #include <filesystem>
 #include <format>
 #include <functional>
-#include <limits>
 #include <map>
 #include <optional>
 #include <ranges>
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -34,9 +32,15 @@ using nlohmann::json;
 
 constexpr std::string_view catalog_file_name = "catalog.json";
 constexpr std::string_view aliases_file_name = "models.json";
-constexpr std::string_view locks_dir_name = "locks";
 constexpr std::string_view aliases_lock_name = "models.lock";
 constexpr std::string_view batch_suffix = ":batch";
+// The suffixes OpenRouter's model-variants guide lists (fetched 2026-11-11): catalog variants
+// (free, batch, and the deprecated thinking and extended) and routing variants (nitro, floor,
+// exacto, and the deprecated online). None of them is ever a provider tag.
+constexpr unsigned char ascii_delete = 0x7f;
+constexpr std::array<std::string_view, 8> variant_words = {
+    "free", "batch", "thinking", "extended", "nitro", "floor", "exacto", "online",
+};
 constexpr char latest_prefix = '~';
 constexpr int json_indent = 2;
 
@@ -551,30 +555,6 @@ std::optional<std::chrono::sys_seconds> parse_utc(std::string_view text) {
     return when;
 }
 
-Result<bool> file_present(const std::filesystem::path& file) {
-    std::error_code error;
-    const std::filesystem::file_status status = std::filesystem::symlink_status(file, error);
-    if (error && error != std::errc::no_such_file_or_directory) {
-        return fail(Exit::config,
-                    std::format("cannot inspect {}: {}", file.string(), error.message()));
-    }
-    if (status.type() == std::filesystem::file_type::not_found) {
-        return false;
-    }
-    if (error) {
-        return fail(Exit::config,
-                    std::format("cannot inspect {}: {}", file.string(), error.message()));
-    }
-    return true;
-}
-
-Result<std::string> read_private_file(const std::filesystem::path& file) {
-    if (const auto checked = check_private_file(file); !checked) {
-        return std::unexpected(checked.error());
-    }
-    return read_regular_file(file, std::numeric_limits<std::size_t>::max());
-}
-
 struct CachedCatalog {
     Catalog catalog;
     std::chrono::sys_seconds fetched;
@@ -723,6 +703,59 @@ std::string normalize_alias(std::string_view name) {
     return alias;
 }
 
+Result<void> check_provider_tag(std::string_view tag) {
+    if (tag.empty()) {
+        return fail(Exit::usage, "a provider tag cannot be empty; copy one from the TAG column of "
+                                 "`openrouter-cli show MODEL`");
+    }
+    const bool malformed = std::ranges::any_of(tag, [](char raw) {
+        const auto byte = static_cast<unsigned char>(raw);
+        return raw == ':' || raw == ' ' || byte < ' ' || byte == ascii_delete;
+    });
+    if (malformed) {
+        return fail(Exit::usage,
+                    std::format("\"{}\" is not a provider tag: tags contain no colon, space or "
+                                "control character; copy one from `openrouter-cli show MODEL`",
+                                display_metadata(tag)));
+    }
+    return {};
+}
+
+Result<ModelChoice> split_model_choice(std::string_view value,
+                                       const std::vector<ModelInfo>& catalog) {
+    if (find_by_id(catalog, value) != nullptr) {
+        return ModelChoice{.model = std::string(value), .provider = std::nullopt};
+    }
+    const std::size_t colon = value.rfind(':');
+    if (colon == std::string_view::npos) {
+        return ModelChoice{.model = std::string(value), .provider = std::nullopt};
+    }
+    const std::string_view model = value.substr(0, colon);
+    const std::string_view tag = value.substr(colon + 1);
+    if (model.empty() || tag.empty()) {
+        return fail(Exit::usage,
+                    "-m MODEL:TAG needs a model before the colon and a provider tag after it");
+    }
+    if (std::ranges::contains(variant_words, tag)) {
+        return fail(Exit::model,
+                    std::format("\"{}\" is not a model id in the catalog; OpenRouter variants "
+                                "such as :{} are not supported, and :free works only where "
+                                "`openrouter-cli find` lists a :free id",
+                                display_metadata(value), display_metadata(tag)));
+    }
+    // Only an exact id may keep a colon, so a malformed value never reaches the word search.
+    if (model.contains(':') && find_by_id(catalog, model) == nullptr) {
+        return fail(Exit::model,
+                    std::format("\"{}\" is not a model id in the catalog; only an exact id such "
+                                "as AUTHOR/MODEL:free may contain a colon before :TAG",
+                                display_metadata(model)));
+    }
+    if (const auto checked = check_provider_tag(tag); !checked) {
+        return std::unexpected(checked.error());
+    }
+    return ModelChoice{.model = std::string(model), .provider = std::string(tag)};
+}
+
 std::vector<ModelInfo> search(std::string_view query, const std::vector<ModelInfo>& catalog) {
     const std::vector<std::string> wanted = tokenize(query);
     if (wanted.empty()) {
@@ -783,7 +816,8 @@ std::string format_endpoints(const std::vector<Endpoint>& endpoints) {
     };
     rows.append_range(endpoints | std::views::transform(endpoint_row));
     return render_table(rows) + "Pass a tag (or its provider prefix, e.g. google-vertex) to "
-                                "--provider to use only those endpoints.\n";
+                                "`pin MODEL TAG` to save it, to -m MODEL:TAG for one question, "
+                                "or to --provider.\n";
 }
 
 long long capped_output_tokens(const ModelInfo& model, long long requested) {
@@ -791,7 +825,8 @@ long long capped_output_tokens(const ModelInfo& model, long long requested) {
 }
 
 std::string format_model(const ModelInfo& model, std::string_view catalog_fetched_at,
-                         long long default_output_tokens) {
+                         long long default_output_tokens,
+                         const std::vector<std::string>& saved_provider) {
     std::vector<Field> fields;
     fields.push_back({.label = "ID", .value = model.id});
     fields.push_back({.label = "Name", .value = model.name});
@@ -809,6 +844,14 @@ std::string format_model(const ModelInfo& model, std::string_view catalog_fetche
         .label = "Output budget",
         .value = std::format("{} tokens per answer by default, reasoning included",
                              with_commas(capped_output_tokens(model, default_output_tokens))),
+    });
+    std::string saved_tags;
+    for (const std::string& tag : saved_provider) {
+        saved_tags += saved_tags.empty() ? tag : ", " + tag;
+    }
+    fields.push_back({
+        .label = "Saved provider",
+        .value = saved_tags.empty() ? std::string("none") : saved_tags,
     });
     fields.push_back({.label = "Reasoning", .value = describe_reasoning(model)});
     fields.push_back({.label = "Input", .value = per_million(model.pricing.prompt)});
@@ -883,14 +926,7 @@ namespace {
 
 // Every change to models.json is a read, an edit and an atomic write under this lock.
 Result<FileLock> lock_aliases(const std::filesystem::path& state_dir) {
-    if (const auto made = ensure_private_dir(state_dir); !made) {
-        return std::unexpected(made.error());
-    }
-    const std::filesystem::path locks = state_dir / locks_dir_name;
-    if (const auto made = ensure_private_dir(locks); !made) {
-        return std::unexpected(made.error());
-    }
-    return FileLock::acquire(locks / aliases_lock_name, true);
+    return lock_state_file(state_dir, aliases_lock_name);
 }
 
 } // namespace

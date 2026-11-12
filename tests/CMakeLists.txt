@@ -11,10 +11,12 @@ add_executable(unit_tests
     unit/test_credentials.cpp
     unit/test_display.cpp
     unit/test_fsutil.cpp
+    unit/test_group.cpp
     unit/test_http.cpp
     unit/test_help.cpp
     unit/test_models.cpp
     unit/test_progress.cpp
+    unit/test_registry.cpp
     unit/test_request.cpp
     unit/test_session.cpp
     unit/test_sse.cpp

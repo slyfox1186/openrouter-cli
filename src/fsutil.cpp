@@ -15,6 +15,7 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <limits>
 #include <random>
 #include <string>
 #include <string_view>
@@ -220,6 +221,30 @@ Result<void> check_private_file(const fs::path& file) {
     return check_private(file, info, "chmod 600");
 }
 
+Result<bool> file_present(const fs::path& file) {
+    std::error_code error;
+    const fs::file_status status = fs::symlink_status(file, error);
+    if (error && error != std::errc::no_such_file_or_directory) {
+        return fail(Exit::config,
+                    std::format("cannot inspect {}: {}", file.string(), error.message()));
+    }
+    if (status.type() == fs::file_type::not_found) {
+        return false;
+    }
+    if (error) {
+        return fail(Exit::config,
+                    std::format("cannot inspect {}: {}", file.string(), error.message()));
+    }
+    return true;
+}
+
+Result<std::string> read_private_file(const fs::path& file) {
+    if (const auto checked = check_private_file(file); !checked) {
+        return std::unexpected(checked.error());
+    }
+    return read_regular_file(file, std::numeric_limits<std::size_t>::max());
+}
+
 Result<FileLock> FileLock::acquire(const fs::path& lock_file, bool blocking,
                                    LockDeadline deadline) {
     const auto checked = check_private_file(lock_file);
@@ -275,6 +300,18 @@ FileLock& FileLock::operator=(FileLock&& other) noexcept {
 // Closing the descriptor releases the flock; the lock file itself stays for the next holder.
 FileLock::~FileLock() {
     close_descriptor(fd_);
+}
+
+Result<FileLock> lock_state_file(const fs::path& state_dir, std::string_view lock_name,
+                                 bool blocking) {
+    if (const auto made = ensure_private_dir(state_dir); !made) {
+        return std::unexpected(made.error());
+    }
+    const fs::path locks = state_dir / "locks";
+    if (const auto made = ensure_private_dir(locks); !made) {
+        return std::unexpected(made.error());
+    }
+    return FileLock::acquire(locks / lock_name, blocking);
 }
 
 std::string random_hex(std::size_t bytes) {

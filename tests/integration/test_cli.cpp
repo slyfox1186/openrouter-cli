@@ -1336,10 +1336,13 @@ TEST_CASE("command line grammar") {
     CHECK(sandbox.run({"-m", "x", "logout"}).code == exit_usage);
     CHECK(file_exists(sandbox.api_credential()));
     CHECK(sandbox.run({"-m", "x", "spend"}).code == exit_usage);
-    for (const std::string command : {"find", "show", "save", "remove", "list"}) {
+    for (const std::string command :
+         {"find", "show", "save", "remove", "list", "pin", "unpin", "group"}) {
         INFO(command);
         CHECK(sandbox.run({"-m", "x", command}).code == exit_usage);
     }
+    CHECK(sandbox.run({"-g", "coding", "group", "list"}).code == exit_usage);
+    CHECK(sandbox.run({"--any-provider", "list"}).code == exit_usage);
     CHECK(sandbox.run({"-p", "mockcloud", "status"}).code == exit_usage);
     CHECK(sandbox.run({}).code == exit_usage);
     CHECK(server.post_count() == 0);
@@ -1370,6 +1373,14 @@ TEST_CASE("help is shown for -h and --help on every command") {
         {.path = {"save"}, .usage = "  openrouter-cli save ALIAS MODEL_ID\n"},
         {.path = {"remove"}, .usage = "  openrouter-cli remove ALIAS\n"},
         {.path = {"list"}, .usage = "  openrouter-cli list\n"},
+        {.path = {"pin"}, .usage = "  openrouter-cli pin MODEL TAG...\n"},
+        {.path = {"unpin"}, .usage = "  openrouter-cli unpin MODEL\n"},
+        {.path = {"models", "pin"}, .usage = "  openrouter-cli models pin MODEL TAG...\n"},
+        {.path = {"models", "unpin"}, .usage = "  openrouter-cli models unpin MODEL\n"},
+        {.path = {"group"}, .usage = "  openrouter-cli group COMMAND\n"},
+        {.path = {"group", "add"}, .usage = "  openrouter-cli group add NAME MODELS\n"},
+        {.path = {"group", "remove"}, .usage = "  openrouter-cli group remove NAME [MODELS]\n"},
+        {.path = {"group", "list"}, .usage = "  openrouter-cli group list\n"},
         {.path = {"models"}, .usage = "  openrouter-cli models COMMAND\n"},
         {.path = {"models", "find"}, .usage = "  openrouter-cli models find [OPTIONS] NAME\n"},
         {.path = {"models", "show"}, .usage = "  openrouter-cli models show MODEL\n"},
@@ -1408,7 +1419,31 @@ TEST_CASE("help is shown for -h and --help on every command") {
     CHECK(root.starts_with("openrouter-cli "));
     CHECK(line_starting(root, "  -h, --help ").ends_with("Show this help and exit"));
     CHECK(line_starting(root, "      --version ").ends_with("Show the version and exit"));
-    CHECK(line_starting(root, "  -m, --model MODEL ").ends_with("~author/family-latest, or name"));
+    CHECK(line_starting(root, "  -m, --model MODEL[:TAG] ").contains("Model alias, id,"));
+    CHECK(single_spaced(root).contains("or name; :TAG uses only that provider for this question"));
+    CHECK(single_spaced(root).contains("Ask every model in a saved group at once; one billed call "
+                                       "per member"));
+    CHECK(single_spaced(root).contains("Ignore the saved provider for this question; privacy "
+                                       "settings still apply"));
+    CHECK(root.find("expect-model-id") == std::string::npos);
+    for (const std::string_view example :
+         {"openrouter-cli -m AUTHOR/MODEL:TAG \"Question\"", "openrouter-cli pin AUTHOR/MODEL TAG",
+          "openrouter-cli unpin AUTHOR/MODEL",
+          "openrouter-cli -m AUTHOR/MODEL --any-provider \"Q\"",
+          "openrouter-cli group add NAME \"AUTHOR/A,AUTHOR/B\"",
+          "openrouter-cli -g NAME --role review \"Question\""}) {
+        INFO(example);
+        CHECK(root.contains("\n    " + std::string(example) + "\n"));
+    }
+    // Example commands are never wrapped, so each must fit a 60-column page as written.
+    for (const std::string& line : lines_of(root)) {
+        if (line.starts_with("    openrouter-cli ")) {
+            INFO(line);
+            CHECK(line.size() <= 4U + 56U);
+        }
+    }
+    CHECK(single_spaced(root).contains("any other word after the last colon is read as a provider "
+                                       "tag"));
     CHECK(single_spaced(root).contains("Output budget including reasoning (built-in default "
                                        "64000; `show MODEL` prints the configured budget)"));
     CHECK(root.find("HELP") == std::string::npos);
@@ -1416,7 +1451,7 @@ TEST_CASE("help is shown for -h and --help on every command") {
     CHECK(root.find("\nEXAMPLES\n") != std::string::npos);
     // The short commands are the listed spelling; the models group still documents itself.
     CHECK(line_starting(root, "  save ALIAS MODEL_ID ").ends_with("Save an alias for a model id"));
-    CHECK(line_starting(root, "  list ").ends_with("List saved aliases"));
+    CHECK(line_starting(root, "  list ").ends_with("List saved aliases and providers"));
     CHECK(root.find("  find [OPTIONS] NAME ") != std::string::npos);
     CHECK(root.find("  show MODEL ") != std::string::npos);
     CHECK(root.find("  remove ALIAS ") != std::string::npos);
@@ -2228,7 +2263,7 @@ TEST_CASE("status reports members it cannot search as not available or lookup fa
                  return Reply{.status = http_ok, .body = R"({"data":[{"id":7}]})"};
              },
          .exit = exit_api,
-         .text = "lookup failed"},
+         .text = "email: lookup failed (unexpected response from GET /organization/members"},
         {.name = "500",
          .responder =
              [](const RecordedRequest&) {
@@ -2236,7 +2271,7 @@ TEST_CASE("status reports members it cannot search as not available or lookup fa
                               .body = R"({"error":{"code":500,"message":"boom"}})"};
              },
          .exit = exit_api,
-         .text = "lookup failed"},
+         .text = "email: lookup failed (HTTP 500: boom)"},
     };
     for (const Case& entry : cases) {
         INFO("members ", entry.name);
@@ -2267,7 +2302,9 @@ TEST_CASE("status stops at the members page cap and reports the lookup as failed
     const RunResult status = sandbox.run({"status"});
 
     CHECK(status.code == exit_api);
-    CHECK(status.all().contains("lookup failed"));
+    CHECK(status.all().contains(std::format(
+        "email: lookup failed (no match in the first {} pages of GET /organization/members)",
+        members_page_cap)));
     CHECK_FALSE(status.all().contains("not available"));
     CHECK(server.requests_to("/organization/members").size() ==
           static_cast<std::size_t>(members_page_cap));
@@ -2816,4 +2853,399 @@ TEST_CASE("spend --resolve prices every call when stdout is closed") {
     CHECK(sandbox.records_of("resolved").size() == static_cast<std::size_t>(calls));
     CHECK(server.generation_count() == calls);
     CHECK(server.post_count() == 0);
+}
+
+// ----- providers with the model, saved providers ------------------------------------------
+
+namespace {
+
+bool asked_for_endpoints(const MockServer& server) {
+    return std::ranges::any_of(server.requests(), [](const RecordedRequest& request) {
+        return request.path.ends_with("/endpoints");
+    });
+}
+
+std::string only_of(const json& body) {
+    const json& provider = body.at("provider");
+    return provider.contains("only") ? provider.at("only").dump() : std::string("none");
+}
+
+} // namespace
+
+TEST_CASE("-m MODEL:TAG sends that model with only that provider") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    const RunResult tagged = sandbox.run({"-m", "test/alpha-1:mockcloud/fp8", "question"});
+    INFO(tagged.err);
+    CHECK(tagged.code == exit_ok);
+    CHECK(text_at(server.last_post(), "model") == "test/alpha-1");
+    CHECK(only_of(server.last_post()) == R"(["mockcloud/fp8"])");
+    CHECK(tagged.err.contains("providers mockcloud/fp8 (from -m)"));
+    CHECK_FALSE(asked_for_endpoints(server));
+    const std::vector<json> pending = sandbox.records_of("pending");
+    REQUIRE_FALSE(pending.empty());
+    CHECK(text_at(pending.back(), "requested_model") == "test/alpha-1:mockcloud/fp8");
+
+    REQUIRE(sandbox.run({"save", "rev", std::string(alpha)}).code == exit_ok);
+    CHECK(sandbox.run({"-m", "rev:other", "q"}).code == exit_ok);
+    CHECK(only_of(server.last_post()) == R"(["other"])");
+    CHECK(sandbox.run({"-m", "test/alpha-1:futureword", "q"}).code == exit_ok);
+    CHECK(only_of(server.last_post()) == R"(["futureword"])");
+    CHECK(server.post_count() == 3);
+
+    CHECK(sandbox.run({"-m", "test/alpha-1:", "q"}).code == exit_usage);
+    const RunResult variant = sandbox.run({"-m", "test/alpha-1:nitro", "q"});
+    CHECK(variant.code == exit_model);
+    CHECK(variant.err.contains("variants such as :nitro are not supported"));
+    CHECK(sandbox.run({"-m", "test/alpha-1:a", "-p", "b", "q"}).code == exit_usage);
+    CHECK(sandbox.run({"-m", "test/alpha-1:a", "--any-provider", "q"}).code == exit_usage);
+    CHECK(server.post_count() == 3);
+}
+
+TEST_CASE("a pinned provider applies until a question names its own or skips it") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    const RunResult pinned =
+        sandbox.run({"pin", std::string(alpha), "mockcloud", "other/fp8", "mockcloud"});
+    INFO(pinned.err);
+    CHECK(pinned.code == exit_ok);
+    CHECK(pinned.out == "saved providers mockcloud, other/fp8 for test/alpha-1\n");
+
+    CHECK(sandbox.run(ask("q1")).code == exit_ok);
+    CHECK(only_of(server.last_post()) == R"(["mockcloud","other/fp8"])");
+    CHECK(sandbox.run(ask("q1")).err.contains("providers mockcloud,other/fp8 (saved)"));
+
+    CHECK(sandbox.run({"-m", std::string(alpha), "-p", "solo", "q2"}).code == exit_ok);
+    CHECK(only_of(server.last_post()) == R"(["solo"])");
+    CHECK(sandbox.run({"-m", "test/alpha-1:inline", "q3"}).code == exit_ok);
+    CHECK(only_of(server.last_post()) == R"(["inline"])");
+
+    const RunResult any = sandbox.run({"-m", std::string(alpha), "--any-provider", "q4"});
+    CHECK(any.code == exit_ok);
+    CHECK(any.err.contains("providers any"));
+    const json any_post = server.last_post();
+    const json& provider = any_post.at("provider");
+    CHECK_FALSE(provider.contains("only"));
+    CHECK(provider.at("zdr").get<bool>());
+    CHECK(text_at(provider, "data_collection") == "deny");
+    CHECK(provider.at("require_parameters").get<bool>());
+    CHECK(sandbox.run({"-m", std::string(alpha), "--any-provider", "-p", "x", "q"}).code ==
+          exit_usage);
+
+    CHECK(sandbox.run(ask("q5")).code == exit_ok);
+    CHECK(only_of(server.last_post()) == R"(["mockcloud","other/fp8"])");
+    CHECK_FALSE(asked_for_endpoints(server));
+
+    const RunResult replaced = sandbox.run({"models", "pin", "alpha 1", "solo"});
+    CHECK(replaced.code == exit_ok);
+    CHECK(replaced.out == "saved provider solo for test/alpha-1\nreplaced mockcloud, other/fp8\n");
+    for (const std::string& bad : {std::string("a b"), std::string("a:b"), std::string()}) {
+        INFO(bad);
+        CHECK(sandbox.run({"pin", std::string(alpha), bad}).code == exit_usage);
+    }
+    CHECK(sandbox.run({"list"}).out.contains("test/alpha-1: solo (saved "));
+}
+
+TEST_CASE("unpin clears a saved provider, even for a model that left the catalog") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+
+    CHECK(sandbox.run({"pin", std::string(alpha), "mockcloud"}).code == exit_ok);
+    const RunResult removed = sandbox.run({"unpin", "alpha 1"});
+    CHECK(removed.code == exit_ok);
+    CHECK(removed.out == "removed saved provider mockcloud for test/alpha-1\n");
+    const RunResult none = sandbox.run({"models", "unpin", std::string(alpha)});
+    CHECK(none.code == exit_model);
+    CHECK(none.err.contains("no saved provider for test/alpha-1"));
+
+    // An alias whose target retired falls through to the live model, the way pin resolves it.
+    write_text(sandbox.state_dir() / "models.json",
+               R"({"aliases": {"alpha-1": {"model_id": "test/retired", "saved": "t"}}})");
+    write_text(sandbox.state_dir() / "providers.json",
+               R"({"providers": {"test/retired": {"tags": ["old"], "saved": "t"},)"
+               R"( "test/alpha-1": {"tags": ["live"], "saved": "t"}}})");
+    const RunResult through_alias = sandbox.run({"unpin", "alpha-1"});
+    CHECK(through_alias.code == exit_ok);
+    CHECK(through_alias.out == "removed saved provider live for test/alpha-1\n");
+
+    server.set_route("/models", [](const RecordedRequest&) {
+        return Reply{.status = http_server_error, .body = "{}"};
+    });
+    fs::remove(sandbox.state_dir() / "catalog.json");
+    const RunResult retired = sandbox.run({"unpin", "test/retired"});
+    CHECK(retired.code == exit_ok);
+    CHECK(retired.out == "removed saved provider old for test/retired\n");
+}
+
+TEST_CASE("list and show report saved providers, and a broken file blocks only what reads it") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    CHECK(sandbox.run({"list"}).out == "no saved aliases or providers yet\n");
+    REQUIRE(sandbox.run({"save", "mine", "test/beta-2"}).code == exit_ok);
+    REQUIRE(sandbox.run({"pin", "mine", "mockcloud"}).code == exit_ok);
+    REQUIRE(sandbox.run({"remove", "mine"}).code == exit_ok);
+    const RunResult listed = sandbox.run({"list"});
+    CHECK(listed.out.starts_with("Saved providers:\ntest/beta-2: mockcloud (saved "));
+    CHECK(sandbox.run({"show", "test/beta-2"}).out.contains("Saved provider:     mockcloud\n"));
+    CHECK(sandbox.run({"show", std::string(alpha)}).out.contains("Saved provider:     none\n"));
+
+    write_text(sandbox.state_dir() / "providers.json", R"({"providers": {"x": {"tags": []}}})");
+    for (const std::vector<std::string>& args :
+         {std::vector<std::string>{"list"}, std::vector<std::string>{"show", std::string(alpha)},
+          ask("q")}) {
+        const RunResult broken = sandbox.run(args);
+        CHECK(broken.code == exit_config);
+        CHECK(broken.err.contains("providers.json is corrupt (model x)"));
+    }
+    CHECK(sandbox.run({"-m", std::string(alpha), "-p", "p", "q"}).code == exit_ok);
+    CHECK(sandbox.run({"-m", "test/alpha-1:t", "q"}).code == exit_ok);
+    CHECK(sandbox.run({"-m", std::string(alpha), "--any-provider", "q"}).code == exit_ok);
+    CHECK(server.post_count() == 3);
+}
+
+TEST_CASE("a session keeps its model, not a provider given in one round") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    CHECK(sandbox.run({"--session", "s", "-m", "test/alpha-1:first", "q1"}).code == exit_ok);
+    CHECK(only_of(server.last_post()) == R"(["first"])");
+    CHECK(sandbox.run({"--session", "s", "q2"}).code == exit_ok);
+    CHECK(only_of(server.last_post()) == "none");
+    REQUIRE(sandbox.run({"pin", std::string(alpha), "saved"}).code == exit_ok);
+    CHECK(sandbox.run({"--session", "s", "q3"}).code == exit_ok);
+    CHECK(only_of(server.last_post()) == R"(["saved"])");
+    CHECK(sandbox.run({"--session", "s", "-m", "test/alpha-1:again", "q4"}).code == exit_ok);
+    CHECK(only_of(server.last_post()) == R"(["again"])");
+    const RunResult other = sandbox.run({"--session", "s", "-m", "test/beta-2:x", "q5"});
+    CHECK(other.code == exit_usage);
+    CHECK(other.err.contains("session s keeps model test/alpha-1"));
+    CHECK(server.post_count() == 4);
+}
+
+// ----- groups -----------------------------------------------------------------------------
+
+namespace {
+
+// The block a group prints for one member.
+std::string member_block(std::string_view typed, std::string_view id) {
+    return std::format("===== {} ({}) =====\n", typed, id);
+}
+
+std::vector<std::string> posted_models(const MockServer& server) {
+    std::vector<std::string> models;
+    for (const json& body : server.posts()) {
+        models.push_back(text_at(body, "model"));
+    }
+    std::ranges::sort(models);
+    return models;
+}
+
+} // namespace
+
+TEST_CASE("group add, list and remove edit saved groups") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+
+    CHECK(sandbox.run({"group", "list"}).out.starts_with("no groups yet"));
+    const RunResult added = sandbox.run({"group", "add", "Coding", "test/alpha-1, test/beta-2:mc"});
+    INFO(added.err);
+    CHECK(added.code == exit_ok);
+    CHECK(added.out == "group coding: test/alpha-1, test/beta-2:mc\n");
+    CHECK(sandbox.run({"group", "add", "coding", "beta 3"}).code == exit_ok);
+    CHECK(sandbox.run({"group", "list"})
+              .out.starts_with("coding: test/alpha-1, test/beta-2:mc, beta 3 (saved "));
+    CHECK(sandbox.run({"list"}).out.contains("Groups: see openrouter-cli group list"));
+
+    const std::string before = read_text(sandbox.state_dir() / "groups.json");
+    CHECK(sandbox.run({"group", "add", "coding", "no-such-model-anywhere"}).code == exit_model);
+    CHECK(sandbox.run({"group", "add", "coding", "test/alpha-1"}).code == exit_usage);
+    REQUIRE(sandbox.run({"save", "first", std::string(alpha)}).code == exit_ok);
+    const RunResult duplicate = sandbox.run({"group", "add", "coding", "first"});
+    CHECK(duplicate.code == exit_usage);
+    CHECK(duplicate.err.contains("are both test/alpha-1"));
+    CHECK(sandbox.run({"group", "add", "coding", "a,,b"}).code == exit_usage);
+    CHECK(sandbox.run({"group", "add", "!!", "test/alpha-1"}).code == exit_usage);
+    CHECK(read_text(sandbox.state_dir() / "groups.json") == before);
+
+    CHECK(sandbox.run({"group", "remove", "coding", "test/alpha-1"}).out ==
+          "group coding: test/beta-2:mc, beta 3\n");
+    CHECK(sandbox.run({"group", "remove", "coding", "test/alpha-1"}).code == exit_model);
+    CHECK(sandbox.run({"group", "remove", "nothing"}).code == exit_model);
+    CHECK(sandbox.run({"group", "remove", "coding"}).out == "removed group coding\n");
+    CHECK(sandbox.run({"group", "list"}).out.starts_with("no groups yet"));
+}
+
+TEST_CASE("a group holds at most eight models and a retired member is removable offline") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    make_private_dir(sandbox.state_dir());
+    write_text(sandbox.state_dir() / "groups.json",
+               R"({"groups": {"g": {"members": ["test/gone", "b", "c", "d", "e", "f", "g", "h"],)"
+               R"( "saved": "t"}}})");
+    CHECK(sandbox.run({"group", "add", "g", std::string(alpha)}).code == exit_usage);
+    server.set_route("/models", [](const RecordedRequest&) {
+        return Reply{.status = http_server_error, .body = "{}"};
+    });
+    const RunResult removed = sandbox.run({"group", "remove", "g", "test/gone"});
+    CHECK(removed.code == exit_ok);
+    CHECK(removed.out == "group g: b, c, d, e, f, g, h\n");
+}
+
+TEST_CASE("-g asks every member at once, each with its own model and provider") {
+    MockServer server;
+    server.hold_until_posts(2);
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    REQUIRE(sandbox.run({"group", "add", "coding", "test/alpha-1:mockcloud,Beta 2"}).code ==
+            exit_ok);
+    REQUIRE(sandbox.run({"pin", "test/beta-2", "pinned"}).code == exit_ok);
+
+    const RunResult asked = sandbox.run({"-g", "coding", "--role", "review", "Review this"});
+    INFO(asked.err);
+    CHECK(asked.code == exit_ok);
+    CHECK(posted_models(server) == std::vector<std::string>{"test/alpha-1", "test/beta-2"});
+    for (const json& body : server.posts()) {
+        INFO(text_at(body, "model"));
+        CHECK(only_of(body) ==
+              (text_at(body, "model") == "test/alpha-1" ? R"(["mockcloud"])" : R"(["pinned"])"));
+        CHECK(last_user_text(body).contains("Review this"));
+    }
+    CHECK(asked.out.contains(member_block("test/alpha-1:mockcloud", "test/alpha-1") +
+                             "Hello world\n"));
+    CHECK(asked.out.contains(member_block("Beta 2", "test/beta-2") + "Hello world\n"));
+    CHECK(asked.err.contains("openrouter-cli: group coding: asking 2 members (one billed call "
+                             "each)\n"));
+    CHECK(asked.err.contains("[Beta 2] openrouter-cli: cost "));
+    CHECK(asked.err.contains("[test/alpha-1:mockcloud] openrouter-cli: asking test/alpha-1"));
+    CHECK(asked.err.contains("group coding: Beta 2 (test/beta-2): complete\n"));
+    CHECK(asked.err.ends_with("group coding: 2 complete, 0 incomplete, 0 failed\n"));
+    CHECK(sandbox.records_of("pending").size() == 2U);
+    CHECK(sandbox.answer_files().size() == 2U);
+    CHECK_FALSE(asked_for_endpoints(server));
+}
+
+TEST_CASE("a group question read from stdin reaches every member") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    REQUIRE(sandbox.run({"group", "add", "pair", "test/alpha-1,test/beta-2"}).code == exit_ok);
+    const std::string big(200000, 'q');
+    const RunResult asked =
+        sandbox.run_with(Launch{.args = {"-g", "pair", "-"}, .stdin_text = big});
+    INFO(asked.err);
+    CHECK(asked.code == exit_ok);
+    REQUIRE(server.posts().size() == 2U);
+    for (const json& body : server.posts()) {
+        CHECK(last_user_text(body) == big);
+    }
+}
+
+TEST_CASE("one member failing leaves the others' answers and sets the exit code") {
+    MockServer server;
+    server.set_model_scenario("test/beta-2", Scenario::http_error);
+    server.set_model_scenario("test/beta-3", Scenario::length_empty);
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    REQUIRE(sandbox.run({"group", "add", "g", "test/alpha-1,test/beta-2,test/beta-3"}).code ==
+            exit_ok);
+
+    const RunResult asked = sandbox.run({"-g", "g", "q"});
+    CHECK(asked.code == exit_api);
+    CHECK(asked.out.contains(member_block("test/alpha-1", "test/alpha-1") + "Hello world\n"));
+    CHECK(asked.err.contains("group g: test/beta-2 (test/beta-2): failed (exit 5)"));
+    CHECK(asked.err.contains("group g: test/beta-3 (test/beta-3): incomplete (exit 6"));
+    CHECK(asked.err.contains("group g: 1 complete, 1 incomplete, 1 failed"));
+    CHECK(server.post_count() == 3);
+    const RunResult spend = sandbox.run({"spend"});
+    CHECK(spend.code == exit_ok);
+}
+
+TEST_CASE("group problems found before sending make no request") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    REQUIRE(sandbox.run({"group", "add", "g", "test/alpha-1,anthropic/claude-test"}).code ==
+            exit_ok);
+    REQUIRE(sandbox.run({"group", "add", "tagged", "test/alpha-1:mc"}).code == exit_ok);
+
+    CHECK(sandbox.run({"-g", "g", "-m", std::string(alpha), "q"}).code == exit_usage);
+    CHECK(sandbox.run({"-g", "g", "-p", "x", "q"}).code == exit_usage);
+    CHECK(sandbox.run({"-g", "missing", "q"}).code == exit_model);
+    const RunResult tagged = sandbox.run({"-g", "tagged", "--any-provider", "q"});
+    CHECK(tagged.code == exit_usage);
+    CHECK(tagged.err.contains("test/alpha-1:mc"));
+    // anthropic/claude-test must reason, so -e none fails its dry run before anyone is asked.
+    const RunResult effort = sandbox.run({"-g", "g", "-e", "none", "q"});
+    CHECK(effort.code != exit_ok);
+    CHECK(effort.err.contains("group member anthropic/claude-test"));
+
+    // The catalog drops a member after it was added.
+    server.set_route("/models", [](const RecordedRequest&) {
+        return Reply{.status = http_ok,
+                     .body = R"({"data":[{"id":"test/beta-2","name":"Beta 2"}]})"};
+    });
+    REQUIRE(sandbox.run({"find", "beta", "--refresh"}).code == exit_ok);
+    CHECK(sandbox.run({"-g", "g", "q"}).code == exit_model);
+    CHECK(server.post_count() == 0);
+}
+
+TEST_CASE("an interrupt sent only to the group parent reaches every member") {
+    MockServer server;
+    server.set_scenario(Scenario::gated);
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    REQUIRE(sandbox.run({"group", "add", "pair", "test/alpha-1,test/beta-2"}).code == exit_ok);
+
+    Child child = sandbox.spawn(Launch{.args = {"-g", "pair", "q"}});
+    const auto deadline = Clock::now() + output_wait;
+    while (server.post_count() < 2 && Clock::now() < deadline) {
+        std::this_thread::sleep_for(poll_interval);
+    }
+    REQUIRE(server.post_count() == 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    REQUIRE(::kill(child.pid(), SIGINT) == 0);
+    const int code = child.wait();
+    server.release_gate();
+    CHECK(code == exit_interrupted);
+    CHECK(child.err().contains("interrupted (exit 8)"));
+    CHECK(child.out().contains("Hello"));
+}
+
+TEST_CASE("a group conversation keeps one history per member and refuses new members") {
+    MockServer server;
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+    REQUIRE(sandbox.run({"group", "add", "pair", "test/alpha-1,test/beta-2"}).code == exit_ok);
+
+    const RunResult first =
+        sandbox.run({"-g", "pair", "--session", "plan", "--role", "review", "round one"});
+    INFO(first.err);
+    CHECK(first.code == exit_ok);
+    CHECK(file_exists(sandbox.state_dir() / "group-sessions" / "plan.json"));
+    const RunResult second = sandbox.run({"-g", "pair", "--session", "plan", "round two"});
+    INFO(second.err);
+    CHECK(second.code == exit_ok);
+    for (const json& body : server.posts()) {
+        if (last_user_text(body) == "round two") {
+            CHECK(body.at("messages").size() == 4U);
+        }
+    }
+    CHECK(sandbox.run({"-g", "pair", "--session", "plan", "--role", "review", "again"}).code ==
+          exit_usage);
+
+    REQUIRE(sandbox.run({"group", "add", "pair", "test/beta-3"}).code == exit_ok);
+    const RunResult added = sandbox.run({"-g", "pair", "--session", "plan", "round three"});
+    CHECK(added.code == exit_usage);
+    CHECK(added.err.contains("member test/beta-3 has no history in session plan"));
+
+    // An ordinary session named like the marker is unaffected by it.
+    CHECK(sandbox.run({"--session", "plan.group", "-m", std::string(alpha), "q"}).code == exit_ok);
+    CHECK(server.post_count() == 5);
 }
