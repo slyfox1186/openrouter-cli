@@ -355,7 +355,7 @@ scripts/build.sh --with-skills
 
 This links the skill into `~/.agents/skills/openrouter-cli` and `~/.claude/skills/openrouter-cli`. You can then say something like *"ask Gemini to review this plan"* to your assistant.
 
-The skill tells the assistant to show you the model and its prices and to **wait for your approval before every paid question**. It also tells the assistant never to touch your keys.
+The skill tells the assistant to show you the model and its prices and to wait for your approval before a paid question, unless you have given it standing permission, for example in your `CLAUDE.md` or `AGENTS.md`. Any spending limits and funds checks you require still apply. It also tells the assistant never to touch your keys.
 
 *Keep the cloned folder where it is*, because the skill links point into it.
 

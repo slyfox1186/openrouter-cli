@@ -1,13 +1,19 @@
 ---
 name: openrouter-cli
-description: "Second opinion, critique or peer review from another AI model hosted on OpenRouter (Gemini, GPT, Grok, DeepSeek, Qwen, Llama, Mistral, Kimi, GLM, Claude and others) through the `openrouter-cli` command, optionally restricted to one provider, or from every model in a saved group at once. Use when the user asks for an outside opinion, says to call or ask the NAME LLMs, models or group (\"call the coding LLMs\"), wants a different model to check, critique or improve a plan, design, diff or code, names an OpenRouter-hosted model or provider (\"ask Gemini 4 Argon to check this\"), asks for a follow-up round with that model, or asks about OpenRouter model prices, spend, credits or account status. Every question to a model is a billed call that needs the user's approval first."
+description: "Use when seeking another LLM's advice on project decisions, asking an outside model to compare approaches or review a plan, design, diff or code, naming an OpenRouter model or provider (for example Gemini, DeepSeek, Kimi, Grok or Qwen), saying to call or ask the NAME LLMs, models or group (\"call the coding LLMs\"), using openrouter-cli for a question or follow-up, or checking OpenRouter prices, spend, credits or account status."
 ---
 
 # openrouter-cli
 
-`openrouter-cli` sends a question, plus any files you attach, to one OpenRouter model, or with
-`-g` to every model in a saved group at once, and prints the answer. By default the question is sent as written (`plain`). For a critique or peer review,
-pass `--role review`, which makes the model act as a reviewer of a plan or code.
+Alongside the `codex` and `claude` CLIs, `openrouter-cli` provides another way to consult LLMs
+when making project decisions. It sends a question, plus any files you attach, to any chat model
+available through OpenRouter, or with `-g` to every model in a saved group at once, and prints
+the answer. Model selection is open; saved aliases and the examples below are not a fixed list of
+supported models.
+
+Use it to compare approaches, investigate a difficult bug, or get another model's assessment of
+a plan or code. It supplements any required `codex`/`claude` peer review. By default the question
+is sent as written (`plain`); pass `--role review` for a critique or peer review.
 
 ## Billing
 
@@ -20,12 +26,17 @@ Every question is a billed call. Before one:
    `:TAG` or `-p` you pass; without those, the `Saved provider` line of `show`; with
    `--any-provider`, any endpoint. For a worst-case cost, take the highest `INPUT` and `OUTPUT`
    among the endpoint rows those providers allow (a tag's provider prefix, such as
-   `google-vertex`, allows its standard rows, not `flex` or `priority` ones). Price the prompt at that input rate and the output budget the call sends (the
-   `Output budget` line, or the `--max-output-tokens` value you pass, capped at `Max output`) at
-   that output rate or the model's `Internal reasoning` price, whichever is higher, then add any
-   `Request` fee. When `show` says some requests are billed at different catalog rates, no worst
-   case can be computed from it; say so.
-3. Wait for approval, unless the user already approved that exact call in this turn.
+   `google-vertex`, allows its standard rows, not `flex` or `priority` ones). Price the prompt
+   at that input rate and the output budget the call sends (the `Output budget` line, or the
+   `--max-output-tokens` value you pass, capped at `Max output`) at that output rate or the
+   model's `Internal reasoning` price, whichever is higher, then add any `Request` fee. When
+   `show` says some requests are billed at different catalog rates, no worst case can be
+   computed from it; say so and obtain approval rather than relying on a spending cap.
+3. Obtain approval unless the user already approved that exact call in this turn or an explicit
+   standing policy authorizes it. Apply the user's total-cost limits and required funds checks to
+   every call, including individually approved calls, follow-ups and retries. If required funds
+   cannot be read or are insufficient, stop and report the missing figure or shortfall; never
+   reduce the requested work or output budget to fit the balance.
 
 After the call, report the final `cost` line from stderr to the user. These commands are free
 and need no approval: `find`, `show`, `save`, `remove`, `list`, `pin`, `unpin`, `group add`,
@@ -50,6 +61,9 @@ it yourself. While `providers.json` is corrupt, a question that passes `:TAG`, `
 - `-m` accepts a saved alias, an exact id (`google/gemini-4-argon`), a `~author/family-latest`
   id, or plain words (`-m "gemini 4 argon"`). Exact IDs take precedence over aliases; a plain
   name that matches exactly one model is used without saving an alias.
+- Examples include `deepseek/deepseek-v4.1-flash-1017` and `moonshotai/kimi-k3.1-pro`. Use
+  `find` and `show` to check current availability and prices for these or any other model;
+  endpoint availability and the privacy/provider filters still apply.
 - `openrouter-cli save ALIAS MODEL_ID` saves an alias by hand. A model keeps one alias: saving
   another name for the same id removes the old one.
 - `openrouter-cli remove ALIAS` deletes a saved alias.
@@ -80,10 +94,14 @@ it yourself. While `providers.json` is corrupt, a question that passes `:TAG`, `
 
 ## Sending a question
 
-Options come first and the query comes last:
+Options come first and the query comes last. After the billing checks, choose the command that
+fits the task; these are independent examples, not a requirement to call both models:
 
 ```bash
-openrouter-cli -m google/gemini-4-argon --role review -f src/http.cpp -f src/http.hpp \
+openrouter-cli -m deepseek/deepseek-v4.1-flash-1017 -f plan.md \
+  "Compare the approaches in this plan against its goals and constraints. Recommend one and explain the tradeoffs."
+
+openrouter-cli -m moonshotai/kimi-k3.1-pro --role review -f src/http.cpp -f src/http.hpp \
   "Goal: retry free GET requests safely. Constraints: ... Review the retry logic."
 ```
 
@@ -116,7 +134,8 @@ openrouter-cli -m google/gemini-4-argon --role review -f src/http.cpp -f src/htt
   enhancements, and what was not verified. Pass it whenever the user wants a review or critique.
 - `-s TEXT` or `-s @FILE` (long form `--system-prompt`) adds system prompt text.
 - `-e EFFORT` sets reasoning effort (`max`, `xhigh`, `high`, `medium`, `low`, `minimal`, `none`);
-  the default comes from the user's `config.env` (or legacy `.env`). Models that cannot select effort ignore it.
+  the default comes from the user's `config.env` (or legacy `.env`). Models that cannot select
+  effort ignore it.
   Pass `-e xhigh` on every question unless the user names another level for that call
   (the user's standing rule, 2026-11-11); never lower it by your own judgment.
 - `--max-output-tokens N` sets the output budget, reasoning included. Leave it unset: the default
@@ -197,8 +216,8 @@ the `openrouter-cli:` lines.
 | `2` | Usage error | Fix the command; `openrouter-cli --help`. |
 | `3` | Refused before sending: input too large, session busy, cost log not writable | Nothing was sent or billed. Shrink the input, wait until the other call on that session ends, or report the cost log problem. |
 | `4` | Unknown or ambiguous model, an unknown group or member, or `unpin` found no saved provider | Choose from the printed candidates or ask the user. `list` and `group list` show what is saved. |
-| `5` | API or network failure, rejected key, or no endpoint matching the model, providers and privacy | Report the message. For no endpoint, check tags with `show`, including a saved provider; the user can clear it with `unpin` or skip it with `--any-provider`. A retry is another billed call; ask first. |
-| `6` | Incomplete answer (output limit reached, stream ended early, content filter) | The partial answer is in the answer file and the session is unchanged. For an output limit the message gives the reasoning and answer token counts when usage allows, and says whether a higher `--max-output-tokens` can help. Retry as it advises only after telling the user it costs another call. |
+| `5` | API or network failure, rejected key, or no endpoint matching the model, providers and privacy | Report the message. For no endpoint, check tags with `show`, including a saved provider; the user can clear it with `unpin` or skip it with `--any-provider`. A retry is another billed call; repeat the Billing checks first. |
+| `6` | Incomplete answer (output limit reached, stream ended early, content filter) | The partial answer is in the answer file and the session is unchanged. For an output limit the message gives the reasoning and answer token counts when usage allows, and says whether a higher `--max-output-tokens` can help. A retry is another billed call; repeat the Billing checks with the new output budget before retrying as advised. |
 | `7` | Configuration problem: no stored key, key cannot be decrypted, plaintext key in settings, invalid settings, or a corrupt `models.json`, `providers.json` or `groups.json` | Follow Keys and sign-in above. Never read or print `config.env` or `.env`. |
 | `8` | Interrupted, during the answer or during the cost lookup after it | The partial answer was kept; report the cost line. |
 | `9` | The call finished and may have been billed, but saving failed (answer file, cost record or session) | Use the answer from stdout, report the message and cost line, and never retry automatically. |
