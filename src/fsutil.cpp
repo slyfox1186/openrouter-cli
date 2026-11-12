@@ -3,6 +3,7 @@
 #include "common.hpp"
 #include "credentials.hpp"
 #include "http.hpp"
+#include "posix.hpp"
 
 #include <openssl/crypto.h>
 
@@ -36,6 +37,8 @@ namespace fs = std::filesystem;
 
 namespace {
 
+using posix::retry_eintr;
+
 constexpr mode_t private_dir_mode = S_IRWXU;
 constexpr mode_t private_file_mode = S_IRUSR | S_IWUSR;
 constexpr mode_t group_other_bits = S_IRWXG | S_IRWXO;
@@ -53,15 +56,6 @@ std::unexpected<Error> sys_fail(std::string_view action, const fs::path& path) {
     return fail(Exit::config,
                 std::format("cannot {} {}: {}", action, path.string(),
                             std::error_code(error_number, std::system_category()).message()));
-}
-
-template <class Call> auto retry_eintr(Call call) {
-    for (;;) {
-        const auto value = call();
-        if (value != -1 || errno != EINTR) {
-            return value;
-        }
-    }
 }
 
 // close(2) is not retried on EINTR: on Linux the descriptor is released either way.

@@ -293,7 +293,7 @@ Result<Config> config_from_env(const EnvMap& env) {
 // Swapping the file between these checks and the read needs write access to the project
 // directory, which already gives control of this configuration. A missing file reads as empty,
 // so every setting takes its default.
-Result<std::string> read_private_file(const std::filesystem::path& path) {
+Result<std::string> read_settings_file(const std::filesystem::path& path) {
     const std::string shown = path.string();
     std::error_code status_error;
     const std::filesystem::file_status status = std::filesystem::symlink_status(path, status_error);
@@ -400,7 +400,7 @@ Result<Config> load_config(const std::filesystem::path& home,
     }
     const std::filesystem::path env_path =
         home.empty() ? config_root / "openrouter-cli" / "config.env" : home / ".env";
-    const Result<std::string> text = read_private_file(env_path);
+    const Result<std::string> text = read_settings_file(env_path);
     if (!text.has_value()) {
         return std::unexpected(text.error());
     }
