@@ -734,6 +734,24 @@ TEST_CASE("an OpenRouter no-endpoints error exits 5 with a hint to inspect the m
     CHECK(server.post_count() == 1);
 }
 
+TEST_CASE("a rejected key on a question points at the free status check before replacing it") {
+    MockServer server;
+    server.set_route("/chat/completions", [](const RecordedRequest&) {
+        return Reply{.status = http_unauthorized,
+                     .body = R"({"error":{"code":401,"message":"User not found."}})"};
+    });
+    Sandbox sandbox(server.port());
+    sandbox.store_api_key();
+
+    const RunResult result = sandbox.run(ask("question"));
+
+    CHECK(result.code == exit_api);
+    CHECK(result.err.contains("HTTP 401"));
+    CHECK(result.err.contains("If the free `openrouter-cli status` also says key rejected, run "
+                              "`openrouter-cli login --replace`"));
+    CHECK(server.post_count() == 1);
+}
+
 TEST_CASE("a plain model name resolves without saving an alias") {
     MockServer server;
     Sandbox sandbox(server.port());
@@ -2389,7 +2407,8 @@ TEST_CASE("status follows the real HTTP status of /key whatever the body says") 
         CHECK_FALSE(status.out.contains("logged in: yes"));
         CHECK(status.all().contains("key rejected") == (entry.status == http_unauthorized));
         if (entry.status == http_unauthorized) {
-            CHECK(status.all().contains("openrouter-cli login --replace"));
+            CHECK(status.all().contains(
+                "try again, and if it is rejected again, run openrouter-cli login --replace"));
         }
     }
 }
@@ -2413,7 +2432,9 @@ TEST_CASE("status keeps the login state when only the Management key is rejected
     CHECK(status.code == exit_api);
     CHECK(status.out.contains("logged in: yes"));
     CHECK(status.out.contains("management key: stored but rejected"));
-    CHECK(status.all().contains("auth set --management --replace"));
+    CHECK(status.all().contains(
+        "try again, and if it is rejected again, run openrouter-cli auth set --management "
+        "--replace"));
 }
 
 // ----- account ---------------------------------------------------------------------------------
@@ -2512,7 +2533,8 @@ TEST_CASE("account commands report OpenRouter's reason and follow the real HTTP 
          .status = http_unauthorized,
          .body = R"({"error":{"code":403,"message":"User not found."}})",
          .shown = {"rejected the stored Management key for GET /keys (HTTP 401: User not found.)",
-                   "auth set --management --replace"}},
+                   "try again, and if it is rejected again, run `openrouter-cli auth set "
+                   "--management --replace`"}},
         {.args = {"account", "credits"},
          .path = "/credits",
          .status = http_server_error,

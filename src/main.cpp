@@ -1123,7 +1123,9 @@ Verdict judge(const StreamRun& run, long long max_tokens, std::optional<long lon
             text += ": " + sanitize_for_display(*outcome.error_message, max_display_chars);
         }
         if (run.transfer.status == http_unauthorized) {
-            text += "; the stored API key was rejected: run `openrouter-cli login --replace`";
+            // A retry here is another billed question, so the free status check confirms first.
+            text += "; the stored API key was rejected. If the free `openrouter-cli status` also "
+                    "says key rejected, run `openrouter-cli login --replace`";
         } else if (run.transfer.status == http_not_found ||
                    run.transfer.status == http_unavailable) {
             text += "; check the provider tags with `openrouter-cli show MODEL` (a saved one is "

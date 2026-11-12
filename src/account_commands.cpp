@@ -34,6 +34,9 @@ constexpr std::size_t date_length = 10; // YYYY-MM-DD
 constexpr std::string_view login_replace_hint = "openrouter-cli login --replace";
 constexpr std::string_view management_replace_hint =
     "openrouter-cli auth set --management --replace";
+// OpenRouter has answered 401 "User not found." once for a key that worked minutes later, so a
+// single 401 is not proof that the key must be replaced.
+constexpr std::string_view retry_then = "try again, and if it is rejected again, run";
 constexpr std::string_view management_keys_url = "https://openrouter.ai/settings/management-keys";
 constexpr std::string_view seen_by_organization = " (as seen by the Management key's organization)";
 constexpr std::string_view not_available = "n/a";
@@ -68,8 +71,9 @@ Result<std::string> fetch_body(const Http& http, std::string_view path, Auth aut
     const bool management = auth == Auth::management;
     if (response->status == http_unauthorized) {
         return fail(Exit::api,
-                    std::format("OpenRouter rejected the stored {} for GET {} ({}); run `{}`",
+                    std::format("OpenRouter rejected the stored {} for GET {} ({}); {} `{}`",
                                 management ? "Management key" : "API key", endpoint, status,
+                                retry_then,
                                 management ? management_replace_hint : login_replace_hint));
     }
     // OpenRouter's docs disagree on whether Management keys can be workspace-scoped, so the
@@ -175,7 +179,7 @@ LoginOutcome show_login(const Config& config) {
         return outcome;
     }
     if (response->status == http_unauthorized) {
-        std::println("logged in: key rejected; run {}", login_replace_hint);
+        std::println("logged in: key rejected; {} {}", retry_then, login_replace_hint);
         outcome.code = exit_code(Exit::api);
         return outcome;
     }
@@ -236,7 +240,7 @@ Result<std::vector<MemberEntry>> members_from(const HttpResponse& response) {
 }
 
 int print_management_rejected() {
-    std::println("management key: stored but rejected; run {}", management_replace_hint);
+    std::println("management key: stored but rejected; {} {}", retry_then, management_replace_hint);
     return exit_code(Exit::api);
 }
 

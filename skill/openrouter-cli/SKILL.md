@@ -47,9 +47,9 @@ and need no approval: `find`, `show`, `save`, `remove`, `list`, `pin`, `unpin`, 
 
 Never run `login`, `logout` or `auth set`, and never read, print, pipe or ask for a
 key. Keys are the user's to manage. If a command exits `7` with a key or setting
-problem, run `openrouter-cli status` and tell the user what it says; when it shows no stored key
-or a rejected key, ask them to run `openrouter-cli login` (or `login --replace`) in their own
-terminal. When the message names a corrupt `models.json`, `providers.json` or `groups.json`
+problem, run `openrouter-cli status` and tell the user what it says. When it shows no stored key,
+or a rejected key on a second `status` run as well (OpenRouter can reject a good key once), ask
+them to run `openrouter-cli login` (or `login --replace`) in their own terminal. When the message names a corrupt `models.json`, `providers.json` or `groups.json`
 instead, report the file and entry it names and ask the user how to fix it; never delete or edit
 it yourself. While `providers.json` is corrupt, a question that passes `:TAG`, `-p` or
 `--any-provider` still works.
